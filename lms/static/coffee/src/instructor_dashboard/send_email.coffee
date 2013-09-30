@@ -22,7 +22,6 @@ class SendEmail
     # attach click handlers
 
     @$btn_send.click =>
-
       if @$subject.val() == ""
         alert gettext("Your message must have a subject.")
       else if @$emailEditor.save()['data'] == ""
