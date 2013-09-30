@@ -17,6 +17,16 @@ from xmodule.modulestore import XML_MODULESTORE_TYPE
 
 from mock import patch
 
+@override_settings(MODULESTORE=TEST_DATA_MONGO_MODULESTORE)
+class TestNewInstructorDashboardEmailView(ModuleStoreTestCase):
+    """
+    Check for email view displayed with flag
+    """
+    # will need to check for Mongo vs XML, ENABLED vs not enabled,
+    # is studio course vs not studio course
+    # section_data
+    # what is html_module?
+    # which are API lines
 
 @override_settings(MODULESTORE=TEST_DATA_MONGO_MODULESTORE)
 class TestInstructorDashboardEmailView(ModuleStoreTestCase):
@@ -64,15 +74,6 @@ class TestInstructorDashboardEmailView(ModuleStoreTestCase):
         # Assert that the URL for the email view is not in the response
         response = self.client.get(self.url)
         self.assertFalse(self.email_link in response.content)
-
-    @patch.dict(settings.MITX_FEATURES,{'ENABLE_INSTRUCTOR_EMAIL': True})
-    def test_email_flag_false(self):
-        with patch('xmodule.modulestore.mongo.base.MongoModuleStore.get_modulestore_type') as mock_modulestore:
-            mock_modulestore.return_value = XML_MODULESTORE_TYPE
-
-            response = self.client.get(self.url)
-            self.assertFalse(self.email_link in response.content)
-
 
     @patch.dict(settings.MITX_FEATURES, {'ENABLE_INSTRUCTOR_EMAIL': True})
     def test_email_flag_true_xml_store(self):

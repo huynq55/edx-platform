@@ -9,7 +9,6 @@ Many of these GETs may become PUTs in the future.
 import re
 import logging
 import requests
-from collections import OrderedDict
 from django.conf import settings
 from django_future.csrf import ensure_csrf_cookie
 from django.views.decorators.cache import cache_control
@@ -399,7 +398,7 @@ def get_anon_ids(request, course_id):  # pylint: disable=W0613
     students = User.objects.filter(
         courseenrollment__course_id=course_id,
     ).order_by('id')
-    header =['User ID', 'Anonymized user ID']
+    header = ['User ID', 'Anonymized user ID']
     rows = [[s.id, unique_id_for_user(s)] for s in students]
     return csv_response(course_id.replace('/', '-') + '-anon-ids.csv', header, rows)
 
@@ -760,15 +759,12 @@ def send_email(request, course_id):
     - 'message' specifies email's content
     """
     course = get_course_by_id(course_id)
-    has_instructor_access = has_access(request.user, course, 'instructor')
     send_to = request.GET.get("send_to")
     subject = request.GET.get("subject")
     message = request.GET.get("message")
     text_message = html_to_text(message)
-    if subject == "":
-        return HttpResponseBadRequest("Operation requires instructor access.")
     email = CourseEmail(
-        course_id = course_id,
+        course_id=course_id,
         sender=request.user,
         to_option=send_to,
         subject=subject,
@@ -784,6 +780,7 @@ def send_email(request, course_id):
         'course_id': course_id,
     }
     return JsonResponse(response_payload)
+
 
 @ensure_csrf_cookie
 @cache_control(no_cache=True, no_store=True, must_revalidate=True)
@@ -847,6 +844,7 @@ def update_forum_role_membership(request, course_id):
         'action': action,
     }
     return JsonResponse(response_payload)
+
 
 @ensure_csrf_cookie
 @cache_control(no_cache=True, no_store=True, must_revalidate=True)
