@@ -224,21 +224,23 @@ def css_has_text(css_selector, text, index=0,
 
 
 @world.absorb
-def css_has_value(css_selector, value, index=0, allow_blank=False):
+def css_has_text(css_selector, text, index=0, allow_blank=True):
     """
-    Return a boolean indicating whether the element with
-    `css_selector` has the specified `value`.
+    Returns True only if the element with `css_selector` has
+    the specified `text`.
 
-    If `allow_blank` is False, wait for the element to have
-    a value that is a non-empty string.
+    If there are multiple elements on the page, `index` specifies
+    which one to select.
 
-    If there are multiple elements matching the css selector,
-    use `index` to indicate which one.
+    If `allow_blank` is False, wait for the element to have non-empty
+    text before making the assertion.  This is useful for elements
+    that are populated by JavaScript after the page loads.
     """
     if not allow_blank:
-        world.wait_for(lambda _: world.css_value(css_selector, index=index))
+        world.wait_for(lambda _: world.css_text(css_selector, index=index))
 
-    return world.css_value(css_selector, index=index) == value
+    return world.css_text(css_selector, index=index) == text
+>>>>>>> 0920dea... Added acceptance tests for bulk email (through beta dashboard)
 
 
 @world.absorb
