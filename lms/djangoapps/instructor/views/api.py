@@ -44,10 +44,6 @@ from bulk_email.models import CourseEmail
 from html_to_text import html_to_text
 from bulk_email import tasks
 
-from pudb import set_trace
-
-log = logging.getLogger(__name__)
-
 
 def common_exceptions_400(func):
     """
@@ -725,6 +721,44 @@ def send_email(request, course_id):
     - 'message' specifies email's content
     """
     set_trace()
+    course = get_course_by_id(course_id)
+    has_instructor_access = has_access(request.user, course, 'instructor')
+    send_to = request.GET.get("send_to")
+    subject = request.GET.get("subject")
+    message = request.GET.get("message")
+    text_message = html_to_text(message)
+    if subject == "":
+        return HttpResponseBadRequest("Operation requires instructor access.")
+    email = CourseEmail(
+        course_id = course_id,
+        sender=request.user,
+        to_option=send_to,
+        subject=subject,
+        html_message=message,
+        text_message=text_message
+    )
+    email.save()
+    tasks.delegate_email_batches.delay(
+        email.id,
+        request.user.id
+    )
+    response_payload = {
+        'course_id': course_id,
+    }
+    return JsonResponse(response_payload)
+
+@ensure_csrf_cookie
+@cache_control(no_cache=True, no_store=True, must_revalidate=True)
+@require_level('staff')
+@require_query_params(send_to="sending to whom", subject="subject line", message="message text")
+def send_email(request, course_id):
+    """
+    Send an email to self, staff, or everyone involved in a course.
+    Query Paramaters:
+    - 'send_to' specifies what group the email should be sent to
+    - 'subject' specifies email's subject
+    - 'message' specifies email's content
+    """
     course = get_course_by_id(course_id)
     has_instructor_access = has_access(request.user, course, 'instructor')
     send_to = request.GET.get("send_to")
