@@ -34,7 +34,6 @@ class SendEmail
         confirm_message = gettext("You are about to send an email titled \"#{subject}\" to #{send_to}.  Is this OK?")
         if confirm confirm_message
 
-<<<<<<< HEAD
           send_data =
             action: 'send'
             send_to: @$send_to.val()
