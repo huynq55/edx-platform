@@ -260,9 +260,7 @@ section.instructor-dashboard-content-2 {
 
   // system feedback - messages
   .msg {
-    border-radius: 1px;
-    padding: 10px 15px;
-    margin-bottom: 20px;
+
 
     .copy {
       font-weight: 600;
@@ -270,7 +268,6 @@ section.instructor-dashboard-content-2 {
   }
 
   .msg-confirm {
-    border-top: 2px solid green;
     background: tint(green,90%);
 
     .copy {
@@ -292,6 +289,10 @@ section.instructor-dashboard-content-2 {
       }
     }
   }
+  .msg .copy {
+      font-weight: 600; }
+  .msg-confirm {
+    background: #e5f2e5; }
 }
 
 
@@ -590,4 +591,8 @@ section.instructor-dashboard-content-2 {
     position: absolute;
     right: $baseline;
   }
+}
+
+input[name="subject"] {
+  width:600px;
 }
