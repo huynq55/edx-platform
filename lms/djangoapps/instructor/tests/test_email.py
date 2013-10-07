@@ -103,5 +103,4 @@ class TestInstructorDashboardEmailView(ModuleStoreTestCase):
 
             # Assert that the URL for the email view is not in the response
             response = self.client.get(self.url)
-            from nose.tools import set_trace; set_trace()
             self.assertFalse(self.email_link in response.content)
