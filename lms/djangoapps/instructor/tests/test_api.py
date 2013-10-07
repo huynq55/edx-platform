@@ -704,7 +704,7 @@ class TestInstructorSendEmail(ModuleStoreTestCase, LoginEnrollmentTestCase):
         
     def test_send_email_as_logged_in_instructor(self):
         url = reverse('send_email', kwargs={'course_id': self.course.id})
-        response = self.client.get(url,{
+        response = self.client.post(url,{
             'send_to': 'staff',
             'subject': 'test subject',
             'message': 'test message',
@@ -714,7 +714,7 @@ class TestInstructorSendEmail(ModuleStoreTestCase, LoginEnrollmentTestCase):
     def test_send_email_but_not_logged_in(self):
         self.client.logout()
         url = reverse('send_email', kwargs={'course_id': self.course.id})
-        response = self.client.get(url, {
+        response = self.client.post(url, {
             'send_to': 'staff',
             'subject': 'test subject',
             'message': 'test message',
@@ -726,7 +726,7 @@ class TestInstructorSendEmail(ModuleStoreTestCase, LoginEnrollmentTestCase):
         self.student = UserFactory()
         self.client.login(username=self.student.username, password='test')
         url = reverse('send_email', kwargs={'course_id': self.course.id})
-        response = self.client.get(url, {
+        response = self.client.post(url, {
             'send_to': 'staff',
             'subject': 'test subject',
             'message': 'test message',
@@ -735,7 +735,7 @@ class TestInstructorSendEmail(ModuleStoreTestCase, LoginEnrollmentTestCase):
 
     def test_send_email_but_course_not_exist(self):
         url = reverse('send_email', kwargs={'course_id': 'GarbageCourse/DNE/NoTerm'})
-        response = self.client.get(url, {
+        response = self.client.post(url, {
             'send_to': 'staff',
             'subject': 'test subject',
             'message': 'test message',
@@ -744,7 +744,7 @@ class TestInstructorSendEmail(ModuleStoreTestCase, LoginEnrollmentTestCase):
 
     def test_send_email_no_sendto(self):
         url = reverse('send_email', kwargs={'course_id': self.course.id})
-        response = self.client.get(url, {
+        response = self.client.post(url, {
             'subject': 'test subject',
             'message': 'test message',
             })
@@ -752,7 +752,7 @@ class TestInstructorSendEmail(ModuleStoreTestCase, LoginEnrollmentTestCase):
 
     def test_send_email_no_subject(self):
         url = reverse('send_email', kwargs={'course_id': self.course.id})
-        response = self.client.get(url, {
+        response = self.client.post(url, {
             'send_to': 'staff',
             'message': 'test message',
             })
@@ -760,7 +760,7 @@ class TestInstructorSendEmail(ModuleStoreTestCase, LoginEnrollmentTestCase):
 
     def test_send_email_no_message(self):
         url = reverse('send_email', kwargs={'course_id': self.course.id})
-        response = self.client.get(url, {
+        response = self.client.post(url, {
             'send_to': 'staff',
             'subject': 'test subject',
             })
