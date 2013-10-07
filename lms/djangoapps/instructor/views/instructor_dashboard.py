@@ -50,9 +50,8 @@ def instructor_dashboard_2(request, course_id):
         _section_data_download(course_id),
         _section_analytics(course_id)
     ]
-
+    
     enrollment_count = sections[0]['enrollment_count']
-
     disable_buttons = False
     max_enrollment_for_buttons = settings.MITX_FEATURES.get("MAX_ENROLLMENT_INSTR_BUTTONS")
     if max_enrollment_for_buttons is not None:

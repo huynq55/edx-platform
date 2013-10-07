@@ -48,7 +48,8 @@ class SendEmail
             success: (data) => 
               @display_response gettext('Your email was successfully queued for sending.')
               $(".msg-confirm").css({"display":"block"})
-            error: std_ajax_err => @fail_with_error gettext('Error sending email.')
+            error: std_ajax_err => 
+              @fail_with_error gettext('Error sending email.')
               $(".msg-confirm").css({"display":"none"})
 
   fail_with_error: (msg) ->
