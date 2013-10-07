@@ -31,6 +31,8 @@ urlpatterns = ('',  # nopep8
 
     url(r'^accounts/login$', 'student.views.accounts_login', name="accounts_login"),
 
+    url(r'^disable_account$', 'student.views.disable_account', name="disable_account"),
+
     url(r'^login_ajax$', 'student.views.login_user', name="login"),
     url(r'^login_ajax/(?P<error>[^/]*)$', 'student.views.login_user'),
     url(r'^logout$', 'student.views.logout_user', name='logout'),

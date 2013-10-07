@@ -1,0 +1,15 @@
+<%inherit file="main.html" />
+
+<%! from django.core.urlresolvers import reverse %>
+<%! from django.utils.translation import ugettext as _ %>
+
+<h2>ban or unban students from your course</h2>
+<form action="/disable_account" method="post" data-remote="true">
+	<label for="username">Username:</label>
+	<input type="text" id="username" name="username">
+	<label for="karma">Ban</label>
+	<input type="radio" name="karma" value="ban" id="karma">
+	<label for="karma">Unban</label>
+	<input type="radio" name="karma" value="unban" id="karma">
+	<input type="submit" value="submit">
+</form>

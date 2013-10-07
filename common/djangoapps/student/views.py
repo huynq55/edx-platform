@@ -30,6 +30,7 @@ from django_future.csrf import ensure_csrf_cookie
 from django.utils.http import cookie_date, base36_to_int, urlencode
 from django.utils.translation import ugettext as _
 from django.views.decorators.http import require_POST
+from django.contrib.admin.views.decorators import staff_member_required
 
 from ratelimitbackend.exceptions import RateLimitException
 
@@ -40,7 +41,8 @@ from student.models import (Registration, UserProfile, TestCenterUser, TestCente
                             TestCenterRegistration, TestCenterRegistrationForm,
                             PendingNameChange, PendingEmailChange,
                             CourseEnrollment, unique_id_for_user,
-                            get_testcenter_registration, CourseEnrollmentAllowed)
+                            get_testcenter_registration, CourseEnrollmentAllowed,
+                            UserKarma)
 from student.forms import PasswordResetFormNoActive
 
 from certificates.models import CertificateStatuses, certificate_status_for_student
@@ -531,6 +533,22 @@ def login_user(request, error=""):
         return HttpResponse(json.dumps({'success': False,
                                         'value': _('Email or password is incorrect.')}))
 
+    if user is not None:
+        try:
+            user_karma = UserKarma.objects.get(user=user)
+            if user_karma.account_status == u'banned':
+                return HttpResponse(json.dumps({
+                    'success': False,
+                    'value': _(
+                        'Your account has been disabled. If you believe '
+                        'this was done in error, please contact support: {}'
+                    ).format(
+                        settings.CONTACT_EMAIL
+                    )
+                }))
+        except UserKarma.DoesNotExist:
+            pass
+
     if user is not None and user.is_active:
         try:
             # We do not log here, because we have a handler registered
@@ -601,6 +619,39 @@ def logout_user(request):
                            domain=settings.SESSION_COOKIE_DOMAIN)
     return response
 
+@login_required
+@ensure_csrf_cookie
+def disable_account(request):
+    if not request.user.is_staff:
+        raise Http404
+
+    if request.method == "GET":
+        return render_to_response("disable_account.html")
+
+
+    username = request.POST.get('username')
+    karma = request.POST.get('karma')
+    context = {}
+    if username is None or not username.strip():
+        return redirect("disable_account")
+
+    username = username.strip()
+    try:
+        user = User.objects.get(username=username)
+    except User.DoesNotExist:
+        context['message'] = _("User with username {} does not exist").format(username)
+    else:
+        user_karma, created = UserKarma.objects.get_or_create(user=user)
+        if karma == 'ban':
+            user_karma.account_status = 'banned'
+            user_karma.save()
+            context['message'] = _("Successfully disabled {}'s account").format(username)
+        elif karma == 'unban':
+            user_karma.account_status = ''
+            user_karma.save()
+            context['message'] = _("Successfully reenabled {}'s account").format(username)
+
+    return render_to_response("disable_account.html", context)
 
 @login_required
 @ensure_csrf_cookie
