@@ -153,3 +153,41 @@ class CourseEmailTemplate(models.Model):
         stored HTML template and the provided `context` dict.
         """
         return CourseEmailTemplate._render(self.html_template, htmltext, context)
+
+class CourseAuthorization(models.Model):
+    """
+    Enable the course email feature on a course-by-course basis.
+    """
+    # The course that these features are attached to.
+    ## is it possible to prepopulate this field with `modulestore().get_courses() ?
+    ## or maybe not prepopulate but calculate/do a call on-the-fly
+
+    ## If not, will have to figure out how to attach a verification method onto
+    ## the admin dash such that when a course_id is entered it is verified via
+    ## modulestore().get_course_from_id(course_id)
+    course_id = models.CharField(max_length=255, db_index=True)
+
+    # Whether or not to enable instructor email
+    email_enabled = models.BooleanField(default=False)
+
+    class Meta:
+        """ meta attributes of this model """
+        unique_together = ('course_id', 'email_enabled')
+
+    @classmethod
+    def instructor_email_enabled(cls, course_id):
+        """
+        Returns whether or not email is enabled for the given course id.
+
+        If email has not been explicitly enabled, returns False.
+        """
+        try:
+            record = cls.objects.get(course_id=course_id)
+            return record.email_enabled
+        except cls.DoesNotExist:
+            return False
+
+    def __unicode__(self):
+        return u"Course {}: Instructor Email Enabled ({})".format(
+            self.course_id, self.email_enabled
+        )

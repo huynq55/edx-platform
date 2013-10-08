@@ -114,7 +114,8 @@ MITX_FEATURES = {
     # analytics experiments
     'ENABLE_INSTRUCTOR_ANALYTICS': False,
 
-    'ENABLE_INSTRUCTOR_EMAIL': False,
+    # Enables the LMS bulk email feature for course staff
+    'ENABLE_INSTRUCTOR_EMAIL': True,
 
     # enable analytics server.
     # WARNING: THIS SHOULD ALWAYS BE SET TO FALSE UNDER NORMAL
