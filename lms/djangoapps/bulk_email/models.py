@@ -12,11 +12,15 @@ file and check it in at the same time as your model changes. To do that,
 
 """
 import logging
-from django.db import models, transaction
-from django.contrib.auth.models import User
-from html_to_text import html_to_text
-
 from django.conf import settings
+from django.contrib.auth.models import User
+from django.db import models, transaction
+
+from openedx.core.lib.html_to_text import html_to_text
+from openedx.core.lib.mail_utils import wrap_message
+
+from xmodule_django.models import CourseKeyField
+from util.keyword_substitution import substitute_keywords_with_data
 
 log = logging.getLogger(__name__)
 
@@ -40,7 +44,8 @@ class Email(models.Model):
     created = models.DateTimeField(auto_now_add=True)
     modified = models.DateTimeField(auto_now=True)
 
-    class Meta:  # pylint: disable=C0111
+    class Meta(object):
+        app_label = "bulk_email"
         abstract = True
 
 
@@ -48,6 +53,9 @@ class CourseEmail(Email):
     """
     Stores information for an email to a course.
     """
+    class Meta(object):
+        app_label = "bulk_email"
+
     # Three options for sending that we provide from the instructor dashboard:
     # * Myself: This sends an email to the staff member that is composing the email.
     #
@@ -62,23 +70,20 @@ class CourseEmail(Email):
         (SEND_TO_STAFF, 'Staff and instructors'),
         (SEND_TO_ALL, 'All')
     )
-    course_id = models.CharField(max_length=255, db_index=True)
+    course_id = CourseKeyField(max_length=255, db_index=True)
     to_option = models.CharField(max_length=64, choices=TO_OPTION_CHOICES, default=SEND_TO_MYSELF)
+    template_name = models.CharField(null=True, max_length=255)
+    from_addr = models.CharField(null=True, max_length=255)
 
     def __unicode__(self):
         return self.subject
 
     @classmethod
-    def create(cls, course_id, sender, to_option, subject, html_message, text_message=None):
+    def create(
+            cls, course_id, sender, to_option, subject, html_message,
+            text_message=None, template_name=None, from_addr=None):
         """
         Create an instance of CourseEmail.
-
-        The CourseEmail.save_now method makes sure the CourseEmail entry is committed.
-        When called from any view that is wrapped by TransactionMiddleware,
-        and thus in a "commit-on-success" transaction, an autocommit buried within here
-        will cause any pending transaction to be committed by a successful
-        save here.  Any future database operations will take place in a
-        separate transaction.
         """
         # automatically generate the stripped version of the text from the HTML markup:
         if text_message is None:
@@ -98,24 +103,18 @@ class CourseEmail(Email):
             subject=subject,
             html_message=html_message,
             text_message=text_message,
+            template_name=template_name,
+            from_addr=from_addr,
         )
-        course_email.save_now()
+        course_email.save()
 
         return course_email
 
-    @transaction.autocommit
-    def save_now(self):
+    def get_template(self):
         """
-        Writes CourseEmail immediately, ensuring the transaction is committed.
-
-        Autocommit annotation makes sure the database entry is committed.
-        When called from any view that is wrapped by TransactionMiddleware,
-        and thus in a "commit-on-success" transaction, this autocommit here
-        will cause any pending transaction to be committed by a successful
-        save here.  Any future database operations will take place in a
-        separate transaction.
+        Returns the corresponding CourseEmailTemplate for this CourseEmail.
         """
-        self.save()
+        return CourseEmailTemplate.get_template(name=self.template_name)
 
 
 class Optout(models.Model):
@@ -126,9 +125,10 @@ class Optout(models.Model):
     # We need to first create the 'user' column with some sort of default in order to run the data migration,
     # and given the unique index, 'null' is the best default value.
     user = models.ForeignKey(User, db_index=True, null=True)
-    course_id = models.CharField(max_length=255, db_index=True)
+    course_id = CourseKeyField(max_length=255, db_index=True)
 
-    class Meta:  # pylint: disable=C0111
+    class Meta(object):
+        app_label = "bulk_email"
         unique_together = ('user', 'course_id')
 
 
@@ -146,18 +146,22 @@ class CourseEmailTemplate(models.Model):
     The admin console interface disables add and delete operations.
     Validation is handled in the CourseEmailTemplateForm class.
     """
+    class Meta(object):
+        app_label = "bulk_email"
+
     html_template = models.TextField(null=True, blank=True)
     plain_template = models.TextField(null=True, blank=True)
+    name = models.CharField(null=True, max_length=255, unique=True, blank=True)
 
     @staticmethod
-    def get_template():
+    def get_template(name=None):
         """
         Fetch the current template
 
         If one isn't stored, an exception is thrown.
         """
         try:
-            return CourseEmailTemplate.objects.get()
+            return CourseEmailTemplate.objects.get(name=name)
         except CourseEmailTemplate.DoesNotExist:
             log.exception("Attempting to fetch a non-existent course email template")
             raise
@@ -171,29 +175,29 @@ class CourseEmailTemplate(models.Model):
         using the provided template.  The template is a format string,
         which is rendered using format() with the provided `context` dict.
 
-        This doesn't insert user's text into template, until such time we can
-        support proper error handling due to errors in the message body
-        (e.g. due to the use of curly braces).
-
-        Instead, for now, we insert the message body *after* the substitutions
-        have been performed, so that anything in the message body that might
-        interfere will be innocently returned as-is.
+        Any keywords encoded in the form %%KEYWORD%% found in the message
+        body are subtituted with user data before the body is inserted into
+        the template.
 
         Output is returned as a unicode string.  It is not encoded as utf-8.
         Such encoding is left to the email code, which will use the value
         of settings.DEFAULT_CHARSET to encode the message.
         """
-        # If we wanted to support substitution, we'd call:
-        # format_string = format_string.replace(COURSE_EMAIL_MESSAGE_BODY_TAG, message_body)
+
+        # Substitute all %%-encoded keywords in the message body
+        if 'user_id' in context and 'course_id' in context:
+            message_body = substitute_keywords_with_data(message_body, context)
+
         result = format_string.format(**context)
+
         # Note that the body tag in the template will now have been
         # "formatted", so we need to do the same to the tag being
         # searched for.
         message_body_tag = COURSE_EMAIL_MESSAGE_BODY_TAG.format()
         result = result.replace(message_body_tag, message_body, 1)
 
-        # finally, return the result, without converting to an encoded byte array.
-        return result
+        # finally, return the result, after wrapping long lines and without converting to an encoded byte array.
+        return wrap_message(result)
 
     def render_plaintext(self, plaintext, context):
         """
@@ -218,8 +222,11 @@ class CourseAuthorization(models.Model):
     """
     Enable the course email feature on a course-by-course basis.
     """
+    class Meta(object):
+        app_label = "bulk_email"
+
     # The course that these features are attached to.
-    course_id = models.CharField(max_length=255, db_index=True)
+    course_id = CourseKeyField(max_length=255, db_index=True, unique=True)
 
     # Whether or not to enable instructor email
     email_enabled = models.BooleanField(default=False)
@@ -246,4 +253,5 @@ class CourseAuthorization(models.Model):
         not_en = "Not "
         if self.email_enabled:
             not_en = ""
-        return u"Course '{}': Instructor Email {}Enabled".format(self.course_id, not_en)
+        # pylint: disable=no-member
+        return u"Course '{}': Instructor Email {}Enabled".format(self.course_id.to_deprecated_string(), not_en)

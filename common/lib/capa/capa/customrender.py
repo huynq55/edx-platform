@@ -6,11 +6,10 @@ These tags do not have state, so they just get passed the system (for access to 
 and the xml element.
 """
 
-from .registry import TagRegistry
-
 import logging
 import re
 
+from cgi import escape as cgi_escape
 from lxml import etree
 import xml.sax.saxutils as saxutils
 from .registry import TagRegistry
@@ -43,12 +42,11 @@ class MathRenderer(object):
 
         mathstr = re.sub(r'\$(.*)\$', r'[mathjaxinline]\1[/mathjaxinline]', xml.text)
         mtag = 'mathjax'
-        if not r'\displaystyle' in mathstr:
+        if r'\displaystyle' not in mathstr:
             mtag += 'inline'
         else:
             mathstr = mathstr.replace(r'\displaystyle', '')
         self.mathstr = mathstr.replace('mathjaxinline]', '%s]' % mtag)
-
 
     def get_html(self):
         """
@@ -98,3 +96,74 @@ class SolutionRenderer(object):
         return etree.XML(html)
 
 registry.register(SolutionRenderer)
+
+#-----------------------------------------------------------------------------
+
+
+class TargetedFeedbackRenderer(object):
+    """
+    A targeted feedback is just a <span>...</span> that is used for displaying an
+    extended piece of feedback to students if they incorrectly answered a question.
+    """
+    tags = ['targetedfeedback']
+
+    def __init__(self, system, xml):
+        self.system = system
+        self.xml = xml
+
+    def get_html(self):
+        """
+        Return the contents of this tag, rendered to html, as an etree element.
+        """
+        html = '<section class="targeted-feedback-span"><span>{}</span></section>'.format(etree.tostring(self.xml))
+        try:
+            xhtml = etree.XML(html)
+        except Exception as err:  # pylint: disable=broad-except
+            if self.system.DEBUG:
+                msg = """
+                    <html>
+                      <div class="inline-error">
+                        <p>Error {err}</p>
+                        <p>Failed to construct targeted feedback from <pre>{html}</pre></p>
+                      </div>
+                    </html>
+                """.format(err=cgi_escape(err), html=cgi_escape(html))
+                log.error(msg)
+                return etree.XML(msg)
+            else:
+                raise
+        return xhtml
+
+registry.register(TargetedFeedbackRenderer)
+
+#-----------------------------------------------------------------------------
+
+
+class ClarificationRenderer(object):
+    """
+    A clarification appears as an inline icon which reveals more information when the user
+    hovers over it.
+
+    e.g. <p>Enter the ROA <clarification>Return on Assets</clarification> for 2015:</p>
+    """
+    tags = ['clarification']
+
+    def __init__(self, system, xml):
+        self.system = system
+        # Get any text content found inside this tag prior to the first child tag. It may be a string or None type.
+        initial_text = xml.text if xml.text else ''
+        self.inner_html = initial_text + ''.join(etree.tostring(element) for element in xml)
+        self.tail = xml.tail
+
+    def get_html(self):
+        """
+        Return the contents of this tag, rendered to html, as an etree element.
+        """
+        context = {'clarification': self.inner_html}
+        html = self.system.render_template("clarification.html", context)
+        xml = etree.XML(html)
+        # We must include any text that was following our original <clarification>...</clarification> XML node.:
+        xml.tail = self.tail
+        return xml
+
+registry.register(ClarificationRenderer)

@@ -18,7 +18,6 @@ from uuid import uuid4
 import csv
 import json
 import hashlib
-import os
 import os.path
 import urllib
 
@@ -28,6 +27,8 @@ from boto.s3.key import Key
 from django.conf import settings
 from django.contrib.auth.models import User
 from django.db import models, transaction
+
+from xmodule_django.models import CourseKeyField
 
 
 # define custom states used by InstructorTask
@@ -57,8 +58,11 @@ class InstructorTask(models.Model):
     `created` stores date that entry was first created
     `updated` stores date that entry was last modified
     """
+    class Meta(object):
+        app_label = "instructor_task"
+
     task_type = models.CharField(max_length=50, db_index=True)
-    course_id = models.CharField(max_length=255, db_index=True)
+    course_id = CourseKeyField(max_length=255, db_index=True)
     task_key = models.CharField(max_length=255, db_index=True)
     task_input = models.CharField(max_length=255)
     task_id = models.CharField(max_length=255, db_index=True)  # max_length from celery_taskmeta
@@ -86,13 +90,6 @@ class InstructorTask(models.Model):
     def create(cls, course_id, task_type, task_key, task_input, requester):
         """
         Create an instance of InstructorTask.
-
-        The InstructorTask.save_now method makes sure the InstructorTask entry is committed.
-        When called from any view that is wrapped by TransactionMiddleware,
-        and thus in a "commit-on-success" transaction, an autocommit buried within here
-        will cause any pending transaction to be committed by a successful
-        save here.  Any future database operations will take place in a
-        separate transaction.
         """
         # create the task_id here, and pass it into celery:
         task_id = str(uuid4())
@@ -119,17 +116,10 @@ class InstructorTask(models.Model):
 
         return instructor_task
 
-    @transaction.autocommit
+    @transaction.atomic
     def save_now(self):
         """
         Writes InstructorTask immediately, ensuring the transaction is committed.
-
-        Autocommit annotation makes sure the database entry is committed.
-        When called from any view that is wrapped by TransactionMiddleware,
-        and thus in a "commit-on-success" transaction, this autocommit here
-        will cause any pending transaction to be committed by a successful
-        save here.  Any future database operations will take place in a
-        separate transaction.
         """
         self.save()
 
@@ -159,7 +149,7 @@ class InstructorTask(models.Model):
         Truncation is indicated by adding "..." to the end of the value.
         """
         tag = '...'
-        task_progress = {'exception': type(exception).__name__, 'message': str(exception.message)}
+        task_progress = {'exception': type(exception).__name__, 'message': unicode(exception.message)}
         if traceback_string is not None:
             # truncate any traceback that goes into the InstructorTask model:
             task_progress['traceback'] = traceback_string
@@ -189,29 +179,38 @@ class InstructorTask(models.Model):
         return json.dumps({'message': 'Task revoked before running'})
 
 
-class GradesStore(object):
+class ReportStore(object):
     """
-    Simple abstraction layer that can fetch and store CSV files for grades
-    download. Should probably refactor later to create a GradesFile object that
+    Simple abstraction layer that can fetch and store CSV files for reports
+    download. Should probably refactor later to create a ReportFile object that
     can simply be appended to for the sake of memory efficiency, rather than
     passing in the whole dataset. Doing that for now just because it's simpler.
     """
     @classmethod
-    def from_config(cls):
+    def from_config(cls, config_name):
         """
-        Return one of the GradesStore subclasses depending on django
+        Return one of the ReportStore subclasses depending on django
         configuration. Look at subclasses for expected configuration.
         """
-        storage_type = settings.GRADES_DOWNLOAD.get("STORAGE_TYPE")
+        storage_type = getattr(settings, config_name).get("STORAGE_TYPE")
         if storage_type.lower() == "s3":
-            return S3GradesStore.from_config()
+            return S3ReportStore.from_config(config_name)
         elif storage_type.lower() == "localfs":
-            return LocalFSGradesStore.from_config()
+            return LocalFSReportStore.from_config(config_name)
+
+    def _get_utf8_encoded_rows(self, rows):
+        """
+        Given a list of `rows` containing unicode strings, return a
+        new list of rows with those strings encoded as utf-8 for CSV
+        compatibility.
+        """
+        for row in rows:
+            yield [unicode(item).encode('utf-8') for item in row]
 
 
-class S3GradesStore(GradesStore):
+class S3ReportStore(ReportStore):
     """
-    Grades store backed by S3. The directory structure we use to store things
+    Reports store backed by S3. The directory structure we use to store things
     is::
 
         `{bucket}/{root_path}/{sha1 hash of course_id}/filename`
@@ -228,16 +227,17 @@ class S3GradesStore(GradesStore):
             settings.AWS_ACCESS_KEY_ID,
             settings.AWS_SECRET_ACCESS_KEY
         )
+
         self.bucket = conn.get_bucket(bucket_name)
 
     @classmethod
-    def from_config(cls):
+    def from_config(cls, config_name):
         """
-        The expected configuration for an `S3GradesStore` is to have a
+        The expected configuration for an `S3ReportStore` is to have a
         `GRADES_DOWNLOAD` dict in settings with the following fields::
 
             STORAGE_TYPE : "s3"
-            BUCKET : Your bucket name, e.g. "grades-bucket"
+            BUCKET : Your bucket name, e.g. "reports-bucket"
             ROOT_PATH : The path you want to store all course files under. Do not
                         use a leading or trailing slash. e.g. "staging" or
                         "staging/2013", not "/staging", or "/staging/"
@@ -246,14 +246,14 @@ class S3GradesStore(GradesStore):
         and `AWS_SECRET_ACCESS_KEY` in settings.
         """
         return cls(
-            settings.GRADES_DOWNLOAD['BUCKET'],
-            settings.GRADES_DOWNLOAD['ROOT_PATH']
+            getattr(settings, config_name).get("BUCKET"),
+            getattr(settings, config_name).get("ROOT_PATH")
         )
 
     def key_for(self, course_id, filename):
-        """Return the S3 key we would use to store and retrive the data for the
+        """Return the S3 key we would use to store and retrieve the data for the
         given filename."""
-        hashed_course_id = hashlib.sha1(course_id)
+        hashed_course_id = hashlib.sha1(course_id.to_deprecated_string())
 
         key = Key(self.bucket)
         key.key = "{}/{}/{}".format(
@@ -264,7 +264,7 @@ class S3GradesStore(GradesStore):
 
         return key
 
-    def store(self, course_id, filename, buff):
+    def store(self, course_id, filename, buff, config=None):
         """
         Store the contents of `buff` in a directory determined by hashing
         `course_id`, and name the file `filename`. `buff` is typically a
@@ -277,10 +277,15 @@ class S3GradesStore(GradesStore):
         """
         key = self.key_for(course_id, filename)
 
+        _config = config if config else {}
+
+        content_type = _config.get('content_type', 'text/csv')
+        content_encoding = _config.get('content_encoding', 'gzip')
+
         data = buff.getvalue()
         key.size = len(data)
-        key.content_encoding = "gzip"
-        key.content_type = "text/csv"
+        key.content_encoding = content_encoding
+        key.content_type = content_type
 
         # Just setting the content encoding and type above should work
         # according to the docs, but when experimenting, this was necessary for
@@ -288,9 +293,9 @@ class S3GradesStore(GradesStore):
         key.set_contents_from_string(
             data,
             headers={
-                "Content-Encoding": "gzip",
+                "Content-Encoding": content_encoding,
                 "Content-Length": len(data),
-                "Content-Type": "text/csv",
+                "Content-Type": content_type,
             }
         )
 
@@ -305,7 +310,8 @@ class S3GradesStore(GradesStore):
         """
         output_buffer = StringIO()
         gzip_file = GzipFile(fileobj=output_buffer, mode="wb")
-        csv.writer(gzip_file).writerows(rows)
+        csvwriter = csv.writer(gzip_file)
+        csvwriter.writerows(self._get_utf8_encoded_rows(rows))
         gzip_file.close()
 
         self.store(course_id, filename, output_buffer)
@@ -316,19 +322,16 @@ class S3GradesStore(GradesStore):
         can be plugged straight into an href
         """
         course_dir = self.key_for(course_id, '')
-        return sorted(
-            [
-                (key.key.split("/")[-1], key.generate_url(expires_in=300))
-                for key in self.bucket.list(prefix=course_dir.key)
-            ],
-            reverse=True
-        )
+        return [
+            (key.key.split("/")[-1], key.generate_url(expires_in=300))
+            for key in sorted(self.bucket.list(prefix=course_dir.key), reverse=True, key=lambda k: k.last_modified)
+        ]
 
 
-class LocalFSGradesStore(GradesStore):
+class LocalFSReportStore(ReportStore):
     """
-    LocalFS implementation of a GradesStore. This is meant for debugging
-    purposes and is *absolutely not for production use*. Use S3GradesStore for
+    LocalFS implementation of a ReportStore. This is meant for debugging
+    purposes and is *absolutely not for production use*. Use S3ReportStore for
     that. We use this in tests and for local development. When it generates
     links, it will make file:/// style links. That means you actually have to
     copy them and open them in a separate browser window, for security reasons.
@@ -345,24 +348,24 @@ class LocalFSGradesStore(GradesStore):
             os.makedirs(root_path)
 
     @classmethod
-    def from_config(cls):
+    def from_config(cls, config_name):
         """
         Generate an instance of this object from Django settings. It assumes
         that there is a dict in settings named GRADES_DOWNLOAD and that it has
         a ROOT_PATH that maps to an absolute file path that the web app has
-        write permissions to. `LocalFSGradesStore` will create any intermediate
+        write permissions to. `LocalFSReportStore` will create any intermediate
         directories as needed. Example::
 
             STORAGE_TYPE : "localfs"
-            ROOT_PATH : /tmp/edx/grade-downloads/
+            ROOT_PATH : /tmp/edx/report-downloads/
         """
-        return cls(settings.GRADES_DOWNLOAD['ROOT_PATH'])
+        return cls(getattr(settings, config_name).get("ROOT_PATH"))
 
     def path_to(self, course_id, filename):
         """Return the full path to a given file for a given course."""
-        return os.path.join(self.root_path, urllib.quote(course_id, safe=''), filename)
+        return os.path.join(self.root_path, urllib.quote(course_id.to_deprecated_string(), safe=''), filename)
 
-    def store(self, course_id, filename, buff):
+    def store(self, course_id, filename, buff, config=None):  # pylint: disable=unused-argument
         """
         Given the `course_id` and `filename`, store the contents of `buff` in
         that file. Overwrite anything that was there previously. `buff` is
@@ -383,13 +386,15 @@ class LocalFSGradesStore(GradesStore):
         write this data out.
         """
         output_buffer = StringIO()
-        csv.writer(output_buffer).writerows(rows)
+        csvwriter = csv.writer(output_buffer)
+        csvwriter.writerows(self._get_utf8_encoded_rows(rows))
+
         self.store(course_id, filename, output_buffer)
 
     def links_for(self, course_id):
         """
         For a given `course_id`, return a list of `(filename, url)` tuples. `url`
-        can be plugged straight into an href. Note that `LocalFSGradesStore`
+        can be plugged straight into an href. Note that `LocalFSReportStore`
         will generate `file://` type URLs, so you'll need to copy the URL and
         open it in a new browser window. Again, this class is only meant for
         local development.
@@ -397,10 +402,10 @@ class LocalFSGradesStore(GradesStore):
         course_dir = self.path_to(course_id, '')
         if not os.path.exists(course_dir):
             return []
-        return sorted(
-            [
-                (filename, ("file://" + urllib.quote(os.path.join(course_dir, filename))))
-                for filename in os.listdir(course_dir)
-            ],
-            reverse=True
-        )
+        files = [(filename, os.path.join(course_dir, filename)) for filename in os.listdir(course_dir)]
+        files.sort(key=lambda (filename, full_path): os.path.getmtime(full_path), reverse=True)
+
+        return [
+            (filename, ("file://" + urllib.quote(full_path)))
+            for filename, full_path in files
+        ]

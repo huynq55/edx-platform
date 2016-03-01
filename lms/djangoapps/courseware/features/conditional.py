@@ -1,9 +1,11 @@
+# pylint: disable=missing-docstring
 
 from lettuce import world, steps
-from nose.tools import assert_in, assert_equals, assert_true
+from nose.tools import assert_in, assert_true
 
 from common import i_am_registered_for_the_course, visit_scenario_item
 from problems_setup import add_problem_to_course, answer_problem
+
 
 @steps
 class ConditionalSteps(object):
@@ -46,16 +48,16 @@ class ConditionalSteps(object):
 
         metadata = {
             'xml_attributes': {
-                'sources': world.scenario_dict['CONDITION_SOURCE'].location.url()
+                condition: cond_value
             }
         }
-        metadata['xml_attributes'][condition] = cond_value
 
         world.scenario_dict['CONDITIONAL'] = world.ItemFactory(
             parent_location=world.scenario_dict['WRAPPER'].location,
             category='conditional',
             display_name="Test Conditional",
-            metadata=metadata
+            metadata=metadata,
+            sources_list=[world.scenario_dict['CONDITION_SOURCE'].location],
         )
 
         world.ItemFactory(
@@ -65,14 +67,13 @@ class ConditionalSteps(object):
             data='<html><div class="hidden-contents">Hidden Contents</p></html>'
         )
 
-
     def setup_problem_attempts(self, step, not_attempted=None):
         r'that the conditioned problem has (?P<not_attempted>not )?been attempted$'
         visit_scenario_item('CONDITION_SOURCE')
 
         if not_attempted is None:
             answer_problem(self.COURSE_NUM, 'string', True)
-            world.css_click("input.check")
+            world.css_click("button.check")
 
     def when_i_view_the_conditional(self, step):
         r'I view the conditional$'
@@ -90,6 +91,12 @@ class ConditionalSteps(object):
             assert_true(world.css_visible('.hidden-contents'))
         else:
             assert_true(world.is_css_not_present('.hidden-contents'))
+            assert_true(
+                world.css_contains_text(
+                    '.conditional-message',
+                    'must be attempted before this will become visible.'
+                )
+            )
 
     def answer_poll(self, step, answer):
         r' I answer the conditioned poll "([^"]*)"$'

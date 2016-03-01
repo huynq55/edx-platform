@@ -1,48 +1,49 @@
 define(
     [
         "js/views/baseview", "underscore", "js/models/metadata", "js/views/abstract_editor",
-        "js/views/transcripts/metadata_videolist"
+        "js/models/uploads", "js/views/uploads",
+        "js/models/license", "js/views/license",
+        "js/views/video/transcripts/metadata_videolist",
+        "js/views/video/translations_editor"
     ],
-function(BaseView, _, MetadataModel, AbstractEditor, VideoList) {
+function(BaseView, _, MetadataModel, AbstractEditor, FileUpload, UploadDialog,
+         LicenseModel, LicenseView, VideoList, VideoTranslations) {
     var Metadata = {};
 
     Metadata.Editor = BaseView.extend({
 
         // Model is CMS.Models.MetadataCollection,
         initialize : function() {
-            var tpl = $("#metadata-editor-tpl").text();
-            if(!tpl) {
-                console.error("Couldn't load metadata editor template");
-            }
-            this.template = _.template(tpl);
+            var self = this,
+                counter = 0,
+                locator = self.$el.closest('[data-locator]').data('locator'),
+                courseKey = self.$el.closest('[data-course-key]').data('course-key');
 
+            this.template = this.loadTemplate('metadata-editor');
             this.$el.html(this.template({numEntries: this.collection.length}));
-            var counter = 0;
 
-            var self = this;
             this.collection.each(
                 function (model) {
                     var data = {
-                        el: self.$el.find('.metadata_entry')[counter++],
-                        model: model
-                    };
-                    if (model.getType() === MetadataModel.SELECT_TYPE) {
-                        new Metadata.Option(data);
+                            el: self.$el.find('.metadata_entry')[counter++],
+                            courseKey: courseKey,
+                            locator: locator,
+                            model: model
+                        },
+                        conversions = {
+                            'Select': 'Option',
+                            'Float': 'Number',
+                            'Integer': 'Number'
+                        },
+                        type = model.getType();
+
+                    if (conversions[type]) {
+                        type = conversions[type];
                     }
-                    else if (model.getType() === MetadataModel.INTEGER_TYPE ||
-                        model.getType() === MetadataModel.FLOAT_TYPE) {
-                        new Metadata.Number(data);
-                    }
-                    else if(model.getType() === MetadataModel.LIST_TYPE) {
-                        new Metadata.List(data);
-                    }
-                    else if(model.getType() === MetadataModel.VIDEO_LIST_TYPE) {
-                        new VideoList(data);
-                    }
-                    else if(model.getType() === MetadataModel.RELATIVE_TIME_TYPE) {
-                        new Metadata.RelativeTime(data);
-                    }
-                    else {
+
+                    if (_.isFunction(Metadata[type])) {
+                        new Metadata[type](data);
+                    } else {
                         // Everything else is treated as GENERIC_TYPE, which uses String editor.
                         new Metadata.String(data);
                     }
@@ -50,7 +51,7 @@ function(BaseView, _, MetadataModel, AbstractEditor, VideoList) {
         },
 
         /**
-         * Returns the just the modified metadata values, in the format used to persist to the server.
+         * Returns just the modified metadata values, in the format used to persist to the server.
          */
         getModifiedMetadataValues: function () {
             var modified_values = {};
@@ -84,11 +85,14 @@ function(BaseView, _, MetadataModel, AbstractEditor, VideoList) {
         }
     });
 
+    Metadata.VideoList = VideoList;
+    Metadata.VideoTranslations = VideoTranslations;
+
     Metadata.String = AbstractEditor.extend({
 
         events : {
             "change input" : "updateModel",
-            "keypress .setting-input" : "showClearButton"  ,
+            "keypress .setting-input" : "showClearButton",
             "click .setting-clear" : "clear"
         },
 
@@ -102,7 +106,8 @@ function(BaseView, _, MetadataModel, AbstractEditor, VideoList) {
             if (this.model.get('non_editable')) {
                 this.$el.find('#' + this.uniqueId)
                     .prop('readonly', true)
-                    .addClass('is-disabled');
+                    .addClass('is-disabled')
+                    .attr('aria-disabled', true);
             }
         },
 
@@ -277,12 +282,13 @@ function(BaseView, _, MetadataModel, AbstractEditor, VideoList) {
 
         setValueInEditor: function (value) {
             var list = this.$el.find('ol');
+
             list.empty();
             _.each(value, function(ele, index) {
                 var template = _.template(
                     '<li class="list-settings-item">' +
                         '<input type="text" class="input" value="<%= ele %>">' +
-                        '<a href="#" class="remove-action remove-setting" data-index="<%= index %>"><i class="icon-remove-sign"></i><span class="sr">Remove</span></a>' +
+                        '<a href="#" class="remove-action remove-setting" data-index="<%= index %>"><i class="icon fa fa-times-circle" aria-hidden="true"></i><span class="sr">Remove</span></a>' +
                     '</li>'
                 );
                 list.append($(template({'ele': ele, 'index': index})));
@@ -295,7 +301,7 @@ function(BaseView, _, MetadataModel, AbstractEditor, VideoList) {
             // change event
             var list = this.model.get('value') || [];
             this.setValueInEditor(list.concat(['']));
-            this.$el.find('.create-setting').addClass('is-disabled');
+            this.$el.find('.create-setting').addClass('is-disabled').attr('aria-disabled', true);
         },
 
         removeEntry: function(event) {
@@ -303,22 +309,31 @@ function(BaseView, _, MetadataModel, AbstractEditor, VideoList) {
             var entry = $(event.currentTarget).siblings().val();
             this.setValueInEditor(_.without(this.model.get('value'), entry));
             this.updateModel();
-            this.$el.find('.create-setting').removeClass('is-disabled');
+            this.$el.find('.create-setting').removeClass('is-disabled').attr('aria-disabled', false);
         },
 
         enableAdd: function() {
-            this.$el.find('.create-setting').removeClass('is-disabled');
+            this.$el.find('.create-setting').removeClass('is-disabled').attr('aria-disabled', false);
+        },
+
+        clear: function() {
+            AbstractEditor.prototype.clear.apply(this, arguments);
+            if (_.isNull(this.model.getValue())) {
+                this.$el.find('.create-setting').removeClass('is-disabled').attr('aria-disabled', false);
+            }
         }
     });
 
     Metadata.RelativeTime = AbstractEditor.extend({
 
-        defaultValue : '00:00:00',
+        defaultValue: '00:00:00',
         // By default max value of RelativeTime field on Backend is 23:59:59,
         // that is 86399 seconds.
-        maxTimeInSeconds : 86399,
+        maxTimeInSeconds: 86399,
 
-        events : {
+        events: {
+            "focus input" : "addSelection",
+            "mouseup input" : "mouseUpHandler",
             "change input" : "updateModel",
             "keypress .setting-input" : "showClearButton"  ,
             "click .setting-clear" : "clear"
@@ -326,7 +341,7 @@ function(BaseView, _, MetadataModel, AbstractEditor, VideoList) {
 
         templateName: "metadata-string-entry",
 
-        getValueFromEditor : function () {
+        getValueFromEditor: function () {
             var $input = this.$el.find('#' + this.uniqueId);
 
             return $input.val();
@@ -377,13 +392,191 @@ function(BaseView, _, MetadataModel, AbstractEditor, VideoList) {
             ].join(':');
         },
 
-        setValueInEditor : function (value) {
+        setValueInEditor: function (value) {
             if (!value) {
                 value = this.defaultValue;
             }
 
             this.$el.find('input').val(value);
+        },
+
+        addSelection: function (event) {
+            $(event.currentTarget).select();
+        },
+
+        mouseUpHandler: function (event) {
+            // Prevents default behavior to make works selection in WebKit
+            // browsers
+            event.preventDefault();
         }
+    });
+
+    Metadata.Dict = AbstractEditor.extend({
+
+        events: {
+            "click .setting-clear" : "clear",
+            "keypress .setting-input" : "showClearButton",
+            "change input" : "updateModel",
+            "input input" : "enableAdd",
+            "click .create-setting" : "addEntry",
+            "click .remove-setting" : "removeEntry"
+        },
+
+        templateName: "metadata-dict-entry",
+
+        getValueFromEditor: function () {
+            var dict = {};
+
+            _.each(this.$el.find('li'), function(li, index) {
+                var key = $(li).find('.input-key').val().trim(),
+                    value = $(li).find('.input-value').val().trim();
+
+                // Keys should be unique, so if our keys are duplicated and
+                // second key is empty or key and value are empty just do
+                // nothing. Otherwise, it'll be overwritten by the new value.
+                if (value === '') {
+                    if (key === '' || key in dict) {
+                        return false;
+                    }
+                }
+
+                dict[key] = value;
+            });
+
+            return dict;
+        },
+
+        setValueInEditor: function (value) {
+            var list = this.$el.find('ol'),
+                frag = document.createDocumentFragment();
+
+            _.each(value, function(value, key) {
+                var template = _.template(
+                    '<li class="list-settings-item">' +
+                        '<input type="text" class="input input-key" value="<%= key %>">' +
+                        '<input type="text" class="input input-value" value="<%= value %>">' +
+                        '<a href="#" class="remove-action remove-setting" data-value="<%= value %>"><i class="icon fa fa-times-circle" aria-hidden="true"></i><span class="sr">Remove</span></a>' +
+                    '</li>'
+                );
+
+                frag.appendChild($(template({'key': key, 'value': value}))[0]);
+            });
+
+            list.html([frag]);
+        },
+
+        addEntry: function(event) {
+            event.preventDefault();
+            // We don't call updateModel here since it's bound to the
+            // change event
+            var dict = $.extend(true, {}, this.model.get('value')) || {};
+            dict[''] = '';
+            this.setValueInEditor(dict);
+            this.$el.find('.create-setting').addClass('is-disabled').attr('aria-disabled', true);
+        },
+
+        removeEntry: function(event) {
+            event.preventDefault();
+            var entry = $(event.currentTarget).siblings('.input-key').val();
+            this.setValueInEditor(_.omit(this.model.get('value'), entry));
+            this.updateModel();
+            this.$el.find('.create-setting').removeClass('is-disabled').attr('aria-disabled', false);
+        },
+
+        enableAdd: function() {
+            this.$el.find('.create-setting').removeClass('is-disabled').attr('aria-disabled', false);
+        },
+
+        clear: function() {
+            AbstractEditor.prototype.clear.apply(this, arguments);
+            if (_.isNull(this.model.getValue())) {
+                this.$el.find('.create-setting').removeClass('is-disabled').attr('aria-disabled', false);
+            }
+        }
+    });
+
+
+    /**
+     * Provides convenient way to upload/download files in component edit.
+     * The editor uploads files directly to course assets and stores link
+     * to uploaded file.
+     */
+    Metadata.FileUploader = AbstractEditor.extend({
+
+        events : {
+            "click .upload-setting" : "upload",
+            "click .setting-clear" : "clear"
+        },
+
+        templateName: "metadata-file-uploader-entry",
+        templateButtonsName: "metadata-file-uploader-item",
+
+        initialize: function () {
+            this.buttonTemplate = this.loadTemplate(this.templateButtonsName);
+            AbstractEditor.prototype.initialize.apply(this);
+        },
+
+        getValueFromEditor: function () {
+            return this.$('#' + this.uniqueId).val();
+        },
+
+        setValueInEditor: function (value) {
+            var html = this.buttonTemplate({
+                model: this.model,
+                uniqueId: this.uniqueId
+            });
+
+            this.$('#' + this.uniqueId).val(value);
+            this.$('.wrapper-uploader-actions').html(html);
+        },
+
+        upload: function (event) {
+            var self = this,
+                target = $(event.currentTarget),
+                url = '/assets/' + this.options.courseKey + '/',
+                model = new FileUpload({
+                    title: gettext('Upload File'),
+                }),
+                view = new UploadDialog({
+                    model: model,
+                    url: url,
+                    parentElement: target.closest('.xblock-editor'),
+                    onSuccess: function (response) {
+                        if (response['asset'] && response['asset']['url']) {
+                            self.model.setValue(response['asset']['url']);
+                        }
+                    }
+                }).show();
+
+            event.preventDefault();
+        }
+    });
+
+    Metadata.License = AbstractEditor.extend({
+
+        initialize: function(options) {
+            this.licenseModel = new LicenseModel({"asString": this.model.getValue()});
+            this.licenseView = new LicenseView({model: this.licenseModel});
+
+            // Rerender when the license model changes
+            this.listenTo(this.licenseModel, 'change', this.setLicense);
+            this.render();
+        },
+
+        render: function() {
+            this.licenseView.render().$el.css("display", "inline");
+            this.licenseView.undelegateEvents();
+            this.$el.empty().append(this.licenseView.el);
+            // restore event bindings
+            this.licenseView.delegateEvents();
+            return this;
+        },
+
+        setLicense: function() {
+            this.model.setValue(this.licenseModel.toString());
+            this.render()
+        }
+
     });
 
     return Metadata;

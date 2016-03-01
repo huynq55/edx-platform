@@ -1,25 +1,47 @@
-from calc import evaluator
-from cmath import isinf
+"""
+Utility functions for capa.
+"""
+import bleach
+from decimal import Decimal
 
+from calc import evaluator
+from cmath import isinf, isnan
+import re
+from lxml import etree
 #-----------------------------------------------------------------------------
 #
 # Utility functions used in CAPA responsetypes
 default_tolerance = '0.001%'
 
 
-def compare_with_tolerance(v1, v2, tol=default_tolerance):
+def compare_with_tolerance(student_complex, instructor_complex, tolerance=default_tolerance, relative_tolerance=False):
     """
-    Compare v1 to v2 with maximum tolerance tol.
+    Compare student_complex to instructor_complex with maximum tolerance tolerance.
 
-    tol is relative if it ends in %; otherwise, it is absolute.
+     - student_complex    :  student result (float complex number)
+     - instructor_complex    :  instructor result (float complex number)
+     - tolerance   :  float, or string (representing a float or a percentage)
+     - relative_tolerance: bool, to explicitly use passed tolerance as relative
 
-     - v1    :  student result (float complex number)
-     - v2    :  instructor result (float complex number)
-     - tol   :  tolerance (string representing a number)
+     Note: when a tolerance is a percentage (i.e. '10%'), it will compute that
+     percentage of the instructor result and yield a number.
 
-     Default tolerance of 1e-3% is added to compare two floats for near-equality
-     (to handle machine representation errors).
-     It is relative, as the acceptable difference between two floats depends on the magnitude of the floats.
+     If relative_tolerance is set to False, it will use that value and the
+     instructor result to define the bounds of valid student result:
+     instructor_complex = 10, tolerance = '10%' will give [9.0, 11.0].
+
+     If relative_tolerance is set to True, it will use that value and both
+     instructor result and student result to define the bounds of valid student
+     result:
+     instructor_complex = 10, student_complex = 20, tolerance = '10%' will give
+     [8.0, 12.0].
+     This is typically used internally to compare float, with a
+     default_tolerance = '0.001%'.
+
+     Default tolerance of 1e-3% is added to compare two floats for
+     near-equality (to handle machine representation errors).
+     Default tolerance is relative, as the acceptable difference between two
+     floats depends on the magnitude of the floats.
      (http://randomascii.wordpress.com/2012/02/25/comparing-floating-point-numbers-2012-edition/)
      Examples:
         In [183]: 0.000016 - 1.6*10**-5
@@ -27,22 +49,45 @@ def compare_with_tolerance(v1, v2, tol=default_tolerance):
         In [212]: 1.9e24 - 1.9*10**24
         Out[212]: 268435456.0
     """
-    relative = tol.endswith('%')
-    if relative:
-        tolerance_rel = evaluator(dict(), dict(), tol[:-1]) * 0.01
-        tolerance = tolerance_rel * max(abs(v1), abs(v2))
-    else:
-        tolerance = evaluator(dict(), dict(), tol)
+    if isinstance(tolerance, str):
+        if tolerance == default_tolerance:
+            relative_tolerance = True
+        if tolerance.endswith('%'):
+            tolerance = evaluator(dict(), dict(), tolerance[:-1]) * 0.01
+            if not relative_tolerance:
+                tolerance = tolerance * abs(instructor_complex)
+        else:
+            tolerance = evaluator(dict(), dict(), tolerance)
 
-    if isinf(v1) or isinf(v2):
-        # If an input is infinite, we can end up with `abs(v1-v2)` and
+    if relative_tolerance:
+        tolerance = tolerance * max(abs(student_complex), abs(instructor_complex))
+
+    if isinf(student_complex) or isinf(instructor_complex):
+        # If an input is infinite, we can end up with `abs(student_complex-instructor_complex)` and
         # `tolerance` both equal to infinity. Then, below we would have
         # `inf <= inf` which is a fail. Instead, compare directly.
-        return v1 == v2
+        return student_complex == instructor_complex
+
+    # because student_complex and instructor_complex are not necessarily
+    # complex here, we enforce it here:
+    student_complex = complex(student_complex)
+    instructor_complex = complex(instructor_complex)
+
+    # if both the instructor and student input are real,
+    # compare them as Decimals to avoid rounding errors
+    if not (instructor_complex.imag or student_complex.imag):
+        # if either of these are not a number, short circuit and return False
+        if isnan(instructor_complex.real) or isnan(student_complex.real):
+            return False
+        student_decimal = Decimal(str(student_complex.real))
+        instructor_decimal = Decimal(str(instructor_complex.real))
+        tolerance_decimal = Decimal(str(tolerance))
+        return abs(student_decimal - instructor_decimal) <= tolerance_decimal
+
     else:
         # v1 and v2 are, in general, complex numbers:
         # there are some notes about backward compatibility issue: see responsetypes.get_staff_ans()).
-        return abs(v1 - v2) <= tolerance
+        return abs(student_complex - instructor_complex) <= tolerance
 
 
 def contextualize_text(text, context):  # private
@@ -113,3 +158,40 @@ def find_with_default(node, path, default):
         return v.text
     else:
         return default
+
+
+def sanitize_html(html_code):
+    """
+    Sanitize html_code for safe embed on LMS pages.
+
+    Used to sanitize XQueue responses from Matlab.
+    """
+    attributes = bleach.ALLOWED_ATTRIBUTES.copy()
+    # Yuck! but bleach does not offer the option of passing in allowed_protocols,
+    # and matlab uses data urls for images
+    if u'data' not in bleach.BleachSanitizer.allowed_protocols:
+        bleach.BleachSanitizer.allowed_protocols.append(u'data')
+    attributes.update({
+        '*': ['class', 'style', 'id'],
+        'audio': ['controls', 'autobuffer', 'autoplay', 'src'],
+        'img': ['src', 'width', 'height', 'class']
+    })
+    output = bleach.clean(
+        html_code,
+        tags=bleach.ALLOWED_TAGS + ['div', 'p', 'audio', 'pre', 'img', 'span'],
+        styles=['white-space'],
+        attributes=attributes
+    )
+    return output
+
+
+def get_inner_html_from_xpath(xpath_node):
+    """
+    Returns inner html as string from xpath node.
+
+    """
+    # returns string from xpath node
+    html = etree.tostring(xpath_node).strip()
+    # strips outer tag from html string
+    inner_html = re.sub('(?ms)<%s[^>]*>(.*)</%s>' % (xpath_node.tag, xpath_node.tag), '\\1', html)
+    return inner_html.strip()

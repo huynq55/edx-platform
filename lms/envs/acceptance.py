@@ -5,7 +5,7 @@ so that we can run the lettuce acceptance tests.
 
 # We intentionally define lots of variables that aren't used, and
 # want to import all variables from base settings files
-# pylint: disable=W0401, W0614
+# pylint: disable=wildcard-import, unused-wildcard-import
 
 from .test import *
 from .sauce import *
@@ -13,50 +13,45 @@ from .sauce import *
 # You need to start the server in debug mode,
 # otherwise the browser will not render the pages correctly
 DEBUG = True
+SITE_NAME = 'localhost:{}'.format(LETTUCE_SERVER_PORT)
 
 # Output Django logs to a file
 import logging
 logging.basicConfig(filename=TEST_ROOT / "log" / "lms_acceptance.log", level=logging.ERROR)
 
+# set root logger level
+logging.getLogger().setLevel(logging.ERROR)
+
 import os
-from random import choice, randint
-import string
+from random import choice
 
 
 def seed():
     return os.getppid()
 
-# Use the mongo store for acceptance tests
-DOC_STORE_CONFIG = {
-    'host': 'localhost',
-    'db': 'acceptance_xmodule',
-    'collection': 'acceptance_modulestore_%s' % seed(),
-}
+# Silence noisy logs
+LOG_OVERRIDES = [
+    ('track.middleware', logging.CRITICAL),
+    ('codejail.safe_exec', logging.ERROR),
+    ('edx.courseware', logging.ERROR),
+    ('audit', logging.ERROR),
+    ('instructor_task.api_helper', logging.ERROR),
+]
 
-modulestore_options = {
-    'default_class': 'xmodule.hidden_module.HiddenDescriptor',
-    'fs_root': TEST_ROOT / "data",
-    'render_template': 'edxmako.shortcuts.render_to_string',
-}
+for log_name, log_level in LOG_OVERRIDES:
+    logging.getLogger(log_name).setLevel(log_level)
 
-MODULESTORE = {
-    'default': {
-        'ENGINE': 'xmodule.modulestore.mixed.MixedModuleStore',
-        'OPTIONS': {
-            'mappings': {},
-            'stores': {
-                'default': {
-                    'ENGINE': 'xmodule.modulestore.mongo.MongoModuleStore',
-                    'DOC_STORE_CONFIG': DOC_STORE_CONFIG,
-                    'OPTIONS': modulestore_options
-                }
-            }
-        }
-    }
-}
-
-MODULESTORE['direct'] = MODULESTORE['default']
-
+update_module_store_settings(
+    MODULESTORE,
+    doc_store_settings={
+        'db': 'acceptance_xmodule',
+        'collection': 'acceptance_modulestore_%s' % seed(),
+    },
+    module_store_options={
+        'fs_root': TEST_ROOT / "data",
+    },
+    default_store=os.environ.get('DEFAULT_STORE', 'draft'),
+)
 CONTENTSTORE = {
     'ENGINE': 'xmodule.contentstore.mongo.MongoContentStore',
     'DOC_STORE_CONFIG': {
@@ -65,7 +60,7 @@ CONTENTSTORE = {
     }
 }
 
-# Set this up so that rake lms[acceptance] and running the
+# Set this up so that 'paver lms --settings=acceptance' and running the
 # harvest command both use the same (test) database
 # which they can flush without messing up your dev db
 DATABASES = {
@@ -73,6 +68,18 @@ DATABASES = {
         'ENGINE': 'django.db.backends.sqlite3',
         'NAME': TEST_ROOT / "db" / "test_edx.db",
         'TEST_NAME': TEST_ROOT / "db" / "test_edx.db",
+        'OPTIONS': {
+            'timeout': 30,
+        },
+        'ATOMIC_REQUESTS': True,
+    },
+    'student_module_history': {
+        'ENGINE': 'django.db.backends.sqlite3',
+        'NAME': TEST_ROOT / "db" / "test_student_module_history.db",
+        'TEST_NAME': TEST_ROOT / "db" / "test_student_module_history.db",
+        'OPTIONS': {
+            'timeout': 30,
+        },
     }
 }
 
@@ -82,21 +89,40 @@ TRACKING_BACKENDS.update({
     }
 })
 
+EVENT_TRACKING_BACKENDS['tracking_logs']['OPTIONS']['backends'].update({
+    'mongo': {
+        'ENGINE': 'eventtracking.backends.mongodb.MongoBackend',
+        'OPTIONS': {
+            'database': 'track'
+        }
+    }
+})
 
-# Enable asset pipeline
-# Our fork of django-pipeline uses `PIPELINE` instead of `PIPELINE_ENABLED`
-# PipelineFinder is explained here: http://django-pipeline.readthedocs.org/en/1.1.24/storages.html
-PIPELINE = True
-STATICFILES_FINDERS += ('pipeline.finders.PipelineFinder', )
 
 BULK_EMAIL_DEFAULT_FROM_EMAIL = "test@test.org"
 
 # Forums are disabled in test.py to speed up unit tests, but we do not have
-# per-test control for acceptance tests
-FEATURES['ENABLE_DISCUSSION_SERVICE'] = True
+# per-test control for lettuce acceptance tests.
+# If you are writing an acceptance test that needs the discussion service enabled,
+# do not write it in lettuce, but instead write it using bok-choy.
+# DO NOT CHANGE THIS SETTING HERE.
+FEATURES['ENABLE_DISCUSSION_SERVICE'] = False
 
 # Use the auto_auth workflow for creating users and logging them in
 FEATURES['AUTOMATIC_AUTH_FOR_TESTING'] = True
+
+# Enable third-party authentication
+FEATURES['ENABLE_THIRD_PARTY_AUTH'] = True
+THIRD_PARTY_AUTH = {
+    "Google": {
+        "SOCIAL_AUTH_GOOGLE_OAUTH2_KEY": "test",
+        "SOCIAL_AUTH_GOOGLE_OAUTH2_SECRET": "test"
+    },
+    "Facebook": {
+        "SOCIAL_AUTH_FACEBOOK_KEY": "test",
+        "SOCIAL_AUTH_FACEBOOK_SECRET": "test"
+    }
+}
 
 # Enable fake payment processing page
 FEATURES['ENABLE_PAYMENT_FAKE'] = True
@@ -105,42 +131,31 @@ FEATURES['ENABLE_PAYMENT_FAKE'] = True
 FEATURES['ENABLE_INSTRUCTOR_EMAIL'] = True
 FEATURES['REQUIRE_COURSE_EMAIL_AUTH'] = False
 
+FEATURES['ENABLE_SPECIAL_EXAMS'] = True
+
 # Don't actually send any requests to Software Secure for student identity
 # verification.
 FEATURES['AUTOMATIC_VERIFY_STUDENT_IDENTITY_FOR_TESTING'] = True
-
-# Configure the payment processor to use the fake processing page
-# Since both the fake payment page and the shoppingcart app are using
-# the same settings, we can generate this randomly and guarantee
-# that they are using the same secret.
-RANDOM_SHARED_SECRET = ''.join(
-    choice(string.letters + string.digits + string.punctuation)
-    for x in range(250)
-)
-
-CC_PROCESSOR['CyberSource']['SHARED_SECRET'] = RANDOM_SHARED_SECRET
-CC_PROCESSOR['CyberSource']['MERCHANT_ID'] = "edx"
-CC_PROCESSOR['CyberSource']['SERIAL_NUMBER'] = "0123456789012345678901"
-CC_PROCESSOR['CyberSource']['PURCHASE_ENDPOINT'] = "/shoppingcart/payment_fake"
 
 # HACK
 # Setting this flag to false causes imports to not load correctly in the lettuce python files
 # We do not yet understand why this occurs. Setting this to true is a stopgap measure
 USE_I18N = True
 
-FEATURES['ENABLE_FEEDBACK_SUBMISSION'] = True
-FEEDBACK_SUBMISSION_EMAIL = 'dummy@example.com'
+FEATURES['ENABLE_FEEDBACK_SUBMISSION'] = False
 
 # Include the lettuce app for acceptance testing, including the 'harvest' django-admin command
 INSTALLED_APPS += ('lettuce.django',)
-LETTUCE_APPS = ('courseware', 'instructor',)
+LETTUCE_APPS = ('courseware', 'instructor')
 
 # Lettuce appears to have a bug that causes it to search
 # `instructor_task` when we specify the `instructor` app.
 # This causes some pretty cryptic errors as lettuce tries
 # to parse files in `instructor_task` as features.
 # As a quick workaround, explicitly exclude the `instructor_task` app.
-LETTUCE_AVOID_APPS = ('instructor_task',)
+# The coursewarehistoryextended app also falls prey to this fuzzy
+# for the courseware app.
+LETTUCE_AVOID_APPS = ('instructor_task', 'coursewarehistoryextended')
 
 LETTUCE_BROWSER = os.environ.get('LETTUCE_BROWSER', 'chrome')
 
@@ -156,7 +171,7 @@ SELENIUM_GRID = {
 #####################################################################
 # See if the developer has any local overrides.
 try:
-    from .private import *  # pylint: disable=F0401
+    from .private import *  # pylint: disable=import-error
 except ImportError:
     pass
 
@@ -173,4 +188,24 @@ XQUEUE_INTERFACE = {
 }
 
 # Point the URL used to test YouTube availability to our stub YouTube server
-YOUTUBE_TEST_URL = "http://127.0.0.1:{0}/test_youtube/".format(YOUTUBE_PORT)
+YOUTUBE['API'] = "http://127.0.0.1:{0}/get_youtube_api/".format(YOUTUBE_PORT)
+YOUTUBE['METADATA_URL'] = "http://127.0.0.1:{0}/test_youtube/".format(YOUTUBE_PORT)
+YOUTUBE['TEXT_API']['url'] = "127.0.0.1:{0}/test_transcripts_youtube/".format(YOUTUBE_PORT)
+
+if FEATURES.get('ENABLE_COURSEWARE_SEARCH') or \
+   FEATURES.get('ENABLE_DASHBOARD_SEARCH') or \
+   FEATURES.get('ENABLE_COURSE_DISCOVERY'):
+    # Use MockSearchEngine as the search engine for test scenario
+    SEARCH_ENGINE = "search.tests.mock_search_engine.MockSearchEngine"
+
+# Generate a random UUID so that different runs of acceptance tests don't break each other
+import uuid
+SECRET_KEY = uuid.uuid4().hex
+
+############################### PIPELINE #######################################
+
+PIPELINE_ENABLED = False
+
+# We want to make sure that any new migrations are run
+# see https://groups.google.com/forum/#!msg/django-developers/PWPj3etj3-U/kCl6pMsQYYoJ
+MIGRATION_MODULES = {}

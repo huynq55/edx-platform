@@ -4,14 +4,12 @@ Settings for the LMS that runs alongside the CMS on AWS
 
 # We intentionally define lots of variables that aren't used, and
 # want to import all variables from base settings files
-# pylint: disable=W0401, W0614
+# pylint: disable=wildcard-import, unused-wildcard-import
 
 from ..dev import *
 
-FEATURES['AUTH_USE_MIT_CERTIFICATES'] = False
+FEATURES['AUTH_USE_CERTIFICATES'] = False
 
-SUBDOMAIN_BRANDING['edge'] = 'edge'
-SUBDOMAIN_BRANDING['preview.edge'] = 'edge'
 VIRTUAL_UNIVERSITIES = ['edge']
 
 # Turn off this flag because it will render 'Edit / QA' links for all instructor viewings of
@@ -21,25 +19,6 @@ VIRTUAL_UNIVERSITIES = ['edge']
 FEATURES['ENABLE_LMS_MIGRATION'] = False
 
 META_UNIVERSITIES = {}
-
-modulestore_options = {
-    'default_class': 'xmodule.hidden_module.HiddenDescriptor',
-    'fs_root': DATA_DIR,
-    'render_template': 'edxmako.shortcuts.render_to_string',
-}
-
-MODULESTORE = {
-    'default': {
-        'ENGINE': 'xmodule.modulestore.mongo.MongoModuleStore',
-        'DOC_STORE_CONFIG': DOC_STORE_CONFIG,
-        'OPTIONS': modulestore_options,
-    },
-    'draft': {
-        'ENGINE': 'xmodule.modulestore.mongo.DraftMongoModuleStore',
-        'DOC_STORE_CONFIG': DOC_STORE_CONFIG,
-        'OPTIONS': modulestore_options,
-    },
-}
 
 CONTENTSTORE = {
     'ENGINE': 'xmodule.contentstore.mongo.MongoContentStore',
@@ -52,16 +31,16 @@ CONTENTSTORE = {
 INSTALLED_APPS += (
     # Mongo perf stats
     'debug_toolbar_mongo',
-    )
+)
 
 
 DEBUG_TOOLBAR_PANELS += (
-   'debug_toolbar_mongo.panel.MongoDebugPanel',
-   )
+    'debug_toolbar_mongo.panel.MongoDebugPanel',
+)
 
 # HOSTNAME_MODULESTORE_DEFAULT_MAPPINGS defines, as dictionary of regex's, a set of mappings of HTTP request hostnames to
 # what the 'default' modulestore to use while processing the request
 # for example 'preview.edx.org' should use the draft modulestore
 HOSTNAME_MODULESTORE_DEFAULT_MAPPINGS = {
-    'preview\.': 'draft'
+    'preview\.': 'draft-preferred'
 }

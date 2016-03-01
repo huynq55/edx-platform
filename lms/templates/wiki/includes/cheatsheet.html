@@ -1,10 +1,10 @@
 {% load i18n %}
 <section id="cheatsheetModal" class="modal" aria-hidden="true">
   <div class="inner-wrapper" role="dialog" aria-labelledby="cheatsheet-title">
-    <button class="close-modal">&#10005; <span class="sr">{% trans 'Close Modal' %}</span></button>
+    <button class="close-modal"><i class="icon fa fa-remove"></i> <span class="sr">{% trans 'Close' %}</span></button>
 
     <header>
-      <h2 id="cheatsheet-title">{% trans "Wiki Cheatsheet" %}<span class="sr">, {% trans "modal open" %}</span></h2>
+      <h2 id="cheatsheet-title">{% trans "Wiki Cheatsheet" %}<span class="sr">, {% trans "window open" %}</span></h2>
       <hr/>
     </header>
     <div id="cheatsheet-body" class="modal-body">
@@ -21,10 +21,8 @@
           <pre>{% trans "[Article Name](wiki:ArticleName)" %}</pre>
         </section>
         <section>
-          {# Translators: Do not translate "edX" #}
-          <h3>{% trans "edX Additions:" %}</h3>
-          <pre>circuit-schematic:</pre>
-          <pre>$LaTeX Math Expression$</pre>
+          <h3>{% blocktrans with platform_name=settings.PLATFORM_NAME %}{{ platform_name }} Additions:{% endblocktrans %}</h3>
+          <pre>$LaTeX {% trans "Math Expression" %}$</pre>
         </section>
       </div>
 
@@ -33,8 +31,8 @@
               <h3>{% trans "Useful examples:" %}</h3>
               <pre>
 http://wikipedia.org
-[Wikipedia](http://wikipedia.org)
-[edX Wiki](wiki:/edx/)
+[{% trans "Wikipedia" %}](http://wikipedia.org)
+[{% blocktrans with platform_name=settings.PLATFORM_NAME %}{{ platform_name }} Wiki{% endblocktrans %}](wiki:/edx/)
               </pre>
               <pre>
 {% trans "Huge Header" %}

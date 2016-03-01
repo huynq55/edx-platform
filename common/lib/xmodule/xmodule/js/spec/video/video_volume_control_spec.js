@@ -1,209 +1,321 @@
-(function (undefined) {
-    describe('VideoVolumeControl', function () {
-        var state, oldOTBD;
+(function () {
+'use strict';
+describe('VideoVolumeControl', function () {
+    var state, oldOTBD, volumeControl;
+
+    var KEY = $.ui.keyCode,
+
+    keyPressEvent = function(key) {
+        return $.Event('keydown', { keyCode: key });
+    };
+
+    beforeEach(function () {
+        oldOTBD = window.onTouchBasedDevice;
+        window.onTouchBasedDevice = jasmine.createSpy('onTouchBasedDevice')
+            .andReturn(null);
+    });
+
+    afterEach(function () {
+        $('source').remove();
+        window.onTouchBasedDevice = oldOTBD;
+        state.storage.clear();
+        state.videoPlayer.destroy();
+    });
+
+    it('Volume level has correct value even if cookie is broken', function () {
+        $.cookie.andReturn('broken_cookie');
+        state = jasmine.initializePlayer();
+        volumeControl = state.videoVolumeControl;
+        expect(volumeControl.volume).toEqual(100);
+    });
+
+    describe('constructor', function () {
+        beforeEach(function () {
+            spyOn($.fn, 'slider').andCallThrough();
+            $.cookie.andReturn('75');
+            state = jasmine.initializePlayer();
+            volumeControl = state.videoVolumeControl;
+        });
+
+        it('initialize volume to 75%', function () {
+            expect(volumeControl.volume).toEqual(75);
+        });
+
+        it('render the volume control', function () {
+            expect($('.volume')).toExist();
+        });
+
+        it('create the slider', function () {
+            expect($.fn.slider.calls[2].args).toEqual([{
+                orientation: 'vertical',
+                range: 'min',
+                min: 0,
+                max: 100,
+                slide: jasmine.any(Function)
+            }]);
+            expect($.fn.slider).toHaveBeenCalledWith(
+                'value', volumeControl.volume
+            );
+        });
+
+        it('add ARIA attributes to live region', function () {
+            var liveRegion = $('.video-live-region');
+
+            expect(liveRegion).toHaveAttrs({
+                'aria-live': 'polite'
+            });
+        });
+
+        it('add ARIA attributes to volume control', function () {
+            var button = $('.volume .control');
+
+            expect(button).toHaveAttrs({
+                'aria-disabled': 'false'
+            });
+        });
+
+        it('bind the volume control', function () {
+            var button = $('.volume .control');
+
+            expect(button).toHandle('keydown');
+            expect(button).toHandle('mousedown');
+            expect($('.volume')).not.toHaveClass('is-opened');
+
+            $('.volume').mouseenter();
+            expect($('.volume')).toHaveClass('is-opened');
+
+            $('.volume').mouseleave();
+            expect($('.volume')).not.toHaveClass('is-opened');
+        });
+    });
+
+    describe('setVolume', function () {
+        beforeEach(function () {
+            state = jasmine.initializePlayer();
+            volumeControl = state.videoVolumeControl;
+
+            this.addMatchers({
+                assertLiveRegionState: function (volume, expectation) {
+                    var region = $('.video-live-region');
+
+                    var getExpectedText = function (text) {
+                        return text + ' Volume.';
+                    };
+
+                    this.actual.setVolume(volume, true, true);
+                    return region.text() === getExpectedText(expectation);
+                }
+            });
+        });
+
+        it('update is not called, if new volume equals current', function () {
+            volumeControl.volume = 60;
+            spyOn(volumeControl, 'updateSliderView');
+            volumeControl.setVolume(60, false, true);
+            expect(volumeControl.updateSliderView).not.toHaveBeenCalled();
+        });
+
+        it('volume is changed on sliding', function () {
+            volumeControl.onSlideHandler(null, {value: 99});
+            expect(volumeControl.volume).toBe(99);
+        });
+
+        describe('when the new volume is more than 0', function () {
+            beforeEach(function () {
+                volumeControl.setVolume(60, false, true);
+            });
+
+            it('set the player volume', function () {
+                expect(volumeControl.volume).toEqual(60);
+            });
+
+            it('remove muted class', function () {
+                expect($('.volume')).not.toHaveClass('is-muted');
+            });
+        });
+
+        describe('when the new volume is more than 0, but was 0', function () {
+             it('remove muted class', function () {
+                volumeControl.setVolume(0, false, true);
+                expect($('.volume')).toHaveClass('is-muted');
+                state.el.trigger('volumechange', [20]);
+                expect($('.volume')).not.toHaveClass('is-muted');
+            });
+        });
+
+        describe('when the new volume is 0', function () {
+            beforeEach(function () {
+                volumeControl.setVolume(0, false, true);
+            });
+
+            it('set the player volume', function () {
+                expect(volumeControl.volume).toEqual(0);
+            });
+
+            it('add muted class', function () {
+                expect($('.volume')).toHaveClass('is-muted');
+            });
+        });
+
+        it('when the new volume is Muted', function () {
+            expect(volumeControl).assertLiveRegionState(0, 'Muted');
+        });
+
+        it('when the new volume is in ]0,20]', function () {
+            expect(volumeControl).assertLiveRegionState(10, 'Very low');
+        });
+
+        it('when the new volume is in ]20,40]', function () {
+            expect(volumeControl).assertLiveRegionState(30, 'Low');
+        });
+
+        it('when the new volume is in ]40,60]', function () {
+            expect(volumeControl).assertLiveRegionState(50, 'Average');
+        });
+
+        it('when the new volume is in ]60,80]', function () {
+            expect(volumeControl).assertLiveRegionState(70, 'Loud');
+        });
+
+        it('when the new volume is in ]80,100[', function () {
+            expect(volumeControl).assertLiveRegionState(90, 'Very loud');
+        });
+
+        it('when the new volume is Maximum', function () {
+            expect(volumeControl).assertLiveRegionState(100, 'Maximum');
+        });
+    });
+
+    describe('increaseVolume', function () {
 
         beforeEach(function () {
-            oldOTBD = window.onTouchBasedDevice;
-            window.onTouchBasedDevice = jasmine.createSpy('onTouchBasedDevice')
-                .andReturn(null);
-
-        afterEach(function () {
-            $('source').remove();
-            window.onTouchBasedDevice = oldOTBD;
+            state = jasmine.initializePlayer();
+            volumeControl = state.videoVolumeControl;
         });
 
-        describe('constructor', function () {
+        it('volume is increased correctly', function () {
+            var button = $('.volume .control');
+            volumeControl.volume = 60;
+
+            // adjust the volume
+            button.focus();
+            button.trigger(keyPressEvent(KEY.UP));
+            expect(volumeControl.volume).toEqual(80);
+        });
+
+        it('volume level is not changed if it is already max', function () {
+            volumeControl.volume = 100;
+            volumeControl.increaseVolume();
+            expect(volumeControl.volume).toEqual(100);
+        });
+    });
+
+    describe('decreaseVolume', function () {
+
+        beforeEach(function () {
+            state = jasmine.initializePlayer();
+            volumeControl = state.videoVolumeControl;
+        });
+
+        it('volume is decreased correctly', function () {
+            var button = $('.volume .control');
+            volumeControl.volume = 60;
+
+            // adjust the volume
+            button.focus();
+            button.trigger(keyPressEvent(KEY.DOWN));
+            expect(volumeControl.volume).toEqual(40);
+        });
+
+        it('volume level is not changed if it is already min', function () {
+            volumeControl.volume = 0;
+            volumeControl.decreaseVolume();
+            expect(volumeControl.volume).toEqual(0);
+        });
+    });
+
+    describe('toggleMute', function () {
+        beforeEach(function () {
+            state = jasmine.initializePlayer();
+            volumeControl = state.videoVolumeControl;
+        });
+
+        describe('when the current volume is more than 0', function () {
             beforeEach(function () {
-                spyOn($.fn, 'slider').andCallThrough();
-                state = jasmine.initializePlayer();
+                volumeControl.volume = 60;
+                volumeControl.button.trigger('mousedown');
             });
 
-            it('initialize currentVolume to 100%', function () {
-                // Please note that:
-                //     0%   -> 0
-                //     100% -> 1.0
-                expect(state.videoVolumeControl.currentVolume).toEqual(1);
+            it('save the previous volume', function () {
+                expect(volumeControl.storedVolume).toEqual(60);
             });
 
-            it('render the volume control', function () {
-                expect(state.videoControl.secondaryControlsEl.html())
-                    .toContain("<div class=\"volume\">\n");
-            });
-
-            it('create the slider', function () {
-                expect($.fn.slider).toHaveBeenCalledWith({
-                    orientation: "vertical",
-                    range: "min",
-                    min: 0,
-                    max: 100,
-                    value: state.videoVolumeControl.currentVolume,
-                    change: state.videoVolumeControl.onChange,
-                    slide: state.videoVolumeControl.onChange
-                });
-            });
-
-            it('add ARIA attributes to slider handle', function () {
-                var sliderHandle = $('div.volume-slider>a.ui-slider-handle'),
-                    arr = [
-                        'muted', 'very low', 'low', 'average', 'loud',
-                        'very loud', 'maximum'
-                    ];
-
-                expect(sliderHandle).toHaveAttrs({
-                    'role': 'slider',
-                    'title': 'volume',
-                    'aria-disabled': 'false',
-                    'aria-valuemin': '0',
-                    'aria-valuemax': '100'
-                });
-                expect(sliderHandle.attr('aria-valuenow')).toBeInRange(0, 100);
-                expect(sliderHandle.attr('aria-valuetext')).toBeInArray(arr);
-            });
-
-            it('add ARIA attributes to volume control', function () {
-                var volumeControl = $('div.volume>a');
-
-                expect(volumeControl).toHaveAttrs({
-                    'role': 'button',
-                    'title': 'Volume',
-                    'aria-disabled': 'false'
-                });
-            });
-
-            it('bind the volume control', function () {
-                expect($('.volume>a')).toHandleWith(
-                    'click', state.videoVolumeControl.toggleMute
-                );
-                expect($('.volume')).not.toHaveClass('open');
-
-                $('.volume').mouseenter();
-                expect($('.volume')).toHaveClass('open');
-
-                $('.volume').mouseleave();
-                expect($('.volume')).not.toHaveClass('open');
+            it('set the player volume', function () {
+                expect(volumeControl.volume).toEqual(0);
             });
         });
 
-        describe('onChange', function () {
-            var initialData = [{
-                range: 'muted',
-                value: 0,
-                expectation: 'muted'
-            }, {
-                range: 'in ]0,20]',
-                value: 10,
-                expectation: 'very low'
-            }, {
-                range: 'in ]20,40]',
-                value: 30,
-                expectation: 'low'
-            }, {
-                range: 'in ]40,60]',
-                value: 50,
-                expectation: 'average'
-            }, {
-                range: 'in ]60,80]',
-                value: 70,
-                expectation: 'loud'
-            }, {
-                range: 'in ]80,100[',
-                value: 90,
-                expectation: 'very loud'
-            }, {
-                range: 'maximum',
-                value: 100,
-                expectation: 'maximum'
-            }];
-
+        describe('when the current volume is 0', function () {
             beforeEach(function () {
-                state = jasmine.initializePlayer();
+                volumeControl.volume = 0;
+                volumeControl.storedVolume = 60;
+                volumeControl.button.trigger('mousedown');
             });
 
-            describe('when the new volume is more than 0', function () {
-                beforeEach(function () {
-                    state.videoVolumeControl.onChange(void 0, {
-                        value: 60
-                    });
-                });
-
-                it('set the player volume', function () {
-                    expect(state.videoVolumeControl.currentVolume).toEqual(60);
-                });
-
-                it('remote muted class', function () {
-                    expect($('.volume')).not.toHaveClass('muted');
-                });
-            });
-
-            describe('when the new volume is 0', function () {
-                beforeEach(function () {
-                    state.videoVolumeControl.onChange(void 0, {
-                        value: 0
-                    });
-                });
-
-                it('set the player volume', function () {
-                    expect(state.videoVolumeControl.currentVolume).toEqual(0);
-                });
-
-                it('add muted class', function () {
-                    expect($('.volume')).toHaveClass('muted');
-                });
-            });
-
-            $.each(initialData, function (index, data) {
-                describe('when the new volume is ' + data.range, function () {
-                    beforeEach(function () {
-                        state.videoVolumeControl.onChange(void 0, {
-                            value: data.value
-                        });
-                    });
-
-                    it('changes ARIA attributes', function () {
-                        var sliderHandle = $(
-                            'div.volume-slider>a.ui-slider-handle'
-                        );
-
-                        expect(sliderHandle).toHaveAttrs({
-                            'aria-valuenow': data.value.toString(10),
-                            'aria-valuetext': data.expectation
-                        });
-                    });
-                });
-            });
-        });
-
-        describe('toggleMute', function () {
-            beforeEach(function () {
-                state = jasmine.initializePlayer();
-            });
-
-            describe('when the current volume is more than 0', function () {
-                beforeEach(function () {
-                    state.videoVolumeControl.currentVolume = 60;
-                    state.videoVolumeControl.buttonEl.trigger('click');
-                });
-
-                it('save the previous volume', function () {
-                    expect(state.videoVolumeControl.previousVolume).toEqual(60);
-                });
-
-                it('set the player volume', function () {
-                    expect(state.videoVolumeControl.currentVolume).toEqual(0);
-                });
-            });
-
-            describe('when the current volume is 0', function () {
-                beforeEach(function () {
-                    state.videoVolumeControl.currentVolume = 0;
-                    state.videoVolumeControl.previousVolume = 60;
-                    state.videoVolumeControl.buttonEl.trigger('click');
-                });
-
-                it('set the player volume to previous volume', function () {
-                    expect(state.videoVolumeControl.currentVolume).toEqual(60);
-                });
+            it('set the player volume to previous volume', function () {
+                expect(volumeControl.volume).toEqual(60);
             });
         });
     });
+
+    describe('keyDownHandler', function () {
+        beforeEach(function () {
+            state = jasmine.initializePlayer();
+            volumeControl = state.videoVolumeControl;
+        });
+
+        var assertVolumeIsNotChanged = function (eventObject) {
+            volumeControl.volume = 60;
+            state.el.trigger(jQuery.Event("keydown", eventObject));
+            expect(volumeControl.volume).toEqual(60);
+        };
+
+        it('nothing happens if ALT+keyUp are pushed down', function () {
+            assertVolumeIsNotChanged({
+                keyCode: KEY.UP,
+                altKey: true
+            });
+        });
+
+        it('nothing happens if SHIFT+keyUp are pushed down', function () {
+            assertVolumeIsNotChanged({
+                keyCode: KEY.UP,
+                shiftKey: true
+            });
+        });
+
+        it('nothing happens if SHIFT+keyDown are pushed down', function () {
+            assertVolumeIsNotChanged({
+                keyCode: KEY.DOWN,
+                shiftKey: true
+            });
+        });
+    });
+
+    describe('keyDownButtonHandler', function () {
+        beforeEach(function () {
+            state = jasmine.initializePlayer();
+            volumeControl = state.videoVolumeControl;
+        });
+
+        it('nothing happens if ALT+ENTER are pushed down', function () {
+            var isMuted = volumeControl.getMuteStatus();
+            $('.volume .control').trigger(jQuery.Event("keydown", {
+                keyCode: KEY.ENTER,
+                altKey: true
+            }));
+            expect(volumeControl.getMuteStatus()).toEqual(isMuted);
+        });
+    });
+});
 }).call(this);

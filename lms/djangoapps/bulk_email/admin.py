@@ -23,7 +23,7 @@ class CourseEmailTemplateAdmin(admin.ModelAdmin):
     fieldsets = (
         (None, {
             # make the HTML template display above the plain template:
-            'fields': ('html_template', 'plain_template'),
+            'fields': ('html_template', 'plain_template', 'name'),
             'description': '''
 Enter template to be used by course staff when sending emails to enrolled students.
 
@@ -36,7 +36,8 @@ Other tags that may be used (surrounded by one curly brace on each side):
 {course_title}         : the name of the course
 {course_url}           : the course's full URL
 {email}                : the user's email address
-{account_settings_url} : URL at which users can change email preferences
+{account_settings_url} : URL at which users can change account preferences
+{email_settings_url}   : URL at which users can change course email preferences
 {course_image_url}     : URL for the course's course image.
     Will return a broken link if course doesn't have a course image set.
 
@@ -49,11 +50,13 @@ unsupported tags will cause email sending to fail.
     actions = None
 
     def has_add_permission(self, request):
-        """Disables the ability to add new templates, as we want to maintain a Singleton."""
-        return False
+        """Enable the ability to add new templates, as we want to be able to define multiple templates."""
+        return True
 
     def has_delete_permission(self, request, obj=None):
-        """Disables the ability to remove existing templates, as we want to maintain a Singleton."""
+        """
+        Disables the ability to remove existing templates, as we'd like to make sure we don't have dangling references.
+        """
         return False
 
 

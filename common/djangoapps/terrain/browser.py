@@ -2,8 +2,8 @@
 Browser set up for acceptance tests.
 """
 
-#pylint: disable=E1101
-#pylint: disable=W0613
+# pylint: disable=no-member
+# pylint: disable=unused-argument
 
 from lettuce import before, after, world
 from splinter.browser import Browser
@@ -16,31 +16,14 @@ import requests
 from base64 import encodestring
 from json import dumps
 
-from pymongo import MongoClient
 import xmodule.modulestore.django
 from xmodule.contentstore.django import _CONTENTSTORE
-
-# There is an import issue when using django-staticfiles with lettuce
-# Lettuce assumes that we are using django.contrib.staticfiles,
-# but the rest of the app assumes we are using django-staticfiles
-# (in particular, django-pipeline and our mako implementation)
-# To resolve this, we check whether staticfiles is installed,
-# then redirect imports for django.contrib.staticfiles
-# to use staticfiles.
-try:
-    import staticfiles
-    import staticfiles.handlers
-except ImportError:
-    pass
-else:
-    import sys
-    sys.modules['django.contrib.staticfiles'] = staticfiles
-    sys.modules['django.contrib.staticfiles.handlers'] = staticfiles.handlers
 
 LOGGER = getLogger(__name__)
 LOGGER.info("Loading the lettuce acceptance testing terrain file...")
 
 MAX_VALID_BROWSER_ATTEMPTS = 20
+GLOBAL_SCRIPT_TIMEOUT = 60
 
 
 def get_saucelabs_username_and_key():
@@ -93,6 +76,14 @@ def initial_setup(server):
     if world.LETTUCE_SELENIUM_CLIENT == 'local':
         browser_driver = getattr(settings, 'LETTUCE_BROWSER', 'chrome')
 
+        if browser_driver == 'chrome':
+            desired_capabilities = DesiredCapabilities.CHROME
+            desired_capabilities['loggingPrefs'] = {
+                'browser': 'ALL',
+            }
+        else:
+            desired_capabilities = {}
+
         # There is an issue with ChromeDriver2 r195627 on Ubuntu
         # in which we sometimes get an invalid browser session.
         # This is a work-around to ensure that we get a valid session.
@@ -105,11 +96,18 @@ def initial_setup(server):
             # the browser session is invalid, this will
             # raise a WebDriverException
             try:
-                world.browser = Browser(browser_driver)
-                world.browser.driver.set_script_timeout(10)
+                if browser_driver == 'firefox':
+                    # Lettuce initializes differently for firefox, and sending
+                    # desired_capabilities will not work. So initialize without
+                    # sending desired_capabilities.
+                    world.browser = Browser(browser_driver)
+                else:
+                    world.browser = Browser(browser_driver, desired_capabilities=desired_capabilities)
+                world.browser.driver.set_script_timeout(GLOBAL_SCRIPT_TIMEOUT)
                 world.visit('/')
 
             except WebDriverException:
+                LOGGER.warn("Error acquiring %s browser, retrying", browser_driver, exc_info=True)
                 if hasattr(world, 'browser'):
                     world.browser.quit()
                 num_attempts += 1
@@ -133,7 +131,7 @@ def initial_setup(server):
             **make_saucelabs_desired_capabilities()
         )
         world.absorb(30, 'IMPLICIT_WAIT')
-        world.browser.set_script_timeout(10)
+        world.browser.set_script_timeout(GLOBAL_SCRIPT_TIMEOUT)
 
     elif world.LETTUCE_SELENIUM_CLIENT == 'grid':
         world.browser = Browser(
@@ -142,7 +140,7 @@ def initial_setup(server):
             browser=settings.SELENIUM_GRID.get('BROWSER'),
         )
         world.absorb(30, 'IMPLICIT_WAIT')
-        world.browser.driver.set_script_timeout(10)
+        world.browser.driver.set_script_timeout(GLOBAL_SCRIPT_TIMEOUT)
 
     else:
         raise Exception("Unknown selenium client '{}'".format(world.LETTUCE_SELENIUM_CLIENT))
@@ -162,6 +160,16 @@ def reset_data(scenario):
     world.absorb({}, 'scenario_dict')
 
 
+@before.each_scenario
+def configure_screenshots(scenario):
+    """
+    Before each scenario, turn off automatic screenshots.
+
+    Args: str, scenario. Name of current scenario.
+    """
+    world.auto_capture_screenshots = False
+
+
 @after.each_scenario
 def clear_data(scenario):
     world.spew('scenario_dict')
@@ -174,13 +182,26 @@ def reset_databases(scenario):
     whereas modulestore data is in unique collection names.  This data is created implicitly during the scenarios.
     If no data is created during the test, these lines equivilently do nothing.
     '''
-    mongo = MongoClient()
-    mongo.drop_database(settings.CONTENTSTORE['DOC_STORE_CONFIG']['db'])
+    xmodule.modulestore.django.modulestore()._drop_database()  # pylint: disable=protected-access
+    xmodule.modulestore.django.clear_existing_modulestores()
     _CONTENTSTORE.clear()
 
-    modulestore = xmodule.modulestore.django.editable_modulestore()
-    modulestore.collection.drop()
-    xmodule.modulestore.django.clear_existing_modulestores()
+
+@world.absorb
+def capture_screenshot(image_name):
+    """
+    Capture a screenshot outputting it to a defined directory.
+    This function expects only the name of the file. It will generate
+    the full path of the output screenshot.
+
+    If the name contains spaces, they ill be converted to underscores.
+    """
+    output_dir = '{}/log/auto_screenshots'.format(settings.TEST_ROOT)
+    image_name = '{}/{}.png'.format(output_dir, image_name.replace(' ', '_'))
+    try:
+        world.browser.driver.save_screenshot(image_name)
+    except WebDriverException:
+        LOGGER.error("Could not capture a screenshot '{}'".format(image_name))
 
 
 @after.each_scenario
@@ -195,6 +216,66 @@ def screenshot_on_error(scenario):
             world.browser.driver.save_screenshot(image_name)
         except WebDriverException:
             LOGGER.error('Could not capture a screenshot')
+
+
+@after.each_scenario
+def capture_console_log(scenario):
+    """
+    Save the console log to help with debugging.
+    """
+    if scenario.failed:
+        log = world.browser.driver.get_log('browser')
+        try:
+            output_dir = '{}/log'.format(settings.TEST_ROOT)
+            file_name = '{}/{}.log'.format(output_dir, scenario.name.replace(' ', '_'))
+
+            with open(file_name, 'w') as output_file:
+                for line in log:
+                    output_file.write("{}{}".format(dumps(line), '\n'))
+
+        except WebDriverException:
+            LOGGER.error('Could not capture the console log')
+
+
+def capture_screenshot_for_step(step, when):
+    """
+    Useful method for debugging acceptance tests that are run in Vagrant.
+    This method runs automatically before and after each step of an acceptance
+    test scenario. The variable:
+
+         world.auto_capture_screenshots
+
+    either enables or disabled the taking of screenshots. To change the
+    variable there is a convenient step defined:
+
+        I (enable|disable) auto screenshots
+
+    If you just want to capture a single screenshot at a desired point in code,
+    you should use the method:
+
+        world.capture_screenshot("image_name")
+    """
+    if world.auto_capture_screenshots:
+        scenario_num = step.scenario.feature.scenarios.index(step.scenario) + 1
+        step_num = step.scenario.steps.index(step) + 1
+        step_func_name = step.defined_at.function.func_name
+        image_name = "{prefix:03d}__{num:03d}__{name}__{postfix}".format(
+            prefix=scenario_num,
+            num=step_num,
+            name=step_func_name,
+            postfix=when
+        )
+        world.capture_screenshot(image_name)
+
+
+@before.each_step
+def before_each_step(step):
+    capture_screenshot_for_step(step, '1_before')
+
+
+@after.each_step
+def after_each_step(step):
+    capture_screenshot_for_step(step, '2_after')
 
 
 @after.harvest

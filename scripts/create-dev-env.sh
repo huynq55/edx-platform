@@ -307,7 +307,7 @@ EO
 
         command -v brew &>/dev/null || {
             output "Installing brew"
-            /usr/bin/ruby <(curl -fsSkL raw.github.com/mxcl/homebrew/go)
+            /usr/bin/ruby -e "$(curl -fsSL https://raw.github.com/Homebrew/homebrew/go/install)"
         }
         command -v git &>/dev/null || {
             output "Installing git"
@@ -441,27 +441,6 @@ if [[ -n $compile ]]; then
     rm -rf numpy-${NUMPY_VER} scipy-${SCIPY_VER}
 fi
 
-# building correct version of distribute from source
-DISTRIBUTE_VER="0.6.28"
-output "Building Distribute"
-SITE_PACKAGES="$WORKON_HOME/edx-platform/lib/python2.7/site-packages"
-cd "$SITE_PACKAGES"
-curl -sSLO http://pypi.python.org/packages/source/d/distribute/distribute-${DISTRIBUTE_VER}.tar.gz
-tar -xzvf distribute-${DISTRIBUTE_VER}.tar.gz
-cd distribute-${DISTRIBUTE_VER}
-python setup.py install
-cd ..
-rm distribute-${DISTRIBUTE_VER}.tar.gz
-
-DISTRIBUTE_VERSION=`pip freeze | grep distribute`
-
-if [[ "$DISTRIBUTE_VERSION" == "distribute==0.6.28" ]]; then
-  output "Distribute successfully installed"
-else
-  error "Distribute failed to build correctly. This script requires a working version of Distribute 0.6.28 in your virtualenv's python installation"
-  exit 1
-fi
-
 case `uname -s` in
     Darwin)
         # on mac os x get the latest distribute and pip
@@ -479,10 +458,14 @@ esac
 output "Installing edX pre-requirements"
 pip install -r $BASE/edx-platform/requirements/edx/pre.txt
 
+output "Installing edX paver-requirements"
+pip install -r $BASE/edx-platform/requirements/edx/paver.txt
+
+
 output "Installing edX requirements"
 # Install prereqs
 cd $BASE/edx-platform
-rake install_prereqs
+paver install_prereqs
 
 # Final dependecy
 output "Finishing Touches"
@@ -490,7 +473,7 @@ cd $BASE
 pip install argcomplete
 cd $BASE/edx-platform
 bundle install
-rake install_prereqs
+paver install_prereqs
 
 mkdir -p "$BASE/log"
 mkdir -p "$BASE/db"
@@ -523,7 +506,7 @@ if [[ ! $quiet ]]; then
 
    To start the Django on port 8000
 
-        $ rake lms
+        $ paver lms
 
    Or to start Django on a different <port#>
 

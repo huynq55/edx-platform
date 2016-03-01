@@ -13,6 +13,7 @@ from mock import Mock, MagicMock, patch
 from celery.states import SUCCESS, FAILURE
 
 from xmodule.modulestore.exceptions import ItemNotFoundError
+from opaque_keys.edx.locations import i4xEncoder
 
 from courseware.models import StudentModule
 from courseware.tests.factories import StudentModuleFactory
@@ -21,7 +22,12 @@ from student.tests.factories import UserFactory, CourseEnrollmentFactory
 from instructor_task.models import InstructorTask
 from instructor_task.tests.test_base import InstructorTaskModuleTestCase
 from instructor_task.tests.factories import InstructorTaskFactory
-from instructor_task.tasks import rescore_problem, reset_problem_attempts, delete_problem_state
+from instructor_task.tasks import (
+    rescore_problem,
+    reset_problem_attempts,
+    delete_problem_state,
+    generate_certificates,
+)
 from instructor_task.tasks_helper import UpdateProblemModuleStateError
 
 PROBLEM_URL_NAME = "test_urlname"
@@ -34,24 +40,24 @@ class TestTaskFailure(Exception):
 class TestInstructorTasks(InstructorTaskModuleTestCase):
 
     def setUp(self):
-        super(InstructorTaskModuleTestCase, self).setUp()
+        super(TestInstructorTasks, self).setUp()
         self.initialize_course()
         self.instructor = self.create_instructor('instructor')
-        self.problem_url = InstructorTaskModuleTestCase.problem_location(PROBLEM_URL_NAME)
+        self.location = self.problem_location(PROBLEM_URL_NAME)
 
     def _create_input_entry(self, student_ident=None, use_problem_url=True, course_id=None):
         """Creates a InstructorTask entry for testing."""
         task_id = str(uuid4())
         task_input = {}
         if use_problem_url:
-            task_input['problem_url'] = self.problem_url
+            task_input['problem_url'] = self.location
         if student_ident is not None:
             task_input['student'] = student_ident
 
         course_id = course_id or self.course.id
         instructor_task = InstructorTaskFactory.create(course_id=course_id,
                                                        requester=self.instructor,
-                                                       task_input=json.dumps(task_input),
+                                                       task_input=json.dumps(task_input, cls=i4xEncoder),
                                                        task_key='dummy value',
                                                        task_id=task_id)
         return instructor_task
@@ -96,15 +102,20 @@ class TestInstructorTasks(InstructorTaskModuleTestCase):
         with self.assertRaises(ItemNotFoundError):
             self._run_task_with_mock_celery(task_class, task_entry.id, task_entry.task_id)
 
-    def _test_run_with_task(self, task_class, action_name, expected_num_succeeded, expected_num_skipped=0):
+    def _test_run_with_task(self, task_class, action_name, expected_num_succeeded,
+                            expected_num_skipped=0, expected_attempted=0, expected_total=0):
         """Run a task and check the number of StudentModules processed."""
         task_entry = self._create_input_entry()
         status = self._run_task_with_mock_celery(task_class, task_entry.id, task_entry.task_id)
+        expected_attempted = expected_attempted \
+            if expected_attempted else expected_num_succeeded + expected_num_skipped
+        expected_total = expected_total \
+            if expected_total else expected_num_succeeded + expected_num_skipped
         # check return value
-        self.assertEquals(status.get('attempted'), expected_num_succeeded + expected_num_skipped)
+        self.assertEquals(status.get('attempted'), expected_attempted)
         self.assertEquals(status.get('succeeded'), expected_num_succeeded)
         self.assertEquals(status.get('skipped'), expected_num_skipped)
-        self.assertEquals(status.get('total'), expected_num_succeeded + expected_num_skipped)
+        self.assertEquals(status.get('total'), expected_total)
         self.assertEquals(status.get('action_name'), action_name)
         self.assertGreater(status.get('duration_ms'), 0)
         # compare with entry in table:
@@ -127,7 +138,7 @@ class TestInstructorTasks(InstructorTaskModuleTestCase):
         for student in students:
             CourseEnrollmentFactory.create(course_id=self.course.id, user=student)
             StudentModuleFactory.create(course_id=self.course.id,
-                                        module_state_key=self.problem_url,
+                                        module_state_key=self.location,
                                         student=student,
                                         grade=grade,
                                         max_grade=max_grade,
@@ -139,7 +150,7 @@ class TestInstructorTasks(InstructorTaskModuleTestCase):
         for student in students:
             module = StudentModule.objects.get(course_id=self.course.id,
                                                student=student,
-                                               module_state_key=self.problem_url)
+                                               module_state_key=self.location)
             state = json.loads(module.state)
             self.assertEquals(state['attempts'], num_attempts)
 
@@ -356,7 +367,7 @@ class TestResetAttemptsInstructorTask(TestInstructorTasks):
         for student in students:
             module = StudentModule.objects.get(course_id=self.course.id,
                                                student=student,
-                                               module_state_key=self.problem_url)
+                                               module_state_key=self.location)
             state = json.loads(module.state)
             self.assertEquals(state['attempts'], initial_attempts)
 
@@ -382,7 +393,7 @@ class TestResetAttemptsInstructorTask(TestInstructorTasks):
         for index, student in enumerate(students):
             module = StudentModule.objects.get(course_id=self.course.id,
                                                student=student,
-                                               module_state_key=self.problem_url)
+                                               module_state_key=self.location)
             state = json.loads(module.state)
             if index == 3:
                 self.assertEquals(state['attempts'], 0)
@@ -429,11 +440,34 @@ class TestDeleteStateInstructorTask(TestInstructorTasks):
         for student in students:
             StudentModule.objects.get(course_id=self.course.id,
                                       student=student,
-                                      module_state_key=self.problem_url)
+                                      module_state_key=self.location)
         self._test_run_with_task(delete_problem_state, 'deleted', num_students)
         # confirm that no state can be found anymore:
         for student in students:
             with self.assertRaises(StudentModule.DoesNotExist):
                 StudentModule.objects.get(course_id=self.course.id,
                                           student=student,
-                                          module_state_key=self.problem_url)
+                                          module_state_key=self.location)
+
+
+class TestCertificateGenerationnstructorTask(TestInstructorTasks):
+    """Tests instructor task that generates student certificates."""
+
+    def test_generate_certificates_missing_current_task(self):
+        """
+        Test error is raised when certificate generation task run without current task
+        """
+        self._test_missing_current_task(generate_certificates)
+
+    def test_generate_certificates_task_run(self):
+        """
+        Test certificate generation task run without any errors
+        """
+        self._test_run_with_task(
+            generate_certificates,
+            'certificates generated',
+            0,
+            0,
+            expected_attempted=1,
+            expected_total=1
+        )

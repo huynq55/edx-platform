@@ -2,10 +2,8 @@
 """
 Tests of the Capa XModule
 """
-#pylint: disable=C0111
-#pylint: disable=R0904
-#pylint: disable=C0103
-#pylint: disable=C0302
+# pylint: disable=missing-docstring
+# pylint: disable=invalid-name
 
 import datetime
 import json
@@ -13,24 +11,27 @@ import random
 import os
 import textwrap
 import unittest
+import ddt
 
-from mock import Mock, patch
+from mock import Mock, patch, DEFAULT
 import webob
 from webob.multidict import MultiDict
 
 import xmodule
 from xmodule.tests import DATA_DIR
+from capa import responsetypes
 from capa.responsetypes import (StudentInputError, LoncapaProblemError,
                                 ResponseError)
 from capa.xqueue_interface import XQueueInterface
-from xmodule.capa_module import CapaModule, ComplexEncoder
-from xmodule.modulestore import Location
+from xmodule.capa_module import CapaModule, CapaDescriptor, ComplexEncoder
+from opaque_keys.edx.locations import Location
 from xblock.field_data import DictFieldData
 from xblock.fields import ScopeIds
 
 from . import get_test_system
 from pytz import UTC
 from capa.correctmap import CorrectMap
+from ..capa_base_constants import RANDOMIZATION
 
 
 class CapaFactory(object):
@@ -58,21 +59,22 @@ class CapaFactory(object):
         return cls.num
 
     @classmethod
-    def input_key(cls, input_num=2):
+    def input_key(cls, response_num=2, input_num=1):
         """
         Return the input key to use when passing GET parameters
         """
-        return ("input_" + cls.answer_key(input_num))
+        return "input_" + cls.answer_key(response_num, input_num)
 
     @classmethod
-    def answer_key(cls, input_num=2):
+    def answer_key(cls, response_num=2, input_num=1):
         """
         Return the key stored in the capa problem answer dict
         """
         return (
-            "%s_%d_1" % (
+            "%s_%d_%d" % (
                 "-".join(['i4x', 'edX', 'capa_test', 'problem', 'SampleProblem%d' % cls.num]),
-                input_num,
+                response_num,
+                input_num
             )
         )
 
@@ -81,6 +83,8 @@ class CapaFactory(object):
                attempts=None,
                problem_state=None,
                correct=False,
+               xml=None,
+               override_get_score=True,
                **kwargs
                ):
         """
@@ -99,9 +103,17 @@ class CapaFactory(object):
 
             attempts: also added to instance state.  Will be converted to an int.
         """
-        location = Location(["i4x", "edX", "capa_test", "problem",
-                             "SampleProblem{0}".format(cls.next_num())])
-        field_data = {'data': cls.sample_problem_xml}
+        location = Location(
+            "edX",
+            "capa_test",
+            "2012_Fall",
+            "problem",
+            "SampleProblem{0}".format(cls.next_num()),
+            None
+        )
+        if xml is None:
+            xml = cls.sample_problem_xml
+        field_data = {'data': xml}
         field_data.update(kwargs)
         descriptor = Mock(weight="1")
         if problem_state is not None:
@@ -120,11 +132,12 @@ class CapaFactory(object):
             ScopeIds(None, None, location, location),
         )
 
-        if correct:
-            # TODO: probably better to actually set the internal state properly, but...
-            module.get_score = lambda: {'score': 1, 'total': 1}
-        else:
-            module.get_score = lambda: {'score': 0, 'total': 1}
+        if override_get_score:
+            if correct:
+                # TODO: probably better to actually set the internal state properly, but...
+                module.get_score = lambda: {'score': 1, 'total': 1}
+            else:
+                module.get_score = lambda: {'score': 0, 'total': 1}
 
         return module
 
@@ -170,9 +183,12 @@ if submission[0] == '':
     """)
 
 
+@ddt.ddt
 class CapaModuleTest(unittest.TestCase):
 
     def setUp(self):
+        super(CapaModuleTest, self).setUp()
+
         now = datetime.datetime.now(UTC)
         day_delta = datetime.timedelta(days=1)
         self.yesterday_str = str(now - day_delta)
@@ -200,6 +216,28 @@ class CapaModuleTest(unittest.TestCase):
 
         other_module = CapaFactory.create(correct=True)
         self.assertEqual(other_module.get_score()['score'], 1)
+
+    def test_get_score(self):
+        """
+        Do 1 test where the internals of get_score are properly set
+
+        @jbau Note: this obviously depends on a particular implementation of get_score, but I think this is actually
+        useful as unit-code coverage for this current implementation.  I don't see a layer where LoncapaProblem
+        is tested directly
+        """
+        from capa.correctmap import CorrectMap
+        student_answers = {'1_2_1': 'abcd'}
+        correct_map = CorrectMap(answer_id='1_2_1', correctness="correct", npoints=0.9)
+        module = CapaFactory.create(correct=True, override_get_score=False)
+        module.lcp.correct_map = correct_map
+        module.lcp.student_answers = student_answers
+        self.assertEqual(module.get_score()['score'], 0.9)
+
+        other_correct_map = CorrectMap(answer_id='1_2_1', correctness="incorrect", npoints=0.1)
+        other_module = CapaFactory.create(correct=False, override_get_score=False)
+        other_module.lcp.correct_map = other_correct_map
+        other_module.lcp.student_answers = student_answers
+        self.assertEqual(other_module.get_score()['score'], 0.1)
 
     def test_showanswer_default(self):
         """
@@ -244,6 +282,43 @@ class CapaModuleTest(unittest.TestCase):
         still_in_grace = CapaFactory.create(showanswer='closed',
                                             max_attempts="1",
                                             attempts="0",
+                                            due=self.yesterday_str,
+                                            graceperiod=self.two_day_delta_str)
+        self.assertFalse(still_in_grace.answer_available())
+
+    def test_showanswer_correct_or_past_due(self):
+        """
+        With showanswer="correct_or_past_due" should show answer after the answer is correct
+        or after the problem is closed for everyone--e.g. after due date + grace period.
+        """
+
+        # can see because answer is correct, even with due date in the future
+        answer_correct = CapaFactory.create(showanswer='correct_or_past_due',
+                                            max_attempts="1",
+                                            attempts="0",
+                                            due=self.tomorrow_str,
+                                            correct=True)
+        self.assertTrue(answer_correct.answer_available())
+
+        # can see after due date, even when answer isn't correct
+        past_due_date = CapaFactory.create(showanswer='correct_or_past_due',
+                                           max_attempts="1",
+                                           attempts="0",
+                                           due=self.yesterday_str)
+        self.assertTrue(past_due_date.answer_available())
+
+        # can also see after due date when answer _is_ correct
+        past_due_date_correct = CapaFactory.create(showanswer='correct_or_past_due',
+                                                   max_attempts="1",
+                                                   attempts="0",
+                                                   due=self.yesterday_str,
+                                                   correct=True)
+        self.assertTrue(past_due_date_correct.answer_available())
+
+        # Can't see because grace period hasn't expired and answer isn't correct
+        still_in_grace = CapaFactory.create(showanswer='correct_or_past_due',
+                                            max_attempts="1",
+                                            attempts="1",
                                             due=self.yesterday_str,
                                             graceperiod=self.two_day_delta_str)
         self.assertFalse(still_in_grace.answer_available())
@@ -355,13 +430,6 @@ class CapaModuleTest(unittest.TestCase):
                                     due=self.yesterday_str)
         self.assertTrue(module.closed())
 
-    def test_due_date_extension(self):
-
-        module = CapaFactory.create(
-            max_attempts="1", attempts="0", due=self.yesterday_str,
-            extended_due=self.tomorrow_str)
-        self.assertFalse(module.closed())
-
     def test_parse_get_params(self):
 
         # Valid GET param dict
@@ -381,15 +449,14 @@ class CapaModuleTest(unittest.TestCase):
         # and that we get the same values back
         for key in result.keys():
             original_key = "input_" + key
-            self.assertTrue(original_key in valid_get_dict,
-                            "Output dict should have key %s" % original_key)
+            self.assertIn(original_key, valid_get_dict, "Output dict should have key %s" % original_key)
             self.assertEqual(valid_get_dict[original_key], result[key])
 
         # Valid GET param dict with list keys
         # Each tuple represents a single parameter in the query string
         valid_get_dict = MultiDict((('input_2[]', 'test1'), ('input_2[]', 'test2')))
         result = CapaModule.make_dict_of_responses(valid_get_dict)
-        self.assertTrue('2' in result)
+        self.assertIn('2', result)
         self.assertEqual(['test1', 'test2'], result['2'])
 
         # If we use [] at the end of a key name, we should always
@@ -469,64 +536,68 @@ class CapaModuleTest(unittest.TestCase):
         # Expect that number of attempts NOT incremented
         self.assertEqual(module.attempts, 3)
 
-    def test_check_problem_resubmitted_with_randomize(self):
-        rerandomize_values = ['always', 'true']
+    @ddt.data(
+        RANDOMIZATION.ALWAYS,
+        'true'
+    )
+    def test_check_problem_resubmitted_with_randomize(self, rerandomize):
+        # Randomize turned on
+        module = CapaFactory.create(rerandomize=rerandomize, attempts=0)
 
-        for rerandomize in rerandomize_values:
-            # Randomize turned on
-            module = CapaFactory.create(rerandomize=rerandomize, attempts=0)
+        # Simulate that the problem is completed
+        module.done = True
 
-            # Simulate that the problem is completed
-            module.done = True
-
-            # Expect that we cannot submit
-            with self.assertRaises(xmodule.exceptions.NotFoundError):
-                get_request_dict = {CapaFactory.input_key(): '3.14'}
-                module.check_problem(get_request_dict)
-
-            # Expect that number of attempts NOT incremented
-            self.assertEqual(module.attempts, 0)
-
-    def test_check_problem_resubmitted_no_randomize(self):
-        rerandomize_values = ['never', 'false', 'per_student']
-
-        for rerandomize in rerandomize_values:
-            # Randomize turned off
-            module = CapaFactory.create(rerandomize=rerandomize, attempts=0, done=True)
-
-            # Expect that we can submit successfully
+        # Expect that we cannot submit
+        with self.assertRaises(xmodule.exceptions.NotFoundError):
             get_request_dict = {CapaFactory.input_key(): '3.14'}
-            result = module.check_problem(get_request_dict)
+            module.check_problem(get_request_dict)
 
-            self.assertEqual(result['success'], 'correct')
+        # Expect that number of attempts NOT incremented
+        self.assertEqual(module.attempts, 0)
 
-            # Expect that number of attempts IS incremented
-            self.assertEqual(module.attempts, 1)
+    @ddt.data(
+        RANDOMIZATION.NEVER,
+        'false',
+        RANDOMIZATION.PER_STUDENT
+    )
+    def test_check_problem_resubmitted_no_randomize(self, rerandomize):
+        # Randomize turned off
+        module = CapaFactory.create(rerandomize=rerandomize, attempts=0, done=True)
+
+        # Expect that we can submit successfully
+        get_request_dict = {CapaFactory.input_key(): '3.14'}
+        result = module.check_problem(get_request_dict)
+
+        self.assertEqual(result['success'], 'correct')
+
+        # Expect that number of attempts IS incremented
+        self.assertEqual(module.attempts, 1)
 
     def test_check_problem_queued(self):
         module = CapaFactory.create(attempts=1)
 
         # Simulate that the problem is queued
-        with patch('capa.capa_problem.LoncapaProblem.is_queued') \
-                as mock_is_queued, \
-            patch('capa.capa_problem.LoncapaProblem.get_recentmost_queuetime') \
-                as mock_get_queuetime:
-
-            mock_is_queued.return_value = True
-            mock_get_queuetime.return_value = datetime.datetime.now(UTC)
+        multipatch = patch.multiple(
+            'capa.capa_problem.LoncapaProblem',
+            is_queued=DEFAULT,
+            get_recentmost_queuetime=DEFAULT
+        )
+        with multipatch as values:
+            values['is_queued'].return_value = True
+            values['get_recentmost_queuetime'].return_value = datetime.datetime.now(UTC)
 
             get_request_dict = {CapaFactory.input_key(): '3.14'}
             result = module.check_problem(get_request_dict)
 
             # Expect an AJAX alert message in 'success'
-            self.assertTrue('You must wait' in result['success'])
+            self.assertIn('You must wait', result['success'])
 
         # Expect that the number of attempts is NOT incremented
         self.assertEqual(module.attempts, 1)
 
     def test_check_problem_with_files(self):
         # Check a problem with uploaded files, using the check_problem API.
-        # pylint: disable=W0212
+        # pylint: disable=protected-access
 
         # The files we'll be uploading.
         fnames = ["prog1.py", "prog2.py", "prog3.py"]
@@ -544,8 +615,8 @@ class CapaModuleTest(unittest.TestCase):
 
         # Create a request dictionary for check_problem.
         get_request_dict = {
-            CapaFactoryWithFiles.input_key(input_num=2): fileobjs,
-            CapaFactoryWithFiles.input_key(input_num=3): 'None',
+            CapaFactoryWithFiles.input_key(response_num=2): fileobjs,
+            CapaFactoryWithFiles.input_key(response_num=3): 'None',
         }
 
         module.check_problem(get_request_dict)
@@ -575,7 +646,7 @@ class CapaModuleTest(unittest.TestCase):
 
     def test_check_problem_with_files_as_xblock(self):
         # Check a problem with uploaded files, using the XBlock API.
-        # pylint: disable=W0212
+        # pylint: disable=protected-access
 
         # The files we'll be uploading.
         fnames = ["prog1.py", "prog2.py", "prog3.py"]
@@ -594,8 +665,8 @@ class CapaModuleTest(unittest.TestCase):
         # Create a webob Request with the files uploaded.
         post_data = []
         for fname, fileobj in zip(fnames, fileobjs):
-            post_data.append((CapaFactoryWithFiles.input_key(input_num=2), (fname, fileobj)))
-        post_data.append((CapaFactoryWithFiles.input_key(input_num=3), 'None'))
+            post_data.append((CapaFactoryWithFiles.input_key(response_num=2), (fname, fileobj)))
+        post_data.append((CapaFactoryWithFiles.input_key(response_num=3), 'None'))
         request = webob.Request.blank("/some/fake/url", POST=post_data, content_type='multipart/form-data')
 
         module.handle('xmodule_handler', request, 'problem_check')
@@ -658,7 +729,21 @@ class CapaModuleTest(unittest.TestCase):
             result = module.check_problem(get_request_dict)
 
         # Expect an AJAX alert message in 'success'
-        self.assertTrue(error_msg in result['success'])
+        self.assertIn(error_msg, result['success'])
+
+    def test_check_problem_zero_max_grade(self):
+        """
+        Test that a capa problem with a max grade of zero doesn't generate an error.
+        """
+        # Create the module
+        module = CapaFactory.create(attempts=1)
+
+        # Override the problem score to have a total of zero.
+        module.lcp.get_score = lambda: {'score': 0, 'total': 0}
+
+        # Check the problem
+        get_request_dict = {CapaFactory.input_key(): '3.14'}
+        module.check_problem(get_request_dict)
 
     def test_check_problem_error_nonascii(self):
 
@@ -709,10 +794,10 @@ class CapaModuleTest(unittest.TestCase):
                 result = module.check_problem(get_request_dict)
 
             # Expect an AJAX alert message in 'success'
-            self.assertTrue('test error' in result['success'])
+            self.assertIn('test error', result['success'])
 
             # We DO include traceback information for staff users
-            self.assertTrue('Traceback' in result['success'])
+            self.assertIn('Traceback', result['success'])
 
             # Expect that the number of attempts is NOT incremented
             self.assertEqual(module.attempts, 1)
@@ -734,7 +819,7 @@ class CapaModuleTest(unittest.TestCase):
         self.assertTrue('success' in result and result['success'])
 
         # Expect that the problem HTML is retrieved
-        self.assertTrue('html' in result)
+        self.assertIn('html', result)
         self.assertEqual(result['html'], "<div>Test HTML</div>")
 
         # Expect that the problem was reset
@@ -742,7 +827,7 @@ class CapaModuleTest(unittest.TestCase):
 
     def test_reset_problem_closed(self):
         # pre studio default
-        module = CapaFactory.create(rerandomize="always")
+        module = CapaFactory.create(rerandomize=RANDOMIZATION.ALWAYS)
 
         # Simulate that the problem is closed
         with patch('xmodule.capa_module.CapaModule.closed') as mock_closed:
@@ -780,7 +865,7 @@ class CapaModuleTest(unittest.TestCase):
         self.assertEqual(result['success'], 'correct')
 
         # Expect that we get no HTML
-        self.assertFalse('contents' in result)
+        self.assertNotIn('contents', result)
 
         # Expect that the number of attempts is not incremented
         self.assertEqual(module.attempts, 1)
@@ -873,35 +958,36 @@ class CapaModuleTest(unittest.TestCase):
         # Expect that the result is failure
         self.assertTrue('success' in result and not result['success'])
 
-    def test_save_problem_submitted_with_randomize(self):
-
+    @ddt.data(
+        RANDOMIZATION.ALWAYS,
+        'true'
+    )
+    def test_save_problem_submitted_with_randomize(self, rerandomize):
         # Capa XModule treats 'always' and 'true' equivalently
-        rerandomize_values = ['always', 'true']
+        module = CapaFactory.create(rerandomize=rerandomize, done=True)
 
-        for rerandomize in rerandomize_values:
-            module = CapaFactory.create(rerandomize=rerandomize, done=True)
+        # Try to save
+        get_request_dict = {CapaFactory.input_key(): '3.14'}
+        result = module.save_problem(get_request_dict)
 
-            # Try to save
-            get_request_dict = {CapaFactory.input_key(): '3.14'}
-            result = module.save_problem(get_request_dict)
+        # Expect that we cannot save
+        self.assertTrue('success' in result and not result['success'])
 
-            # Expect that we cannot save
-            self.assertTrue('success' in result and not result['success'])
-
-    def test_save_problem_submitted_no_randomize(self):
-
+    @ddt.data(
+        RANDOMIZATION.NEVER,
+        'false',
+        RANDOMIZATION.PER_STUDENT
+    )
+    def test_save_problem_submitted_no_randomize(self, rerandomize):
         # Capa XModule treats 'false' and 'per_student' equivalently
-        rerandomize_values = ['never', 'false', 'per_student']
+        module = CapaFactory.create(rerandomize=rerandomize, done=True)
 
-        for rerandomize in rerandomize_values:
-            module = CapaFactory.create(rerandomize=rerandomize, done=True)
+        # Try to save
+        get_request_dict = {CapaFactory.input_key(): '3.14'}
+        result = module.save_problem(get_request_dict)
 
-            # Try to save
-            get_request_dict = {CapaFactory.input_key(): '3.14'}
-            result = module.save_problem(get_request_dict)
-
-            # Expect that we succeed
-            self.assertTrue('success' in result and result['success'])
+        # Expect that we succeed
+        self.assertTrue('success' in result and result['success'])
 
     def test_check_button_name(self):
 
@@ -932,11 +1018,19 @@ class CapaModuleTest(unittest.TestCase):
         module = CapaFactory.create(attempts=0)
         self.assertEqual(module.check_button_name(), "Check")
 
+    def test_check_button_checking_name(self):
+        module = CapaFactory.create(attempts=1, max_attempts=10)
+        self.assertEqual(module.check_button_checking_name(), "Checking...")
+
+        module = CapaFactory.create(attempts=10, max_attempts=10)
+        self.assertEqual(module.check_button_checking_name(), "Checking...")
+
     def test_check_button_name_customization(self):
-        module = CapaFactory.create(attempts=1,
-                                    max_attempts=10,
-                                    text_customization={"custom_check": "Submit", "custom_final_check": "Final Submit"}
-                                    )
+        module = CapaFactory.create(
+            attempts=1,
+            max_attempts=10,
+            text_customization={"custom_check": "Submit", "custom_final_check": "Final Submit"}
+        )
         self.assertEqual(module.check_button_name(), "Submit")
 
         module = CapaFactory.create(attempts=9,
@@ -944,6 +1038,29 @@ class CapaModuleTest(unittest.TestCase):
                                     text_customization={"custom_check": "Submit", "custom_final_check": "Final Submit"}
                                     )
         self.assertEqual(module.check_button_name(), "Final Submit")
+
+    def test_check_button_checking_name_customization(self):
+        module = CapaFactory.create(
+            attempts=1,
+            max_attempts=10,
+            text_customization={
+                "custom_check": "Submit",
+                "custom_final_check": "Final Submit",
+                "custom_checking": "Checking..."
+            }
+        )
+        self.assertEqual(module.check_button_checking_name(), "Checking...")
+
+        module = CapaFactory.create(
+            attempts=9,
+            max_attempts=10,
+            text_customization={
+                "custom_check": "Submit",
+                "custom_final_check": "Final Submit",
+                "custom_checking": "Checking..."
+            }
+        )
+        self.assertEqual(module.check_button_checking_name(), "Checking...")
 
     def test_should_show_check_button(self):
 
@@ -964,7 +1081,7 @@ class CapaModuleTest(unittest.TestCase):
         # If user submitted a problem but hasn't reset,
         # do NOT show the check button
         # Note:  we can only reset when rerandomize="always" or "true"
-        module = CapaFactory.create(rerandomize="always", done=True)
+        module = CapaFactory.create(rerandomize=RANDOMIZATION.ALWAYS, done=True)
         self.assertFalse(module.should_show_check_button())
 
         module = CapaFactory.create(rerandomize="true", done=True)
@@ -978,13 +1095,13 @@ class CapaModuleTest(unittest.TestCase):
         # and we do NOT have a reset button, then we can show the check button
         # Setting rerandomize to "never" or "false" ensures that the reset button
         # is not shown
-        module = CapaFactory.create(rerandomize="never", done=True)
+        module = CapaFactory.create(rerandomize=RANDOMIZATION.NEVER, done=True)
         self.assertTrue(module.should_show_check_button())
 
         module = CapaFactory.create(rerandomize="false", done=True)
         self.assertTrue(module.should_show_check_button())
 
-        module = CapaFactory.create(rerandomize="per_student", done=True)
+        module = CapaFactory.create(rerandomize=RANDOMIZATION.PER_STUDENT, done=True)
         self.assertTrue(module.should_show_check_button())
 
     def test_should_show_reset_button(self):
@@ -999,30 +1116,36 @@ class CapaModuleTest(unittest.TestCase):
         module = CapaFactory.create(attempts=attempts, max_attempts=attempts, done=True)
         self.assertFalse(module.should_show_reset_button())
 
-        # If we're NOT randomizing, then do NOT show the reset button
-        module = CapaFactory.create(rerandomize="never", done=True)
-        self.assertFalse(module.should_show_reset_button())
-
-        # If we're NOT randomizing, then do NOT show the reset button
-        module = CapaFactory.create(rerandomize="per_student", done=True)
-        self.assertFalse(module.should_show_reset_button())
-
-        # If we're NOT randomizing, then do NOT show the reset button
-        module = CapaFactory.create(rerandomize="false", done=True)
-        self.assertFalse(module.should_show_reset_button())
-
-        # If the user hasn't submitted an answer yet,
-        # then do NOT show the reset button
-        module = CapaFactory.create(done=False)
-        self.assertFalse(module.should_show_reset_button())
-
         # pre studio default value, DO show the reset button
-        module = CapaFactory.create(rerandomize="always", done=True)
+        module = CapaFactory.create(rerandomize=RANDOMIZATION.ALWAYS, done=True)
         self.assertTrue(module.should_show_reset_button())
 
         # If survey question for capa (max_attempts = 0),
         # DO show the reset button
-        module = CapaFactory.create(rerandomize="always", max_attempts=0, done=True)
+        module = CapaFactory.create(rerandomize=RANDOMIZATION.ALWAYS, max_attempts=0, done=True)
+        self.assertTrue(module.should_show_reset_button())
+
+        # If the question is not correct
+        # DO show the reset button
+        module = CapaFactory.create(rerandomize=RANDOMIZATION.ALWAYS, max_attempts=0, done=True, correct=False)
+        self.assertTrue(module.should_show_reset_button())
+
+        # If the question is correct and randomization is never
+        # DO not show the reset button
+        module = CapaFactory.create(rerandomize=RANDOMIZATION.NEVER, max_attempts=0, done=True, correct=True)
+        self.assertFalse(module.should_show_reset_button())
+
+        # If the question is correct and randomization is always
+        # Show the reset button
+        module = CapaFactory.create(rerandomize=RANDOMIZATION.ALWAYS, max_attempts=0, done=True, correct=True)
+        self.assertTrue(module.should_show_reset_button())
+
+        # Don't show reset button if randomization is turned on and the question is not done
+        module = CapaFactory.create(rerandomize=RANDOMIZATION.ALWAYS, show_reset_button=False, done=False)
+        self.assertFalse(module.should_show_reset_button())
+
+        # Show reset button if randomization is turned on and the problem is done
+        module = CapaFactory.create(rerandomize=RANDOMIZATION.ALWAYS, show_reset_button=False, done=True)
         self.assertTrue(module.should_show_reset_button())
 
     def test_should_show_save_button(self):
@@ -1038,7 +1161,7 @@ class CapaModuleTest(unittest.TestCase):
         self.assertFalse(module.should_show_save_button())
 
         # If user submitted a problem but hasn't reset, do NOT show the save button
-        module = CapaFactory.create(rerandomize="always", done=True)
+        module = CapaFactory.create(rerandomize=RANDOMIZATION.ALWAYS, done=True)
         self.assertFalse(module.should_show_save_button())
 
         module = CapaFactory.create(rerandomize="true", done=True)
@@ -1047,27 +1170,27 @@ class CapaModuleTest(unittest.TestCase):
         # If the user has unlimited attempts and we are not randomizing,
         # then do NOT show a save button
         # because they can keep using "Check"
-        module = CapaFactory.create(max_attempts=None, rerandomize="never", done=False)
+        module = CapaFactory.create(max_attempts=None, rerandomize=RANDOMIZATION.NEVER, done=False)
         self.assertFalse(module.should_show_save_button())
 
         module = CapaFactory.create(max_attempts=None, rerandomize="false", done=True)
         self.assertFalse(module.should_show_save_button())
 
-        module = CapaFactory.create(max_attempts=None, rerandomize="per_student", done=True)
+        module = CapaFactory.create(max_attempts=None, rerandomize=RANDOMIZATION.PER_STUDENT, done=True)
         self.assertFalse(module.should_show_save_button())
 
         # pre-studio default, DO show the save button
-        module = CapaFactory.create(rerandomize="always", done=False)
+        module = CapaFactory.create(rerandomize=RANDOMIZATION.ALWAYS, done=False)
         self.assertTrue(module.should_show_save_button())
 
         # If we're not randomizing and we have limited attempts,  then we can save
-        module = CapaFactory.create(rerandomize="never", max_attempts=2, done=True)
+        module = CapaFactory.create(rerandomize=RANDOMIZATION.NEVER, max_attempts=2, done=True)
         self.assertTrue(module.should_show_save_button())
 
         module = CapaFactory.create(rerandomize="false", max_attempts=2, done=True)
         self.assertTrue(module.should_show_save_button())
 
-        module = CapaFactory.create(rerandomize="per_student", max_attempts=2, done=True)
+        module = CapaFactory.create(rerandomize=RANDOMIZATION.PER_STUDENT, max_attempts=2, done=True)
         self.assertTrue(module.should_show_save_button())
 
         # If survey question for capa (max_attempts = 0),
@@ -1095,7 +1218,7 @@ class CapaModuleTest(unittest.TestCase):
         # then show it even if we would ordinarily
         # require a reset first
         module = CapaFactory.create(force_save_button="true",
-                                    rerandomize="always",
+                                    rerandomize=RANDOMIZATION.ALWAYS,
                                     done=True)
         self.assertTrue(module.should_show_save_button())
 
@@ -1153,7 +1276,55 @@ class CapaModuleTest(unittest.TestCase):
         self.assertEqual(bool(context['save_button']), show_save_button)
 
         # Assert that the encapsulated html contains the original html
-        self.assertTrue(html in html_encapsulated)
+        self.assertIn(html, html_encapsulated)
+
+    demand_xml = """
+        <problem>
+        <p>That is the question</p>
+        <multiplechoiceresponse>
+          <choicegroup type="MultipleChoice">
+            <choice correct="false">Alpha <choicehint>A hint</choicehint>
+            </choice>
+            <choice correct="true">Beta</choice>
+          </choicegroup>
+        </multiplechoiceresponse>
+        <demandhint>
+          <hint>Demand 1</hint>
+          <hint>Demand 2</hint>
+        </demandhint>
+        </problem>"""
+
+    def test_demand_hint(self):
+        # HTML generation is mocked out to be meaningless here, so instead we check
+        # the context dict passed into HTML generation.
+        module = CapaFactory.create(xml=self.demand_xml)
+        module.get_problem_html()  # ignoring html result
+        context = module.system.render_template.call_args[0][1]
+        self.assertEqual(context['demand_hint_possible'], True)
+
+        # Check the AJAX call that gets the hint by index
+        result = module.get_demand_hint(0)
+        self.assertEqual(result['contents'], u'Hint (1 of 2): Demand 1')
+        self.assertEqual(result['hint_index'], 0)
+        result = module.get_demand_hint(1)
+        self.assertEqual(result['contents'], u'Hint (2 of 2): Demand 2')
+        self.assertEqual(result['hint_index'], 1)
+        result = module.get_demand_hint(2)  # here the server wraps around to index 0
+        self.assertEqual(result['contents'], u'Hint (1 of 2): Demand 1')
+        self.assertEqual(result['hint_index'], 0)
+
+    def test_demand_hint_logging(self):
+        module = CapaFactory.create(xml=self.demand_xml)
+        # Re-mock the module_id to a fixed string, so we can check the logging
+        module.location = Mock(module.location)
+        module.location.to_deprecated_string.return_value = 'i4x://edX/capa_test/problem/meh'
+        module.get_problem_html()
+        module.get_demand_hint(0)
+        module.runtime.track_function.assert_called_with(
+            'edx.problem.hint.demandhint_displayed',
+            {'hint_index': 0, 'module_id': u'i4x://edX/capa_test/problem/meh',
+             'hint_text': 'Demand 1', 'hint_len': 2}
+        )
 
     def test_input_state_consistency(self):
         module1 = CapaFactory.create()
@@ -1197,7 +1368,7 @@ class CapaModuleTest(unittest.TestCase):
         # Check the rendering context
         render_args, _ = module.system.render_template.call_args
         context = render_args[1]
-        self.assertTrue("error" in context['problem']['html'])
+        self.assertIn("error", context['problem']['html'])
 
         # Expect that the module has created a new dummy problem with the error
         self.assertNotEqual(original_problem, module.lcp)
@@ -1227,50 +1398,67 @@ class CapaModuleTest(unittest.TestCase):
         # Check the rendering context
         render_args, _ = module.system.render_template.call_args
         context = render_args[1]
-        self.assertTrue(error_msg in context['problem']['html'])
+        self.assertIn(error_msg, context['problem']['html'])
 
-    def test_random_seed_no_change(self):
+    @ddt.data(
+        'false',
+        'true',
+        RANDOMIZATION.NEVER,
+        RANDOMIZATION.PER_STUDENT,
+        RANDOMIZATION.ALWAYS,
+        RANDOMIZATION.ONRESET
+    )
+    def test_random_seed_no_change(self, rerandomize):
 
         # Run the test for each possible rerandomize value
-        for rerandomize in ['false', 'never',
-                            'per_student', 'always',
-                            'true', 'onreset']:
-            module = CapaFactory.create(rerandomize=rerandomize)
 
-            # Get the seed
-            # By this point, the module should have persisted the seed
-            seed = module.seed
-            self.assertTrue(seed is not None)
+        module = CapaFactory.create(rerandomize=rerandomize)
 
-            # If we're not rerandomizing, the seed is always set
-            # to the same value (1)
-            if rerandomize in ['never']:
-                self.assertEqual(seed, 1,
-                                 msg="Seed should always be 1 when rerandomize='%s'" % rerandomize)
+        # Get the seed
+        # By this point, the module should have persisted the seed
+        seed = module.seed
+        self.assertTrue(seed is not None)
 
-            # Check the problem
-            get_request_dict = {CapaFactory.input_key(): '3.14'}
-            module.check_problem(get_request_dict)
+        # If we're not rerandomizing, the seed is always set
+        # to the same value (1)
+        if rerandomize == RANDOMIZATION.NEVER:
+            self.assertEqual(seed, 1,
+                             msg="Seed should always be 1 when rerandomize='%s'" % rerandomize)
 
-            # Expect that the seed is the same
-            self.assertEqual(seed, module.seed)
+        # Check the problem
+        get_request_dict = {CapaFactory.input_key(): '3.14'}
+        module.check_problem(get_request_dict)
 
-            # Save the problem
-            module.save_problem(get_request_dict)
+        # Expect that the seed is the same
+        self.assertEqual(seed, module.seed)
 
-            # Expect that the seed is the same
-            self.assertEqual(seed, module.seed)
+        # Save the problem
+        module.save_problem(get_request_dict)
 
-    def test_random_seed_with_reset(self):
+        # Expect that the seed is the same
+        self.assertEqual(seed, module.seed)
+
+    @ddt.data(
+        'false',
+        'true',
+        RANDOMIZATION.NEVER,
+        RANDOMIZATION.PER_STUDENT,
+        RANDOMIZATION.ALWAYS,
+        RANDOMIZATION.ONRESET
+    )
+    def test_random_seed_with_reset(self, rerandomize):
+        """
+        Run the test for each possible rerandomize value
+        """
 
         def _reset_and_get_seed(module):
-            '''
+            """
             Reset the XModule and return the module's seed
-            '''
+            """
 
             # Simulate submitting an attempt
             # We need to do this, or reset_problem() will
-            # fail with a complaint that we haven't submitted
+            # fail because it won't re-randomize until the problem has been submitted
             # the problem yet.
             module.done = True
 
@@ -1295,45 +1483,83 @@ class CapaModuleTest(unittest.TestCase):
                     break
             return success
 
-        # Run the test for each possible rerandomize value
-        for rerandomize in ['never', 'false', 'per_student',
-                            'always', 'true', 'onreset']:
-            module = CapaFactory.create(rerandomize=rerandomize)
+        module = CapaFactory.create(rerandomize=rerandomize, done=True)
 
-            # Get the seed
-            # By this point, the module should have persisted the seed
-            seed = module.seed
-            self.assertTrue(seed is not None)
+        # Get the seed
+        # By this point, the module should have persisted the seed
+        seed = module.seed
+        self.assertTrue(seed is not None)
 
-            # We do NOT want the seed to reset if rerandomize
-            # is set to 'never' -- it should still be 1
-            # The seed also stays the same if we're randomizing
-            # 'per_student': the same student should see the same problem
-            if rerandomize in ['never', 'false', 'per_student']:
-                self.assertEqual(seed, _reset_and_get_seed(module))
+        # We do NOT want the seed to reset if rerandomize
+        # is set to 'never' -- it should still be 1
+        # The seed also stays the same if we're randomizing
+        # 'per_student': the same student should see the same problem
+        if rerandomize in [RANDOMIZATION.NEVER,
+                           'false',
+                           RANDOMIZATION.PER_STUDENT]:
+            self.assertEqual(seed, _reset_and_get_seed(module))
 
-            # Otherwise, we expect the seed to change
-            # to another valid seed
-            else:
+        # Otherwise, we expect the seed to change
+        # to another valid seed
+        else:
 
-                # Since there's a small chance we might get the
-                # same seed again, give it 5 chances
-                # to generate a different seed
-                success = _retry_and_check(5, lambda: _reset_and_get_seed(module) != seed)
+            # Since there's a small chance we might get the
+            # same seed again, give it 5 chances
+            # to generate a different seed
+            success = _retry_and_check(5, lambda: _reset_and_get_seed(module) != seed)
 
-                self.assertTrue(module.seed is not None)
-                msg = 'Could not get a new seed from reset after 5 tries'
-                self.assertTrue(success, msg)
+            self.assertTrue(module.seed is not None)
+            msg = 'Could not get a new seed from reset after 5 tries'
+            self.assertTrue(success, msg)
 
-    def test_random_seed_bins(self):
+    @ddt.data(
+        'false',
+        'true',
+        RANDOMIZATION.NEVER,
+        RANDOMIZATION.PER_STUDENT,
+        RANDOMIZATION.ALWAYS,
+        RANDOMIZATION.ONRESET
+    )
+    def test_random_seed_with_reset_question_unsubmitted(self, rerandomize):
+        """
+        Run the test for each possible rerandomize value
+        """
+        def _reset_and_get_seed(module):
+            """
+            Reset the XModule and return the module's seed
+            """
+
+            # Reset the problem
+            # By default, the problem is instantiated as unsubmitted
+            module.reset_problem({})
+
+            # Return the seed
+            return module.seed
+
+        module = CapaFactory.create(rerandomize=rerandomize, done=False)
+
+        # Get the seed
+        # By this point, the module should have persisted the seed
+        seed = module.seed
+        self.assertTrue(seed is not None)
+
+        #the seed should never change because the student hasn't finished the problem
+        self.assertEqual(seed, _reset_and_get_seed(module))
+
+    @ddt.data(
+        RANDOMIZATION.ALWAYS,
+        RANDOMIZATION.PER_STUDENT,
+        'true',
+        RANDOMIZATION.ONRESET
+    )
+    def test_random_seed_bins(self, rerandomize):
         # Assert that we are limiting the number of possible seeds.
-
-        # Check the conditions that generate random seeds
-        for rerandomize in ['always', 'per_student', 'true', 'onreset']:
-            # Get a bunch of seeds, they should all be in 0-999.
-            for i in range(200):
-                module = CapaFactory.create(rerandomize=rerandomize)
-                assert 0 <= module.seed < 1000
+        # Get a bunch of seeds, they should all be in 0-999.
+        i = 200
+        while i > 0:
+            module = CapaFactory.create(rerandomize=rerandomize)
+            assert 0 <= module.seed < 1000
+            i -= 1
 
     @patch('xmodule.capa_base.log')
     @patch('xmodule.capa_base.Progress')
@@ -1348,6 +1574,18 @@ class CapaModuleTest(unittest.TestCase):
             self.assertIsNone(module.get_progress())
             mock_log.exception.assert_called_once_with('Got bad progress')
             mock_log.reset_mock()
+
+    @patch('xmodule.capa_base.Progress')
+    def test_get_progress_no_error_if_weight_zero(self, mock_progress):
+        """
+        Check that if the weight is 0 get_progress does not try to create a Progress object.
+        """
+        mock_progress.return_value = True
+        module = CapaFactory.create()
+        module.weight = 0
+        progress = module.get_progress()
+        self.assertIsNone(progress)
+        self.assertFalse(mock_progress.called)
 
     @patch('xmodule.capa_base.Progress')
     def test_get_progress_calculate_progress_fraction(self, mock_progress):
@@ -1380,6 +1618,875 @@ class CapaModuleTest(unittest.TestCase):
         module = CapaFactory.create()
         self.assertEquals(module.get_problem("data"), {'html': module.get_problem_html(encapsulate=False)})
 
+    # Standard question with shuffle="true" used by a few tests
+    common_shuffle_xml = textwrap.dedent("""
+        <problem>
+        <multiplechoiceresponse>
+          <choicegroup type="MultipleChoice" shuffle="true">
+            <choice correct="false">Apple</choice>
+            <choice correct="false">Banana</choice>
+            <choice correct="false">Chocolate</choice>
+            <choice correct ="true">Donut</choice>
+          </choicegroup>
+        </multiplechoiceresponse>
+        </problem>
+    """)
+
+    def test_check_unmask(self):
+        """
+        Check that shuffle unmasking is plumbed through: when check_problem is called,
+        unmasked names should appear in the track_function event_info.
+        """
+        module = CapaFactory.create(xml=self.common_shuffle_xml)
+        with patch.object(module.runtime, 'track_function') as mock_track_function:
+            get_request_dict = {CapaFactory.input_key(): 'choice_3'}  # the correct choice
+            module.check_problem(get_request_dict)
+            mock_call = mock_track_function.mock_calls[0]
+            event_info = mock_call[1][1]
+            self.assertEqual(event_info['answers'][CapaFactory.answer_key()], 'choice_3')
+            # 'permutation' key added to record how problem was shown
+            self.assertEquals(event_info['permutation'][CapaFactory.answer_key()],
+                              ('shuffle', ['choice_3', 'choice_1', 'choice_2', 'choice_0']))
+            self.assertEquals(event_info['success'], 'correct')
+
+    @unittest.skip("masking temporarily disabled")
+    def test_save_unmask(self):
+        """On problem save, unmasked data should appear on track_function."""
+        module = CapaFactory.create(xml=self.common_shuffle_xml)
+        with patch.object(module.runtime, 'track_function') as mock_track_function:
+            get_request_dict = {CapaFactory.input_key(): 'mask_0'}
+            module.save_problem(get_request_dict)
+            mock_call = mock_track_function.mock_calls[0]
+            event_info = mock_call[1][1]
+            self.assertEquals(event_info['answers'][CapaFactory.answer_key()], 'choice_2')
+            self.assertIsNotNone(event_info['permutation'][CapaFactory.answer_key()])
+
+    @unittest.skip("masking temporarily disabled")
+    def test_reset_unmask(self):
+        """On problem reset, unmask names should appear track_function."""
+        module = CapaFactory.create(xml=self.common_shuffle_xml)
+        get_request_dict = {CapaFactory.input_key(): 'mask_0'}
+        module.check_problem(get_request_dict)
+        # On reset, 'old_state' should use unmasked names
+        with patch.object(module.runtime, 'track_function') as mock_track_function:
+            module.reset_problem(None)
+            mock_call = mock_track_function.mock_calls[0]
+            event_info = mock_call[1][1]
+            self.assertEquals(mock_call[1][0], 'reset_problem')
+            self.assertEquals(event_info['old_state']['student_answers'][CapaFactory.answer_key()], 'choice_2')
+            self.assertIsNotNone(event_info['permutation'][CapaFactory.answer_key()])
+
+    @unittest.skip("masking temporarily disabled")
+    def test_rescore_unmask(self):
+        """On problem rescore, unmasked names should appear on track_function."""
+        module = CapaFactory.create(xml=self.common_shuffle_xml)
+        get_request_dict = {CapaFactory.input_key(): 'mask_0'}
+        module.check_problem(get_request_dict)
+        # On rescore, state/student_answers should use unmasked names
+        with patch.object(module.runtime, 'track_function') as mock_track_function:
+            module.rescore_problem()
+            mock_call = mock_track_function.mock_calls[0]
+            event_info = mock_call[1][1]
+            self.assertEquals(mock_call[1][0], 'problem_rescore')
+            self.assertEquals(event_info['state']['student_answers'][CapaFactory.answer_key()], 'choice_2')
+            self.assertIsNotNone(event_info['permutation'][CapaFactory.answer_key()])
+
+    def test_check_unmask_answerpool(self):
+        """Check answer-pool question track_function uses unmasked names"""
+        xml = textwrap.dedent("""
+            <problem>
+            <multiplechoiceresponse>
+              <choicegroup type="MultipleChoice" answer-pool="4">
+                <choice correct="false">Apple</choice>
+                <choice correct="false">Banana</choice>
+                <choice correct="false">Chocolate</choice>
+                <choice correct ="true">Donut</choice>
+              </choicegroup>
+            </multiplechoiceresponse>
+            </problem>
+        """)
+        module = CapaFactory.create(xml=xml)
+        with patch.object(module.runtime, 'track_function') as mock_track_function:
+            get_request_dict = {CapaFactory.input_key(): 'choice_2'}  # mask_X form when masking enabled
+            module.check_problem(get_request_dict)
+            mock_call = mock_track_function.mock_calls[0]
+            event_info = mock_call[1][1]
+            self.assertEqual(event_info['answers'][CapaFactory.answer_key()], 'choice_2')
+            # 'permutation' key added to record how problem was shown
+            self.assertEquals(event_info['permutation'][CapaFactory.answer_key()],
+                              ('answerpool', ['choice_1', 'choice_3', 'choice_2', 'choice_0']))
+            self.assertEquals(event_info['success'], 'incorrect')
+
+
+@ddt.ddt
+class CapaDescriptorTest(unittest.TestCase):
+
+    sample_checkbox_problem_xml = textwrap.dedent("""
+        <problem>
+            <p>Title</p>
+
+            <p>Description</p>
+
+            <p>Example</p>
+
+            <p>The following languages are in the Indo-European family:</p>
+            <choiceresponse>
+              <checkboxgroup label="The following languages are in the Indo-European family:">
+                <choice correct="true">Urdu</choice>
+                <choice correct="false">Finnish</choice>
+                <choice correct="true">Marathi</choice>
+                <choice correct="true">French</choice>
+                <choice correct="false">Hungarian</choice>
+              </checkboxgroup>
+            </choiceresponse>
+
+            <p>Note: Make sure you select all of the correct options—there may be more than one!</p>
+
+            <solution>
+            <div class="detailed-solution">
+            <p>Explanation</p>
+
+            <p>Solution for CAPA problem</p>
+
+            </div>
+            </solution>
+
+        </problem>
+    """)
+
+    sample_dropdown_problem_xml = textwrap.dedent("""
+        <problem>
+            <p>Dropdown problems allow learners to select only one option from a list of options.</p>
+
+            <p>Description</p>
+
+            <p>You can use the following example problem as a model.</p>
+
+            <p> Which of the following countries celebrates its independence on August 15?</p>
+
+
+            <optionresponse>
+              <optioninput label="lbl" options="('India','Spain','China','Bermuda')" correct="India"></optioninput>
+            </optionresponse>
+
+             <solution>
+            <div class="detailed-solution">
+            <p>Explanation</p>
+
+            <p> India became an independent nation on August 15, 1947.</p>
+
+            </div>
+            </solution>
+
+        </problem>
+    """)
+
+    sample_multichoice_problem_xml = textwrap.dedent("""
+        <problem>
+            <p>Multiple choice problems allow learners to select only one option.</p>
+
+            <p>When you add the problem, be sure to select Settings to specify a Display Name and other values.</p>
+
+            <p>You can use the following example problem as a model.</p>
+
+            <p>Which of the following countries has the largest population?</p>
+            <multiplechoiceresponse>
+              <choicegroup label="Which of the following countries has the largest population?" type="MultipleChoice">
+                <choice correct="false">Brazil
+                    <choicehint>timely feedback -- explain why an almost correct answer is wrong</choicehint>
+                </choice>
+                <choice correct="false">Germany</choice>
+                <choice correct="true">Indonesia</choice>
+                <choice correct="false">Russia</choice>
+              </choicegroup>
+            </multiplechoiceresponse>
+
+            <solution>
+            <div class="detailed-solution">
+            <p>Explanation</p>
+
+            <p>According to September 2014 estimates:</p>
+            <p>The population of Indonesia is approximately 250 million.</p>
+            <p>The population of Brazil  is approximately 200 million.</p>
+            <p>The population of Russia is approximately 146 million.</p>
+            <p>The population of Germany is approximately 81 million.</p>
+
+            </div>
+            </solution>
+
+        </problem>
+    """)
+
+    sample_numerical_input_problem_xml = textwrap.dedent("""
+        <problem>
+            <p>In a numerical input problem, learners enter numbers or a specific and relatively simple mathematical
+            expression. Learners enter the response in plain text, and the system then converts the text to a symbolic
+            expression that learners can see below the response field.</p>
+
+            <p>The system can handle several types of characters, including basic operators, fractions, exponents, and
+            common constants such as "i". You can refer learners to "Entering Mathematical and Scientific Expressions"
+            in the edX Guide for Students for more information.</p>
+
+            <p>When you add the problem, be sure to select Settings to specify a Display Name and other values that
+            apply.</p>
+
+            <p>You can use the following example problems as models.</p>
+
+            <p>How many miles away from Earth is the sun? Use scientific notation to answer.</p>
+
+            <numericalresponse answer="9.3*10^7">
+              <formulaequationinput label="How many miles away from Earth is the sun?
+              Use scientific notation to answer." />
+            </numericalresponse>
+
+            <p>The square of what number is -100?</p>
+
+            <numericalresponse answer="10*i">
+              <formulaequationinput label="The square of what number is -100?" />
+            </numericalresponse>
+
+            <solution>
+            <div class="detailed-solution">
+            <p>Explanation</p>
+
+            <p>The sun is 93,000,000, or 9.3*10^7, miles away from Earth.</p>
+            <p>-100 is the square of 10 times the imaginary number, i.</p>
+
+            </div>
+            </solution>
+
+        </problem>
+    """)
+
+    sample_text_input_problem_xml = textwrap.dedent("""
+        <problem>
+            <p>In text input problems, also known as "fill-in-the-blank" problems, learners enter text into a response
+            field. The text can include letters and characters such as punctuation marks. The text that the learner
+            enters must match your specified answer text exactly. You can specify more than one correct answer.
+            Learners must enter a response that matches one of the correct answers exactly.</p>
+
+            <p>When you add the problem, be sure to select Settings to specify a Display Name and other values that
+            apply.</p>
+
+            <p>You can use the following example problem as a model.</p>
+
+            <p>What was the first post-secondary school in China to allow both male and female students?</p>
+
+            <stringresponse answer="Nanjing Higher Normal Institute" type="ci" >
+              <additional_answer answer="National Central University"></additional_answer>
+              <additional_answer answer="Nanjing University"></additional_answer>
+              <textline label="What was the first post-secondary school in China to allow both male and female
+              students?" size="20"/>
+            </stringresponse>
+
+            <solution>
+            <div class="detailed-solution">
+            <p>Explanation</p>
+
+            <p>Nanjing Higher Normal Institute first admitted female students in 1920.</p>
+
+            </div>
+            </solution>
+
+        </problem>
+    """)
+
+    sample_checkboxes_with_hints_and_feedback_problem_xml = textwrap.dedent("""
+        <problem>
+            <p>You can provide feedback for each option in a checkbox problem, with distinct feedback depending on
+            whether or not the learner selects that option.</p>
+
+            <p>You can also provide compound feedback for a specific combination of answers. For example, if you have
+            three possible answers in the problem, you can configure specific feedback for when a learner selects each
+            combination of possible answers.</p>
+
+            <p>You can also add hints for learners.</p>
+
+            <p>Be sure to select Settings to specify a Display Name and other values that apply.</p>
+
+            <p>Use the following example problem as a model.</p>
+
+            <p>Which of the following is a fruit? Check all that apply.</p>
+            <choiceresponse>
+              <checkboxgroup label="Which of the following is a fruit? Check all that apply.">
+                <choice correct="true">apple
+                  <choicehint selected="true">You are correct that an apple is a fruit because it is the fertilized
+                  ovary that comes from an apple tree and contains seeds.</choicehint>
+                  <choicehint selected="false">Remember that an apple is also a fruit.</choicehint></choice>
+                <choice correct="true">pumpkin
+                  <choicehint selected="true">You are correct that a pumpkin is a fruit because it is the fertilized
+                  ovary of a squash plant and contains seeds.</choicehint>
+                  <choicehint selected="false">Remember that a pumpkin is also a fruit.</choicehint></choice>
+                <choice correct="false">potato
+                  <choicehint selected="true">A potato is a vegetable, not a fruit, because it does not come from a
+                  flower and does not contain seeds.</choicehint>
+                  <choicehint selected="false">You are correct that a potato is a vegetable because it is an edible
+                  part of a plant in tuber form.</choicehint></choice>
+                <choice correct="true">tomato
+                  <choicehint selected="true">You are correct that a tomato is a fruit because it is the fertilized
+                  ovary of a tomato plant and contains seeds.</choicehint>
+                  <choicehint selected="false">Many people mistakenly think a tomato is a vegetable. However, because
+                  a tomato is the fertilized ovary of a tomato plant and contains seeds, it is a fruit.</choicehint>
+                  </choice>
+                <compoundhint value="A B D">An apple, pumpkin, and tomato are all fruits as they all are fertilized
+                ovaries of a plant and contain seeds.</compoundhint>
+                <compoundhint value="A B C D">You are correct that an apple, pumpkin, and tomato are all fruits as they
+                all are fertilized ovaries of a plant and contain seeds. However, a potato is not a fruit as it is an
+                edible part of a plant in tuber form and is a vegetable.</compoundhint>
+              </checkboxgroup>
+            </choiceresponse>
+
+
+            <demandhint>
+              <hint>A fruit is the fertilized ovary from a flower.</hint>
+              <hint>A fruit contains seeds of the plant.</hint>
+            </demandhint>
+        </problem>
+    """)
+
+    sample_dropdown_with_hints_and_feedback_problem_xml = textwrap.dedent("""
+        <problem>
+            <p>You can provide feedback for each available option in a dropdown problem.</p>
+
+            <p>You can also add hints for learners.</p>
+
+            <p>Be sure to select Settings to specify a Display Name and other values that apply.</p>
+
+            <p>Use the following example problem as a model.</p>
+
+            <p> A/an ________ is a vegetable.</p>
+            <optionresponse>
+              <optioninput label=" A/an ________ is a vegetable.">
+                <option correct="False">apple <optionhint>An apple is the fertilized ovary that comes from an apple
+                tree and contains seeds, meaning it is a fruit.</optionhint></option>
+                <option correct="False">pumpkin <optionhint>A pumpkin is the fertilized ovary of a squash plant and
+                contains seeds, meaning it is a fruit.</optionhint></option>
+                <option correct="True">potato <optionhint>A potato is an edible part of a plant in tuber form and is a
+                vegetable.</optionhint></option>
+                <option correct="False">tomato <optionhint>Many people mistakenly think a tomato is a vegetable.
+                However, because a tomato is the fertilized ovary of a tomato plant and contains seeds, it is a fruit.
+                </optionhint></option>
+              </optioninput>
+            </optionresponse>
+
+            <demandhint>
+              <hint>A fruit is the fertilized ovary from a flower.</hint>
+              <hint>A fruit contains seeds of the plant.</hint>
+            </demandhint>
+        </problem>
+    """)
+
+    sample_multichoice_with_hints_and_feedback_problem_xml = textwrap.dedent("""
+        <problem>
+            <p>You can provide feedback for each option in a multiple choice problem.</p>
+
+            <p>You can also add hints for learners.</p>
+
+            <p>Be sure to select Settings to specify a Display Name and other values that apply.</p>
+
+            <p>Use the following example problem as a model.</p>
+
+            <p>Which of the following is a vegetable?</p>
+            <multiplechoiceresponse>
+              <choicegroup label="Which of the following is a vegetable?" type="MultipleChoice">
+                <choice correct="false">apple <choicehint>An apple is the fertilized ovary that comes from an apple
+                tree and contains seeds, meaning it is a fruit.</choicehint></choice>
+                <choice correct="false">pumpkin <choicehint>A pumpkin is the fertilized ovary of a squash plant and
+                contains seeds, meaning it is a fruit.</choicehint></choice>
+                <choice correct="true">potato <choicehint>A potato is an edible part of a plant in tuber form and is a
+                vegetable.</choicehint></choice>
+                <choice correct="false">tomato <choicehint>Many people mistakenly think a tomato is a vegetable.
+                However, because a tomato is the fertilized ovary of a tomato plant and contains seeds, it is a fruit.
+                </choicehint></choice>
+              </choicegroup>
+            </multiplechoiceresponse>
+
+
+            <demandhint>
+              <hint>A fruit is the fertilized ovary from a flower.</hint>
+              <hint>A fruit contains seeds of the plant.</hint>
+            </demandhint>
+        </problem>
+    """)
+
+    sample_numerical_input_with_hints_and_feedback_problem_xml = textwrap.dedent("""
+        <problem>
+            <p>You can provide feedback for correct answers in numerical input problems. You cannot provide feedback
+            for incorrect answers.</p>
+
+            <p>Use feedback for the correct answer to reinforce the process for arriving at the numerical value.</p>
+
+            <p>You can also add hints for learners.</p>
+
+            <p>Be sure to select Settings to specify a Display Name and other values that apply.</p>
+
+            <p>Use the following example problem as a model.</p>
+
+            <p>What is the arithmetic mean for the following set of numbers? (1, 5, 6, 3, 5)</p>
+
+            <numericalresponse answer="4">
+              <formulaequationinput label="What is the arithmetic mean for the following set of numbers?
+              (1, 5, 6, 3, 5)" />
+              <correcthint>The mean for this set of numbers is 20 / 5, which equals 4.</correcthint>
+            </numericalresponse>
+            <solution>
+            <div class="detailed-solution">
+            <p>Explanation</p>
+
+            <p>The mean is calculated by summing the set of numbers and dividing by n. In this case:
+            (1 + 5 + 6 + 3 + 5) / 5 = 20 / 5 = 4.</p>
+
+            </div>
+            </solution>
+
+            <demandhint>
+              <hint>The mean is calculated by summing the set of numbers and dividing by n.</hint>
+              <hint>n is the count of items in the set.</hint>
+            </demandhint>
+        </problem>
+    """)
+
+    sample_text_input_with_hints_and_feedback_problem_xml = textwrap.dedent("""
+        <problem>
+            <p>You can provide feedback for the correct answer in text input problems, as well as for specific
+            incorrect answers.</p>
+
+            <p>Use feedback on expected incorrect answers to address common misconceptions and to provide guidance on
+            how to arrive at the correct answer.</p>
+
+            <p>Be sure to select Settings to specify a Display Name and other values that apply.</p>
+
+            <p>Use the following example problem as a model.</p>
+
+            <p>Which U.S. state has the largest land area?</p>
+
+            <stringresponse answer="Alaska" type="ci" >
+              <correcthint>Alaska is 576,400 square miles, more than double the land area of the second largest state,
+              Texas.</correcthint>
+              <stringequalhint answer="Texas">While many people think Texas is the largest state, it is actually the
+              second largest, with 261,797 square miles.</stringequalhint>
+              <stringequalhint answer="California">California is the third largest state, with 155,959 square miles.
+              </stringequalhint>
+              <textline label="Which U.S. state has the largest land area?" size="20"/>
+            </stringresponse>
+
+            <demandhint>
+              <hint>Consider the square miles, not population.</hint>
+              <hint>Consider all 50 states, not just the continental United States.</hint>
+            </demandhint>
+        </problem>
+    """)
+
+    def _create_descriptor(self, xml, name=None):
+        """ Creates a CapaDescriptor to run test against """
+        descriptor = CapaDescriptor(get_test_system(), scope_ids=1)
+        descriptor.data = xml
+        if name:
+            descriptor.display_name = name
+        return descriptor
+
+    @ddt.data(*responsetypes.registry.registered_tags())
+    def test_all_response_types(self, response_tag):
+        """ Tests that every registered response tag is correctly returned """
+        xml = "<problem><{response_tag}></{response_tag}></problem>".format(response_tag=response_tag)
+        name = "Some Capa Problem"
+        descriptor = self._create_descriptor(xml, name=name)
+        self.assertEquals(descriptor.problem_types, {response_tag})
+        self.assertEquals(descriptor.index_dictionary(), {
+            'content_type': CapaDescriptor.INDEX_CONTENT_TYPE,
+            'problem_types': [response_tag],
+            'content': {
+                'display_name': name,
+                'capa_content': ''
+            }
+        })
+
+    def test_response_types_ignores_non_response_tags(self):
+        xml = textwrap.dedent("""
+            <problem>
+            <p>Label</p>
+            <div>Some comment</div>
+            <multiplechoiceresponse>
+              <choicegroup type="MultipleChoice" answer-pool="4">
+                <choice correct="false">Apple</choice>
+                <choice correct="false">Banana</choice>
+                <choice correct="false">Chocolate</choice>
+                <choice correct ="true">Donut</choice>
+              </choicegroup>
+            </multiplechoiceresponse>
+            </problem>
+        """)
+        name = "Test Capa Problem"
+        descriptor = self._create_descriptor(xml, name=name)
+        self.assertEquals(descriptor.problem_types, {"multiplechoiceresponse"})
+        self.assertEquals(descriptor.index_dictionary(), {
+            'content_type': CapaDescriptor.INDEX_CONTENT_TYPE,
+            'problem_types': ["multiplechoiceresponse"],
+            'content': {
+                'display_name': name,
+                'capa_content': ' Label Some comment Apple Banana Chocolate Donut '
+            }
+        })
+
+    def test_response_types_multiple_tags(self):
+        xml = textwrap.dedent("""
+            <problem>
+                <p>Label</p>
+                <div>Some comment</div>
+                <multiplechoiceresponse>
+                  <choicegroup type="MultipleChoice" answer-pool="1">
+                    <choice correct ="true">Donut</choice>
+                  </choicegroup>
+                </multiplechoiceresponse>
+                <multiplechoiceresponse>
+                  <choicegroup type="MultipleChoice" answer-pool="1">
+                    <choice correct ="true">Buggy</choice>
+                  </choicegroup>
+                </multiplechoiceresponse>
+                <optionresponse>
+                    <optioninput label="Option" options="('1','2')" correct="2"></optioninput>
+                </optionresponse>
+            </problem>
+        """)
+        name = "Other Test Capa Problem"
+        descriptor = self._create_descriptor(xml, name=name)
+        self.assertEquals(descriptor.problem_types, {"multiplechoiceresponse", "optionresponse"})
+        self.assertEquals(
+            descriptor.index_dictionary(), {
+                'content_type': CapaDescriptor.INDEX_CONTENT_TYPE,
+                'problem_types': ["optionresponse", "multiplechoiceresponse"],
+                'content': {
+                    'display_name': name,
+                    'capa_content': ' Label Some comment Donut Buggy '
+                }
+            }
+        )
+
+    def test_solutions_not_indexed(self):
+        xml = textwrap.dedent("""
+            <problem>
+                <solution>
+                <div class="detailed-solution">
+                <p>Explanation</p>
+
+                <p>This is what the 1st solution.</p>
+
+                </div>
+                </solution>
+
+                <solution>
+                <div class="detailed-solution">
+                <p>Explanation</p>
+
+                <p>This is the 2nd solution.</p>
+
+                </div>
+                </solution>
+
+
+            </problem>
+        """)
+        name = "Blank Common Capa Problem"
+        descriptor = self._create_descriptor(xml, name=name)
+        self.assertEquals(
+            descriptor.index_dictionary(), {
+                'content_type': CapaDescriptor.INDEX_CONTENT_TYPE,
+                'problem_types': [],
+                'content': {
+                    'display_name': name,
+                    'capa_content': ' '
+                }
+            }
+        )
+
+    def test_indexing_checkboxes(self):
+        name = "Checkboxes"
+        descriptor = self._create_descriptor(self.sample_checkbox_problem_xml, name=name)
+        capa_content = textwrap.dedent("""
+            Title
+            Description
+            Example
+            The following languages are in the Indo-European family:
+            Urdu
+            Finnish
+            Marathi
+            French
+            Hungarian
+            Note: Make sure you select all of the correct options—there may be more than one!
+        """)
+        self.assertEquals(descriptor.problem_types, {"choiceresponse"})
+        self.assertEquals(
+            descriptor.index_dictionary(), {
+                'content_type': CapaDescriptor.INDEX_CONTENT_TYPE,
+                'problem_types': ["choiceresponse"],
+                'content': {
+                    'display_name': name,
+                    'capa_content': capa_content.replace("\n", " ")
+                }
+            }
+        )
+
+    def test_indexing_dropdown(self):
+        name = "Dropdown"
+        descriptor = self._create_descriptor(self.sample_dropdown_problem_xml, name=name)
+        capa_content = textwrap.dedent("""
+            Dropdown problems allow learners to select only one option from a list of options.
+            Description
+            You can use the following example problem as a model.
+            Which of the following countries celebrates its independence on August 15?
+        """)
+        self.assertEquals(descriptor.problem_types, {"optionresponse"})
+        self.assertEquals(
+            descriptor.index_dictionary(), {
+                'content_type': CapaDescriptor.INDEX_CONTENT_TYPE,
+                'problem_types': ["optionresponse"],
+                'content': {
+                    'display_name': name,
+                    'capa_content': capa_content.replace("\n", " ")
+                }
+            }
+        )
+
+    def test_indexing_multiple_choice(self):
+        name = "Multiple Choice"
+        descriptor = self._create_descriptor(self.sample_multichoice_problem_xml, name=name)
+        capa_content = textwrap.dedent("""
+            Multiple choice problems allow learners to select only one option.
+            When you add the problem, be sure to select Settings to specify a Display Name and other values.
+            You can use the following example problem as a model.
+            Which of the following countries has the largest population?
+            Brazil
+            Germany
+            Indonesia
+            Russia
+        """)
+        self.assertEquals(descriptor.problem_types, {"multiplechoiceresponse"})
+        self.assertEquals(
+            descriptor.index_dictionary(), {
+                'content_type': CapaDescriptor.INDEX_CONTENT_TYPE,
+                'problem_types': ["multiplechoiceresponse"],
+                'content': {
+                    'display_name': name,
+                    'capa_content': capa_content.replace("\n", " ")
+                }
+            }
+        )
+
+    def test_indexing_numerical_input(self):
+        name = "Numerical Input"
+        descriptor = self._create_descriptor(self.sample_numerical_input_problem_xml, name=name)
+        capa_content = textwrap.dedent("""
+            In a numerical input problem, learners enter numbers or a specific and relatively simple mathematical
+            expression. Learners enter the response in plain text, and the system then converts the text to a symbolic
+            expression that learners can see below the response field.
+            The system can handle several types of characters, including basic operators, fractions, exponents, and
+            common constants such as "i". You can refer learners to "Entering Mathematical and Scientific Expressions"
+            in the edX Guide for Students for more information.
+            When you add the problem, be sure to select Settings to specify a Display Name and other values that
+            apply.
+            You can use the following example problems as models.
+            How many miles away from Earth is the sun? Use scientific notation to answer.
+            The square of what number is -100?
+        """)
+        self.assertEquals(descriptor.problem_types, {"numericalresponse"})
+        self.assertEquals(
+            descriptor.index_dictionary(), {
+                'content_type': CapaDescriptor.INDEX_CONTENT_TYPE,
+                'problem_types': ["numericalresponse"],
+                'content': {
+                    'display_name': name,
+                    'capa_content': capa_content.replace("\n", " ")
+                }
+            }
+        )
+
+    def test_indexing_text_input(self):
+        name = "Text Input"
+        descriptor = self._create_descriptor(self.sample_text_input_problem_xml, name=name)
+        capa_content = textwrap.dedent("""
+            In text input problems, also known as "fill-in-the-blank" problems, learners enter text into a response
+            field. The text can include letters and characters such as punctuation marks. The text that the learner
+            enters must match your specified answer text exactly. You can specify more than one correct answer.
+            Learners must enter a response that matches one of the correct answers exactly.
+            When you add the problem, be sure to select Settings to specify a Display Name and other values that
+            apply.
+            You can use the following example problem as a model.
+            What was the first post-secondary school in China to allow both male and female students?
+        """)
+        self.assertEquals(descriptor.problem_types, {"stringresponse"})
+        self.assertEquals(
+            descriptor.index_dictionary(), {
+                'content_type': CapaDescriptor.INDEX_CONTENT_TYPE,
+                'problem_types': ["stringresponse"],
+                'content': {
+                    'display_name': name,
+                    'capa_content': capa_content.replace("\n", " ")
+                }
+            }
+        )
+
+    def test_indexing_checkboxes_with_hints_and_feedback(self):
+        name = "Checkboxes with Hints and Feedback"
+        descriptor = self._create_descriptor(self.sample_checkboxes_with_hints_and_feedback_problem_xml, name=name)
+        capa_content = textwrap.dedent("""
+            You can provide feedback for each option in a checkbox problem, with distinct feedback depending on
+            whether or not the learner selects that option.
+            You can also provide compound feedback for a specific combination of answers. For example, if you have
+            three possible answers in the problem, you can configure specific feedback for when a learner selects each
+            combination of possible answers.
+            You can also add hints for learners.
+            Be sure to select Settings to specify a Display Name and other values that apply.
+            Use the following example problem as a model.
+            Which of the following is a fruit? Check all that apply.
+            apple
+            pumpkin
+            potato
+            tomato
+        """)
+        self.assertEquals(descriptor.problem_types, {"choiceresponse"})
+        self.assertEquals(
+            descriptor.index_dictionary(), {
+                'content_type': CapaDescriptor.INDEX_CONTENT_TYPE,
+                'problem_types': ["choiceresponse"],
+                'content': {
+                    'display_name': name,
+                    'capa_content': capa_content.replace("\n", " ")
+                }
+            }
+        )
+
+    def test_indexing_dropdown_with_hints_and_feedback(self):
+        name = "Dropdown with Hints and Feedback"
+        descriptor = self._create_descriptor(self.sample_dropdown_with_hints_and_feedback_problem_xml, name=name)
+        capa_content = textwrap.dedent("""
+            You can provide feedback for each available option in a dropdown problem.
+            You can also add hints for learners.
+            Be sure to select Settings to specify a Display Name and other values that apply.
+            Use the following example problem as a model.
+            A/an ________ is a vegetable.
+            apple
+            pumpkin
+            potato
+            tomato
+        """)
+        self.assertEquals(descriptor.problem_types, {"optionresponse"})
+        self.assertEquals(
+            descriptor.index_dictionary(), {
+                'content_type': CapaDescriptor.INDEX_CONTENT_TYPE,
+                'problem_types': ["optionresponse"],
+                'content': {
+                    'display_name': name,
+                    'capa_content': capa_content.replace("\n", " ")
+                }
+            }
+        )
+
+    def test_indexing_multiple_choice_with_hints_and_feedback(self):
+        name = "Multiple Choice with Hints and Feedback"
+        descriptor = self._create_descriptor(self.sample_multichoice_with_hints_and_feedback_problem_xml, name=name)
+        capa_content = textwrap.dedent("""
+            You can provide feedback for each option in a multiple choice problem.
+            You can also add hints for learners.
+            Be sure to select Settings to specify a Display Name and other values that apply.
+            Use the following example problem as a model.
+            Which of the following is a vegetable?
+            apple
+            pumpkin
+            potato
+            tomato
+        """)
+        self.assertEquals(descriptor.problem_types, {"multiplechoiceresponse"})
+        self.assertEquals(
+            descriptor.index_dictionary(), {
+                'content_type': CapaDescriptor.INDEX_CONTENT_TYPE,
+                'problem_types': ["multiplechoiceresponse"],
+                'content': {
+                    'display_name': name,
+                    'capa_content': capa_content.replace("\n", " ")
+                }
+            }
+        )
+
+    def test_indexing_numerical_input_with_hints_and_feedback(self):
+        name = "Numerical Input with Hints and Feedback"
+        descriptor = self._create_descriptor(self.sample_numerical_input_with_hints_and_feedback_problem_xml, name=name)
+        capa_content = textwrap.dedent("""
+            You can provide feedback for correct answers in numerical input problems. You cannot provide feedback
+            for incorrect answers.
+            Use feedback for the correct answer to reinforce the process for arriving at the numerical value.
+            You can also add hints for learners.
+            Be sure to select Settings to specify a Display Name and other values that apply.
+            Use the following example problem as a model.
+            What is the arithmetic mean for the following set of numbers? (1, 5, 6, 3, 5)
+        """)
+        self.assertEquals(descriptor.problem_types, {"numericalresponse"})
+        self.assertEquals(
+            descriptor.index_dictionary(), {
+                'content_type': CapaDescriptor.INDEX_CONTENT_TYPE,
+                'problem_types': ["numericalresponse"],
+                'content': {
+                    'display_name': name,
+                    'capa_content': capa_content.replace("\n", " ")
+                }
+            }
+        )
+
+    def test_indexing_text_input_with_hints_and_feedback(self):
+        name = "Text Input with Hints and Feedback"
+        descriptor = self._create_descriptor(self.sample_text_input_with_hints_and_feedback_problem_xml, name=name)
+        capa_content = textwrap.dedent("""
+            You can provide feedback for the correct answer in text input problems, as well as for specific
+            incorrect answers.
+            Use feedback on expected incorrect answers to address common misconceptions and to provide guidance on
+            how to arrive at the correct answer.
+            Be sure to select Settings to specify a Display Name and other values that apply.
+            Use the following example problem as a model.
+            Which U.S. state has the largest land area?
+        """)
+        self.assertEquals(descriptor.problem_types, {"stringresponse"})
+        self.assertEquals(
+            descriptor.index_dictionary(), {
+                'content_type': CapaDescriptor.INDEX_CONTENT_TYPE,
+                'problem_types': ["stringresponse"],
+                'content': {
+                    'display_name': name,
+                    'capa_content': capa_content.replace("\n", " ")
+                }
+            }
+        )
+
+    def test_indexing_problem_with_html_tags(self):
+        sample_problem_xml = textwrap.dedent("""
+            <problem>
+                <style>p {left: 10px;}</style>
+                <!-- Beginning of the html -->
+                <p>This has HTML comment in it.<!-- Commenting Content --></p>
+                <!-- Here comes CDATA -->
+                <![CDATA[This is just a CDATA!]]>
+                <p>HTML end.</p>
+                <!-- Script that makes everything alive! -->
+                <script>
+                    var alive;
+                </script>
+            </problem>
+        """)
+        name = "Mixed business"
+        descriptor = self._create_descriptor(sample_problem_xml, name=name)
+        capa_content = textwrap.dedent("""
+            This has HTML comment in it.
+            HTML end.
+        """)
+        self.assertEquals(
+            descriptor.index_dictionary(), {
+                'content_type': CapaDescriptor.INDEX_CONTENT_TYPE,
+                'problem_types': [],
+                'content': {
+                    'display_name': name,
+                    'capa_content': capa_content.replace("\n", " ")
+                }
+            }
+        )
+
 
 class ComplexEncoderTest(unittest.TestCase):
     def test_default(self):
@@ -1390,3 +2497,310 @@ class ComplexEncoderTest(unittest.TestCase):
         expected_str = '1-1*j'
         json_str = json.dumps(complex_num, cls=ComplexEncoder)
         self.assertEqual(expected_str, json_str[1:-1])  # ignore quotes
+
+
+class TestProblemCheckTracking(unittest.TestCase):
+    """
+    Ensure correct tracking information is included in events emitted during problem checks.
+    """
+
+    def setUp(self):
+        super(TestProblemCheckTracking, self).setUp()
+        self.maxDiff = None
+
+    def test_choice_answer_text(self):
+        xml = """\
+            <problem display_name="Multiple Choice Questions">
+              <p>What color is the open ocean on a sunny day?</p>
+              <optionresponse>
+                <optioninput options="('yellow','blue','green')" correct="blue" label="What color is the open ocean on a sunny day?"/>
+              </optionresponse>
+              <p>Which piece of furniture is built for sitting?</p>
+              <multiplechoiceresponse>
+                <choicegroup type="MultipleChoice">
+                  <choice correct="false"><text>a table</text></choice>
+                  <choice correct="false"><text>a desk</text></choice>
+                  <choice correct="true"><text>a chair</text></choice>
+                  <choice correct="false"><text>a bookshelf</text></choice>
+                </choicegroup>
+              </multiplechoiceresponse>
+              <p>Which of the following are musical instruments?</p>
+              <choiceresponse>
+                <checkboxgroup label="Which of the following are musical instruments?">
+                  <choice correct="true">a piano</choice>
+                  <choice correct="false">a tree</choice>
+                  <choice correct="true">a guitar</choice>
+                  <choice correct="false">a window</choice>
+                </checkboxgroup>
+              </choiceresponse>
+            </problem>
+            """
+
+        # Whitespace screws up comparisons
+        xml = ''.join(line.strip() for line in xml.split('\n'))
+        factory = self.capa_factory_for_problem_xml(xml)
+        module = factory.create()
+
+        answer_input_dict = {
+            factory.input_key(2): 'blue',
+            factory.input_key(3): 'choice_0',
+            factory.input_key(4): ['choice_0', 'choice_1'],
+        }
+        event = self.get_event_for_answers(module, answer_input_dict)
+
+        self.assertEquals(event['submission'], {
+            factory.answer_key(2): {
+                'question': 'What color is the open ocean on a sunny day?',
+                'answer': 'blue',
+                'response_type': 'optionresponse',
+                'input_type': 'optioninput',
+                'correct': True,
+                'variant': '',
+            },
+            factory.answer_key(3): {
+                'question': '',
+                'answer': u'<text>a table</text>',
+                'response_type': 'multiplechoiceresponse',
+                'input_type': 'choicegroup',
+                'correct': False,
+                'variant': '',
+            },
+            factory.answer_key(4): {
+                'question': 'Which of the following are musical instruments?',
+                'answer': [u'a piano', u'a tree'],
+                'response_type': 'choiceresponse',
+                'input_type': 'checkboxgroup',
+                'correct': False,
+                'variant': '',
+            },
+        })
+
+    def capa_factory_for_problem_xml(self, xml):
+        class CustomCapaFactory(CapaFactory):
+            """
+            A factory for creating a Capa problem with arbitrary xml.
+            """
+            sample_problem_xml = textwrap.dedent(xml)
+
+        return CustomCapaFactory
+
+    def get_event_for_answers(self, module, answer_input_dict):
+        with patch.object(module.runtime, 'track_function') as mock_track_function:
+            module.check_problem(answer_input_dict)
+
+            self.assertGreaterEqual(len(mock_track_function.mock_calls), 1)
+            # There are potentially 2 track logs: answers and hint. [-1]=answers.
+            mock_call = mock_track_function.mock_calls[-1]
+            event = mock_call[1][1]
+
+            return event
+
+    def test_numerical_textline(self):
+        factory = CapaFactory
+        module = factory.create()
+
+        answer_input_dict = {
+            factory.input_key(2): '3.14'
+        }
+
+        event = self.get_event_for_answers(module, answer_input_dict)
+        self.assertEquals(event['submission'], {
+            factory.answer_key(2): {
+                'question': '',
+                'answer': '3.14',
+                'response_type': 'numericalresponse',
+                'input_type': 'textline',
+                'correct': True,
+                'variant': '',
+            }
+        })
+
+    def test_multiple_inputs(self):
+        factory = self.capa_factory_for_problem_xml("""\
+            <problem display_name="Multiple Inputs">
+              <p>Choose the correct color</p>
+              <optionresponse>
+                <p>What color is the sky?</p>
+                <optioninput options="('yellow','blue','green')" correct="blue"/>
+                <p>What color are pine needles?</p>
+                <optioninput options="('yellow','blue','green')" correct="green"/>
+              </optionresponse>
+            </problem>
+            """)
+        module = factory.create()
+
+        answer_input_dict = {
+            factory.input_key(2, 1): 'blue',
+            factory.input_key(2, 2): 'yellow',
+        }
+
+        event = self.get_event_for_answers(module, answer_input_dict)
+        self.assertEquals(event['submission'], {
+            factory.answer_key(2, 1): {
+                'question': '',
+                'answer': 'blue',
+                'response_type': 'optionresponse',
+                'input_type': 'optioninput',
+                'correct': True,
+                'variant': '',
+            },
+            factory.answer_key(2, 2): {
+                'question': '',
+                'answer': 'yellow',
+                'response_type': 'optionresponse',
+                'input_type': 'optioninput',
+                'correct': False,
+                'variant': '',
+            },
+        })
+
+    def test_optioninput_extended_xml(self):
+        """Test the new XML form of writing with <option> tag instead of options= attribute."""
+        factory = self.capa_factory_for_problem_xml("""\
+            <problem display_name="Woo Hoo">
+              <p>Are you the Gatekeeper?</p>
+                <optionresponse>
+                   <optioninput>
+                       <option correct="True" label="Good Job">
+                           apple
+                           <optionhint>
+                               banana
+                           </optionhint>
+                       </option>
+                       <option correct="False" label="blorp">
+                           cucumber
+                           <optionhint>
+                               donut
+                           </optionhint>
+                       </option>
+                   </optioninput>
+
+                   <optioninput>
+                       <option correct="True">
+                           apple
+                           <optionhint>
+                               banana
+                           </optionhint>
+                       </option>
+                       <option correct="False">
+                           cucumber
+                           <optionhint>
+                               donut
+                           </optionhint>
+                       </option>
+                   </optioninput>
+                 </optionresponse>
+            </problem>
+            """)
+        module = factory.create()
+
+        answer_input_dict = {
+            factory.input_key(2, 1): 'apple',
+            factory.input_key(2, 2): 'cucumber',
+        }
+
+        event = self.get_event_for_answers(module, answer_input_dict)
+        self.assertEquals(event['submission'], {
+            factory.answer_key(2, 1): {
+                'question': '',
+                'answer': 'apple',
+                'response_type': 'optionresponse',
+                'input_type': 'optioninput',
+                'correct': True,
+                'variant': '',
+            },
+            factory.answer_key(2, 2): {
+                'question': '',
+                'answer': 'cucumber',
+                'response_type': 'optionresponse',
+                'input_type': 'optioninput',
+                'correct': False,
+                'variant': '',
+            },
+        })
+
+    def test_rerandomized_inputs(self):
+        factory = CapaFactory
+        module = factory.create(rerandomize=RANDOMIZATION.ALWAYS)
+
+        answer_input_dict = {
+            factory.input_key(2): '3.14'
+        }
+
+        event = self.get_event_for_answers(module, answer_input_dict)
+        self.assertEquals(event['submission'], {
+            factory.answer_key(2): {
+                'question': '',
+                'answer': '3.14',
+                'response_type': 'numericalresponse',
+                'input_type': 'textline',
+                'correct': True,
+                'variant': module.seed,
+            }
+        })
+
+    def test_file_inputs(self):
+        fnames = ["prog1.py", "prog2.py", "prog3.py"]
+        fpaths = [os.path.join(DATA_DIR, "capa", fname) for fname in fnames]
+        fileobjs = [open(fpath) for fpath in fpaths]
+        for fileobj in fileobjs:
+            self.addCleanup(fileobj.close)
+
+        factory = CapaFactoryWithFiles
+        module = factory.create()
+
+        # Mock the XQueueInterface.
+        xqueue_interface = XQueueInterface("http://example.com/xqueue", Mock())
+        xqueue_interface._http_post = Mock(return_value=(0, "ok"))  # pylint: disable=protected-access
+        module.system.xqueue['interface'] = xqueue_interface
+
+        answer_input_dict = {
+            CapaFactoryWithFiles.input_key(response_num=2): fileobjs,
+            CapaFactoryWithFiles.input_key(response_num=3): 'None',
+        }
+
+        event = self.get_event_for_answers(module, answer_input_dict)
+        self.assertEquals(event['submission'], {
+            factory.answer_key(2): {
+                'question': '',
+                'answer': fpaths,
+                'response_type': 'coderesponse',
+                'input_type': 'filesubmission',
+                'correct': False,
+                'variant': '',
+            },
+            factory.answer_key(3): {
+                'answer': 'None',
+                'correct': True,
+                'question': '',
+                'response_type': 'customresponse',
+                'input_type': 'textline',
+                'variant': ''
+            }
+        })
+
+    def test_get_answer_with_jump_to_id_urls(self):
+        """
+        Make sure replace_jump_to_id_urls() is called in get_answer.
+        """
+        problem_xml = textwrap.dedent("""
+        <problem>
+            <p>What is 1+4?</p>
+                <numericalresponse answer="5">
+                  <formulaequationinput />
+                </numericalresponse>
+
+                <solution>
+                <div class="detailed-solution">
+                <p>Explanation</p>
+                <a href="/jump_to_id/c0f8d54964bc44a4a1deb8ecce561ecd">here's the same link to the hint page.</a>
+                </div>
+                </solution>
+        </problem>
+        """)
+
+        data = dict()
+        problem = CapaFactory.create(showanswer='always', xml=problem_xml)
+        problem.runtime.replace_jump_to_id_urls = Mock()
+        problem.get_answer(data)
+        self.assertTrue(problem.runtime.replace_jump_to_id_urls.called)

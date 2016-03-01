@@ -1,3 +1,4 @@
+<%! from django.utils.translation import ugettext as _ %>
 <% element_checked = False %>
 % for choice_id, _ in choices:
     <%choice_id = choice_id %>
@@ -7,22 +8,9 @@
 %endfor
 <section id="choicetextinput_${id}" class="choicetextinput">
 <form class="choicetextgroup capa_inputtype" id="inputtype_${id}">
-    <div class="script_placeholder" data-src="/static/js/capa/choicetextinput.js"/>
-    <div class="indicator_container">
-    % if input_type == 'checkbox' or not element_checked:
-        % if status == 'unsubmitted':
-        <span class="unanswered" style="display:inline-block;" id="status_${id}"></span>
-        % elif status == 'correct':
-        <span class="correct" id="status_${id}"></span>
-        % elif status == 'incorrect':
-        <span class="incorrect" id="status_${id}"></span>
-        % elif status == 'incomplete':
-        <span class="incorrect" id="status_${id}"></span>
-        % endif
-    % endif
-    </div>
-
-    <fieldset>
+    <div class="script_placeholder" data-src="${STATIC_URL}js/capa/choicetextinput.js"/>
+    
+    <fieldset aria-label="${label}">
         % for choice_id, choice_description in choices:
         <%choice_id= choice_id %>
         <section id="forinput${choice_id}"
@@ -32,6 +20,8 @@
                     correctness = 'correct'
                 elif status == 'incorrect':
                     correctness = 'incorrect'
+                elif status == 'partially-correct':
+                    correctness = 'partially-correct'
                 else:
                     correctness = None
             %>
@@ -69,8 +59,18 @@
         <span id="answer_${id}"></span>
     </fieldset>
         <input class= "choicetextvalue" type="hidden"  name="input_${id}{}" id="input_${id}" value="${value|h}" />
+    
+    <div class="indicator-container">
+    % if input_type == 'checkbox' or not element_checked:
+        <span class="status ${status.classname}" id="status_${id}"></span>
+    % endif
+    </div>
+
     % if show_correctness == "never" and (value or status not in ['unsubmitted']):
-    <div class="capa_alert">${submitted_message}</div>
+    <div class="capa_alert">${_(submitted_message)}</div>
     %endif
+    % if msg:
+    <span class="message">${msg|n}</span>
+    % endif
 </form>
 </section>

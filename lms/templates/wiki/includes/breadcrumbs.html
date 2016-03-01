@@ -1,5 +1,8 @@
 ## mako
-<%! from django.core.urlresolvers import reverse %>
+<%!
+  from django.core.urlresolvers import reverse
+  from django.utils.translation import ugettext as _
+%>
 
 %if urlpath is not Undefined and urlpath:
 <header>
@@ -10,13 +13,13 @@
     %>
     %for ancestor in urlpath.cached_ancestors:
       <li><a href="${reverse('wiki:get', kwargs={'path' : ancestor.path})}">${ancestor.article.current_revision.title}</a></li>
-      <% 
+      <%
         if not create_article_root and ancestor.article.can_write(user):
           create_article_root = ancestor
       %>
     %endfor
     <li class="active"><a href="${reverse('wiki:get', kwargs={'path' : urlpath.path})}">${article.current_revision.title}</a></li>
-    <% 
+    <%
       if not create_article_root and urlpath.article.can_write(user):
         create_article_root = urlpath
     %>
@@ -28,8 +31,8 @@
     </form> -->
     %if create_article_root:
     <a class="add-article-btn btn pull-left" href="${reverse('wiki:create', kwargs={'path' : create_article_root.path})}" style="padding: 7px;">
-      <span class="icon-plus"></span>
-      Add article
+      <i class="icon fa fa-plus"></i>
+      ${_("Add article")}
     </a>
     %endif
   </div>

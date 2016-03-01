@@ -1,10 +1,10 @@
-#pylint: disable=C0111,W0613
+# pylint: disable=missing-docstring,unused-argument
 
 from django.http import (HttpResponse, HttpResponseServerError,
                          HttpResponseNotFound)
 from edxmako.shortcuts import render_to_string, render_to_response
 import functools
-import json
+from openedx.core.djangolib.js_utils import dump_js_escaped_json
 
 __all__ = ['not_found', 'server_error', 'render_404', 'render_500']
 
@@ -18,7 +18,7 @@ def jsonable_error(status=500, message="The Studio servers encountered an error"
         @functools.wraps(func)
         def inner(request, *args, **kwargs):
             if request.is_ajax():
-                content = json.dumps({"error": message})
+                content = dump_js_escaped_json({"error": message})
                 return HttpResponse(content, content_type="application/json",
                                     status=status)
             else:

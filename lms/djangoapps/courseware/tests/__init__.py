@@ -13,18 +13,17 @@ from django.test.client import Client
 
 from edxmako.shortcuts import render_to_string
 from student.tests.factories import UserFactory, CourseEnrollmentFactory
-from courseware.tests.modulestore_config import TEST_DATA_MIXED_MODULESTORE
+from xmodule.modulestore.tests.django_utils import TEST_DATA_MONGO_MODULESTORE
 from xblock.field_data import DictFieldData
 from xmodule.tests import get_test_system, get_test_descriptor_system
-from xmodule.modulestore import Location
+from opaque_keys.edx.locations import Location
 from xmodule.modulestore.django import modulestore
 from xmodule.modulestore.tests.factories import CourseFactory, ItemFactory
 from xmodule.modulestore.tests.django_utils import ModuleStoreTestCase
-from lms.lib.xblock.field_data import LmsFieldData
-from lms.lib.xblock.runtime import quote_slashes
+from lms.djangoapps.lms_xblock.field_data import LmsFieldData
+from lms.djangoapps.lms_xblock.runtime import quote_slashes
 
 
-@override_settings(MODULESTORE=TEST_DATA_MIXED_MODULESTORE)
 class BaseTestXmodule(ModuleStoreTestCase):
     """Base class for testing Xmodules with mongo store.
 
@@ -41,6 +40,8 @@ class BaseTestXmodule(ModuleStoreTestCase):
     This class should not contain any tests, because CATEGORY
     should be defined in child class.
     """
+    MODULESTORE = TEST_DATA_MONGO_MODULESTORE
+
     USER_COUNT = 2
     COURSE_DATA = {}
 
@@ -57,17 +58,7 @@ class BaseTestXmodule(ModuleStoreTestCase):
         """
         Generate a new ModuleSystem that is minimally set up for testing
         """
-        runtime = get_test_system(course_id=self.course.id)
-
-        # When asked for a module out of a descriptor, just create a new xmodule runtime,
-        # and inject it into the descriptor
-        def get_module(descr):
-            descr.xmodule_runtime = self.new_module_runtime()
-            return descr
-
-        runtime.get_module = get_module
-
-        return runtime
+        return get_test_system(course_id=self.course.id)
 
     def new_descriptor_runtime(self):
         runtime = get_test_descriptor_system()
@@ -90,9 +81,11 @@ class BaseTestXmodule(ModuleStoreTestCase):
         self.item_descriptor._field_data = LmsFieldData(self.item_descriptor._field_data, student_data)
 
         self.item_descriptor.xmodule_runtime = self.new_module_runtime()
-        self.item_module = self.item_descriptor
 
-        self.item_url = Location(self.item_module.location).url()
+        #self.item_module = self.item_descriptor.xmodule_runtime.xmodule_instance
+        #self.item_module is None at this time
+
+        self.item_url = unicode(self.item_descriptor.location)
 
     def setup_course(self):
         self.course = CourseFactory.create(data=self.COURSE_DATA)
@@ -113,7 +106,7 @@ class BaseTestXmodule(ModuleStoreTestCase):
         # username = robot{0}, password = 'test'
         self.users = [
             UserFactory.create()
-            for i in range(self.USER_COUNT)
+            for dummy0 in range(self.USER_COUNT)
         ]
 
         for user in self.users:
@@ -130,14 +123,15 @@ class BaseTestXmodule(ModuleStoreTestCase):
         self.assertTrue(all(self.login_statuses))
 
     def setUp(self):
-        self.setup_course();
+        super(BaseTestXmodule, self).setUp()
+        self.setup_course()
         self.initialize_module(metadata=self.METADATA, data=self.DATA)
 
     def get_url(self, dispatch):
         """Return item url with dispatch."""
         return reverse(
             'xblock_handler',
-            args=(self.course.id, quote_slashes(self.item_url), 'xmodule_handler', dispatch)
+            args=(unicode(self.course.id), quote_slashes(self.item_url), 'xmodule_handler', dispatch)
         )
 
 

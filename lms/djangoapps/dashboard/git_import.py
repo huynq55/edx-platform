@@ -17,10 +17,13 @@ from django.utils.translation import ugettext as _
 import mongoengine
 
 from dashboard.models import CourseImportLog
+from opaque_keys import InvalidKeyError
+from opaque_keys.edx.keys import CourseKey
+from opaque_keys.edx.locations import SlashSeparatedCourseKey
 
 log = logging.getLogger(__name__)
 
-GIT_REPO_DIR = getattr(settings, 'GIT_REPO_DIR', '/opt/edx/course_repos')
+GIT_REPO_DIR = getattr(settings, 'GIT_REPO_DIR', '/edx/var/app/edxapp/course_repos')
 GIT_IMPORT_STATIC = getattr(settings, 'GIT_IMPORT_STATIC', True)
 
 
@@ -38,6 +41,15 @@ class GitImportError(Exception):
     CANNOT_PULL = _('git clone or pull failed!')
     XML_IMPORT_FAILED = _('Unable to run import command.')
     UNSUPPORTED_STORE = _('The underlying module store does not support import.')
+    # Translators: This is an error message when they ask for a
+    # particular version of a git repository and that version isn't
+    # available from the remote source they specified
+    REMOTE_BRANCH_MISSING = _('The specified remote branch is not available.')
+    # Translators: Error message shown when they have asked for a git
+    # repository branch, a specific version within a repository, that
+    # doesn't exist, or there is a problem changing to it.
+    CANNOT_BRANCH = _('Unable to switch to specified branch. Please check '
+                      'your branch name.')
 
 
 def cmd_log(cmd, cwd):
@@ -47,19 +59,77 @@ def cmd_log(cmd, cwd):
     command doesn't return 0, and returns the command's output.
     """
     output = subprocess.check_output(cmd, cwd=cwd, stderr=subprocess.STDOUT)
-    log.debug('Command was: {0!r}. '
-              'Working directory was: {1!r}'.format(' '.join(cmd), cwd))
-    log.debug('Command output was: {0!r}'.format(output))
+
+    log.debug(u'Command was: %r. Working directory was: %r', ' '.join(cmd), cwd)
+    log.debug(u'Command output was: %r', output)
     return output
 
 
-def add_repo(repo, rdir_in):
-    """This will add a git repo into the mongo modulestore"""
-    # pylint: disable=R0915
+def switch_branch(branch, rdir):
+    """
+    This will determine how to change the branch of the repo, and then
+    use the appropriate git commands to do so.
+
+    Raises an appropriate GitImportError exception if there is any issues with changing
+    branches.
+    """
+    # Get the latest remote
+    try:
+        cmd_log(['git', 'fetch', ], rdir)
+    except subprocess.CalledProcessError as ex:
+        log.exception('Unable to fetch remote: %r', ex.output)
+        raise GitImportError(GitImportError.CANNOT_BRANCH)
+
+    # Check if the branch is available from the remote.
+    cmd = ['git', 'ls-remote', 'origin', '-h', 'refs/heads/{0}'.format(branch), ]
+    try:
+        output = cmd_log(cmd, rdir)
+    except subprocess.CalledProcessError as ex:
+        log.exception('Getting a list of remote branches failed: %r', ex.output)
+        raise GitImportError(GitImportError.CANNOT_BRANCH)
+    if branch not in output:
+        raise GitImportError(GitImportError.REMOTE_BRANCH_MISSING)
+    # Check it the remote branch has already been made locally
+    cmd = ['git', 'branch', '-a', ]
+    try:
+        output = cmd_log(cmd, rdir)
+    except subprocess.CalledProcessError as ex:
+        log.exception('Getting a list of local branches failed: %r', ex.output)
+        raise GitImportError(GitImportError.CANNOT_BRANCH)
+    branches = []
+    for line in output.split('\n'):
+        branches.append(line.replace('*', '').strip())
+
+    if branch not in branches:
+        # Checkout with -b since it is remote only
+        cmd = ['git', 'checkout', '--force', '--track',
+               '-b', branch, 'origin/{0}'.format(branch), ]
+        try:
+            cmd_log(cmd, rdir)
+        except subprocess.CalledProcessError as ex:
+            log.exception('Unable to checkout remote branch: %r', ex.output)
+            raise GitImportError(GitImportError.CANNOT_BRANCH)
+    # Go ahead and reset hard to the newest version of the branch now that we know
+    # it is local.
+    try:
+        cmd_log(['git', 'reset', '--hard', 'origin/{0}'.format(branch), ], rdir)
+    except subprocess.CalledProcessError as ex:
+        log.exception('Unable to reset to branch: %r', ex.output)
+        raise GitImportError(GitImportError.CANNOT_BRANCH)
+
+
+def add_repo(repo, rdir_in, branch=None):
+    """
+    This will add a git repo into the mongo modulestore.
+    If branch is left as None, it will fetch the most recent
+    version of the current branch.
+    """
+    # pylint: disable=too-many-statements
 
     # Set defaults even if it isn't defined in settings
     mongo_db = {
         'host': 'localhost',
+        'port': 27017,
         'user': '',
         'password': '',
         'db': 'xlog',
@@ -67,7 +137,7 @@ def add_repo(repo, rdir_in):
 
     # Allow overrides
     if hasattr(settings, 'MONGODB_LOG'):
-        for config_item in ['host', 'user', 'password', 'db', ]:
+        for config_item in ['host', 'user', 'password', 'db', 'port']:
             mongo_db[config_item] = settings.MONGODB_LOG.get(
                 config_item, mongo_db[config_item])
 
@@ -82,7 +152,7 @@ def add_repo(repo, rdir_in):
         rdir = os.path.basename(rdir_in)
     else:
         rdir = repo.rsplit('/', 1)[-1].rsplit('.git', 1)[0]
-    log.debug('rdir = {0}'.format(rdir))
+    log.debug('rdir = %s', rdir)
 
     rdirp = '{0}/{1}'.format(GIT_REPO_DIR, rdir)
     if os.path.exists(rdirp):
@@ -100,6 +170,9 @@ def add_repo(repo, rdir_in):
     except subprocess.CalledProcessError as ex:
         log.exception('Error running git pull: %r', ex.output)
         raise GitImportError(GitImportError.CANNOT_PULL)
+
+    if branch:
+        switch_branch(branch, rdirp)
 
     # get commit id
     cmd = ['git', 'log', '-1', '--format=%H', ]
@@ -153,21 +226,20 @@ def add_repo(repo, rdir_in):
         logger.setLevel(logging.NOTSET)
         logger.removeHandler(import_log_handler)
 
-    course_id = 'unknown'
+    course_key = None
     location = 'unknown'
 
     # extract course ID from output of import-command-run and make symlink
     # this is needed in order for custom course scripts to work
-    match = re.search('(?ms)===> IMPORTING course to location ([^ \n]+)',
-                      ret_import)
+    match = re.search(r'(?ms)===> IMPORTING courselike (\S+)', ret_import)
     if match:
-        location = match.group(1).strip()
-        log.debug('location = {0}'.format(location))
-        course_id = location.replace('i4x://', '').replace(
-            '/course/', '/').split('\n')[0].strip()
-
-        cdir = '{0}/{1}'.format(GIT_REPO_DIR, course_id.split('/')[1])
-        log.debug('Studio course dir = {0}'.format(cdir))
+        course_id = match.group(1)
+        try:
+            course_key = CourseKey.from_string(course_id)
+        except InvalidKeyError:
+            course_key = SlashSeparatedCourseKey.from_deprecated_string(course_id)
+        cdir = '{0}/{1}'.format(GIT_REPO_DIR, course_key.course)
+        log.debug('Studio course dir = %s', cdir)
 
         if os.path.exists(cdir) and not os.path.islink(cdir):
             log.debug('   -> exists, but is not symlink')
@@ -179,7 +251,7 @@ def add_repo(repo, rdir_in):
                 log.exception('Failed to remove course directory')
 
         if not os.path.exists(cdir):
-            log.debug('   -> creating symlink between {0} and {1}'.format(rdirp, cdir))
+            log.debug('   -> creating symlink between %s and %s', rdirp, cdir)
             try:
                 os.symlink(os.path.abspath(rdirp), os.path.abspath(cdir))
             except OSError:
@@ -188,18 +260,18 @@ def add_repo(repo, rdir_in):
                                               cwd=os.path.abspath(cdir)))
 
     # store import-command-run output in mongo
-    mongouri = 'mongodb://{user}:{password}@{host}/{db}'.format(**mongo_db)
+    mongouri = 'mongodb://{user}:{password}@{host}:{port}/{db}'.format(**mongo_db)
 
     try:
         if mongo_db['user'] and mongo_db['password']:
             mdb = mongoengine.connect(mongo_db['db'], host=mongouri)
         else:
-            mdb = mongoengine.connect(mongo_db['db'], host=mongo_db['host'])
+            mdb = mongoengine.connect(mongo_db['db'], host=mongo_db['host'], port=mongo_db['port'])
     except mongoengine.connection.ConnectionError:
         log.exception('Unable to connect to mongodb to save log, please '
                       'check MONGODB_LOG settings')
     cil = CourseImportLog(
-        course_id=course_id,
+        course_id=course_key,
         location=location,
         repo_dir=rdir,
         created=timezone.now(),
@@ -208,5 +280,5 @@ def add_repo(repo, rdir_in):
     )
     cil.save()
 
-    log.debug('saved CourseImportLog for {0}'.format(cil.course_id))
+    log.debug('saved CourseImportLog for %s', cil.course_id)
     mdb.disconnect()

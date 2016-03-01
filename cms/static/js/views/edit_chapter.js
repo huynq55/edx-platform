@@ -3,7 +3,7 @@ define(["js/views/baseview", "underscore", "underscore.string", "jquery", "gette
     _.str = str; // used in template
     var EditChapter = BaseView.extend({
         initialize: function() {
-            this.template = _.template($("#edit-chapter-tpl").text());
+            this.template = this.loadTemplate('edit-chapter');
             this.listenTo(this.model, "change", this.render);
         },
         tagName: "li",
@@ -12,8 +12,8 @@ define(["js/views/baseview", "underscore", "underscore.string", "jquery", "gette
         },
         render: function() {
             this.$el.html(this.template({
-                name: this.model.escape('name'),
-                asset_path: this.model.escape('asset_path'),
+                name: this.model.get('name'),
+                asset_path: this.model.get('asset_path'),
                 order: this.model.get('order'),
                 error: this.model.validationError
             }));
@@ -52,9 +52,11 @@ define(["js/views/baseview", "underscore", "underscore.string", "jquery", "gette
                 asset_path: this.$("input.chapter-asset-path").val()
             });
             var msg = new FileUploadModel({
-                title: _.template(gettext("Upload a new PDF to “<%= name %>”"),
-                    {name: course.escape('name')}),
-                message: "Files must be in PDF format.",
+                title: _.template(
+                    gettext("Upload a new PDF to “<%= name %>”"),
+                    {name: window.course.escape('name')}
+                ),
+                message: gettext("Please select a PDF file to upload."),
                 mimeTypes: ['application/pdf']
             });
             var that = this;
@@ -65,11 +67,11 @@ define(["js/views/baseview", "underscore", "underscore.string", "jquery", "gette
                     if(!that.model.get('name')) {
                         options.name = response.asset.displayname;
                     }
-                    options.asset_path = response.asset.url;
+                    options.asset_path = response.asset.portable_url;
                     that.model.set(options);
                 }
             });
-            $(".wrapper-view").after(view.show().el);
+            view.show();
         }
     });
 

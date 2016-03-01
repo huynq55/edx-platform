@@ -1,225 +1,113 @@
-<%! from django.utils.translation import ugettext as _ %>
-
-<%!
-  from django.core.urlresolvers import reverse
-  import waffle
-%>
 <%inherit file="main.html" />
-
 <%namespace name='static' file='static_content.html'/>
+<%!
+from django.utils.translation import ugettext as _
+from django.template import RequestContext
+import third_party_auth
+from third_party_auth import pipeline
+from django.core.urlresolvers import reverse
+import json
+%>
 
-<%block name="title"><title>${_("Dashboard")}</title></%block>
+<%
+  cert_name_short = settings.CERT_NAME_SHORT
+  cert_name_long = settings.CERT_NAME_LONG
+%>
+
+
+<%block name="pagetitle">${_("Dashboard")}</%block>
 <%block name="bodyclass">view-dashboard is-authenticated</%block>
+<%block name="nav_skip">#my-courses</%block>
 
-<%block name="js_extra">
-  <script type="text/javascript">
-  (function() {
+<%block name="header_extras">
+% for template_name in ["donation"]:
+<script type="text/template" id="${template_name}-tpl">
+  <%static:include path="dashboard/${template_name}.underscore" />
+</script>
+% endfor
 
-    $('.message.is-expandable .wrapper-tip').bind('click', toggleExpandMessage);
-
-    function toggleExpandMessage(e) {
-        (e).preventDefault();
-
-        $(this).closest('.message.is-expandable').toggleClass('is-expanded');
-    }
-
-    $("#upgrade-to-verified").click(function(event) {
-      user = $(event.target).data("user");
-      course = $(event.target).data("course-id");
-      Logger.log('edx.course.enrollment.upgrade.clicked', [user, course], null);
-      % if waffle.flag_is_active(request, 'alternate_upsell_copy'):
-      analytics.track("Clicked on Alternate Upsell Copy", {
-        course: course
-      });
-      % else:
-      analytics.track("Clicked on Regular Upsell Copy", {
-        course: course
-      });
-      % endif
-    });
-
-    $(".email-settings").click(function(event) {
-      $("#email_settings_course_id").val( $(event.target).data("course-id") );
-      $("#email_settings_course_number").text( $(event.target).data("course-number") );
-      if($(event.target).data("optout") == "False") {
-        $("#receive_emails").prop('checked', true);
-      }
-    });
-
-    $(".unenroll").click(function(event) {
-      $("#unenroll_course_id").val( $(event.target).data("course-id") );
-      $("#unenroll_course_number").text( $(event.target).data("course-number") );
-    });
-
-    $('#unenroll_form').on('ajax:complete', function(event, xhr) {
-      if(xhr.status == 200) {
-        location.href = "${reverse('dashboard')}";
-      } else if (xhr.status == 403) {
-        location.href = "${reverse('signin_user')}?course_id=" +
-          $("#unenroll_course_id").val() + "&enrollment_action=unenroll";
-      } else {
-        $('#unenroll_error').html(
-          xhr.responseText ? xhr.responseText : "${_('An error occurred. Please try again later.')}"
-        ).stop().css("display", "block");
-      }
-    });
-
-    $('#pwd_reset_button').click(function() {
-      $.post('${reverse("password_reset")}',
-             {"email"  : $('#id_email').val()},
-             function(data){
-               $("#password_reset_complete_link").click();
-             });
-    });
-
-    $("#change_email_form").submit(function(){
-      var new_email = $('#new_email_field').val();
-      var new_password = $('#new_email_password').val();
-
-      $.post('${reverse("change_email")}',
-               {"new_email" : new_email, "password" : new_password},
-               function(data) {
-                 if (data.success) {
-                   $("#change_email_title").html("${_('Please verify your new email')}");
-                   $("#change_email_form").html("<p>${_(('You\'ll receive a confirmation in your in-box.'
-                                                    ' Please click the link in the email to confirm'
-                                                    ' the email change.'))}</p>");
-                 } else {
-                   $("#change_email_error").html(data.error).stop().css("display", "block");
-                 }
-               });
-      return false;
-    });
-
-    $("#change_name_form").submit(function(){
-      var new_name = $('#new_name_field').val();
-      var rationale = $('#name_rationale_field').val();
-
-      $.post('${reverse("change_name")}',
-             {"new_name":new_name, "rationale":rationale},
-             function(data) {
-               if(data.success) {
-                 location.reload();
-               } else {
-                 $("#change_name_error").html(data.error).stop().css("display", "block");
-               }
-             });
-       return false;
-    });
-
-    $("#email_settings_form").submit(function(){
-      $.ajax({
-        type: "POST",
-        url: '${reverse("change_email_settings")}',
-        data: $(this).serializeArray(),
-        success: function(data) {
-          if(data.success) {
-            location.href = "${reverse('dashboard')}";
-          }
-        },
-        error: function(xhr, textStatus, error) {
-          if (xhr.status == 403) {
-            location.href = "${reverse('signin_user')}";
-          }
-        }
-      });
-      return false;
-    });
-  })(this);
-
-  $(function(){
-    accessible_modal(".edit-name", "#apply_name_change .close-modal", "#apply_name_change", "#dashboard-main");
-
-    accessible_modal(".edit-email", "#change_email .close-modal", "#change_email", "#dashboard-main");
-
-    accessible_modal("#pwd_reset_button", "#password_reset_complete .close-modal", "#password_reset_complete", "#dashboard-main");
-
-
-    $(".email-settings").each(function(index){
-      $(this).attr("id", "unenroll-" + index);
-      // a bit of a hack, but gets the unique selector for the modal trigger
-      var trigger = "#" + $(this).attr("id");
-      accessible_modal(trigger, "#email-settings-modal .close-modal", "#email-settings-modal", "#dashboard-main");
-    });
-
-    $(".unenroll").each(function(index){
-      $(this).attr("id", "email-settings-" + index);
-      // a bit of a hack, but gets the unique selector for the modal trigger
-      var trigger = "#" + $(this).attr("id");
-      accessible_modal(trigger, "#unenroll-modal .close-modal", "#unenroll-modal", "#dashboard-main");
-    });
-  });
-  </script>
+% for template_name in ["dashboard_search_item", "dashboard_search_results", "search_loading", "search_error"]:
+<script type="text/template" id="${template_name}-tpl">
+    <%static:include path="search/${template_name}.underscore" />
+</script>
+% endfor
 </%block>
 
-<section class="container dashboard" id="dashboard-main" aria-hidden="false">
+<%block name="js_extra">
+  <script src="${static.url('js/commerce/credit.js')}"></script>
+  <%static:js group='dashboard'/>
+  <script type="text/javascript">
+    $(document).ready(function() {
+      edx.dashboard.legacy.init({
+        dashboard: "${reverse('dashboard')}",
+        signInUser: "${reverse('signin_user')}",
+        changeEmailSettings: "${reverse('change_email_settings')}"
+      });
+    });
+  </script>
+  % if settings.FEATURES.get('ENABLE_DASHBOARD_SEARCH'):
+    <%static:require_module module_name="js/search/dashboard/dashboard_search_factory" class_name="DashboardSearchFactory">
+        DashboardSearchFactory();
+    </%static:require_module>
+  % endif
+  % if redirect_message:
+    <%static:require_module module_name="js/views/message_banner" class_name="MessageBannerView">
+        var banner = new MessageBannerView({urgency: 'low', type: 'warning'});
+        $('#content').prepend(banner.$el);
+        banner.showMessage(${json.dumps(redirect_message)})
+    </%static:require_module>
+  % endif
+</%block>
 
-  %if message:
-    <section class="dashboard-banner">
-      ${message}
-    </section>
-  %endif
+<div class="dashboard-notifications" tabindex="-1">
+    %if message:
+        <section class="dashboard-banner">
+            ${message}
+        </section>
+    %endif
 
-  <section class="profile-sidebar">
-    <header class="profile">
-      <h1 class="user-name">${ user.username }</h1>
+    %if enrollment_message:
+        <section class="dashboard-banner">
+            ${enrollment_message}
+        </section>
+    %endif
+</div>
+
+<section class="container dashboard" id="dashboard-main">
+  <section class="my-courses" id="my-courses" role="main" tabindex="-1">
+    <header class="wrapper-header-courses">
+      <h2 class="header-courses">${_("My Courses")}</h2>
     </header>
-    <section class="user-info">
-      <ul>
-        <li class="info--username">
-          <span class="title"><div class="icon name-icon"></div>${_("Full Name")} (<a href="#apply_name_change" rel="leanModal" class="edit-name">${_("edit")}</a>)</span> <span class="data">${ user.profile.name | h }</span>
-        </li>
-        <li class="info--email">
-          <span class="title"><div class="icon email-icon"></div>${_("Email")}
-            % if external_auth_map is None or 'shib' not in external_auth_map.external_domain:
-            (<a href="#change_email" rel="leanModal" class="edit-email">${_("edit")}</a>)
-            % endif
-          </span> <span class="data">${ user.email | h }</span>
-        </li>
 
-        % if external_auth_map is None or 'shib' not in external_auth_map.external_domain:
-        <li class="controls--account">
-          <span class="title"><div class="icon"></div><a href="#password_reset_complete" rel="leanModal" id="pwd_reset_button">${_("Reset Password")}</a></span>
-          <form id="password_reset_form" method="post" data-remote="true" action="${reverse('password_reset')}">
-            <input id="id_email" type="hidden" name="email" maxlength="75" value="${user.email}" />
-            <!-- <input type="submit" id="pwd_reset_button" value="${_('Reset Password')}" /> -->
-          </form>
-        </li>
-        % endif
 
-        <%include file='dashboard/_dashboard_status_verification.html' />
-
-      </ul>
-    </section>
-
-  </section>
-
-  <section class="my-courses">
-    <header>
-      <h2>${_("Current Courses")}</h2>
-    </header>
-
-    % if len(course_enrollment_pairs) > 0:
+    % if len(course_enrollments) > 0:
       <ul class="listing-courses">
-        % for course, enrollment in course_enrollment_pairs:
-            <% show_courseware_link = (course.id in show_courseware_links_for) %>
-            <% cert_status = cert_statuses.get(course.id) %>
-            <% show_email_settings = (course.id in show_email_settings_for) %>
-            <% course_mode_info = all_course_modes.get(course.id) %>
-            <% show_refund_option = (course.id in show_refund_option_for) %>
-            <%include file='dashboard/_dashboard_course_listing.html' args="course=course, enrollment=enrollment, show_courseware_link=show_courseware_link, cert_status=cert_status, show_email_settings=show_email_settings, course_mode_info=course_mode_info, show_refund_option = show_refund_option" />
+      <% share_settings = getattr(settings, 'SOCIAL_SHARING_SETTINGS', {}) %>
+      % for dashboard_index, enrollment in enumerate(course_enrollments):
+        <% show_courseware_link = (enrollment.course_id in show_courseware_links_for) %>
+        <% cert_status = cert_statuses.get(enrollment.course_id) %>
+        <% can_unenroll = (not cert_status) or cert_status.get('can_unenroll') %>
+        <% credit_status = credit_statuses.get(enrollment.course_id) %>
+        <% show_email_settings = (enrollment.course_id in show_email_settings_for) %>
+        <% course_mode_info = all_course_modes.get(enrollment.course_id) %>
+        <% show_refund_option = (enrollment.course_id in show_refund_option_for) %>
+        <% is_paid_course = (enrollment.course_id in enrolled_courses_either_paid) %>
+        <% is_course_blocked = (enrollment.course_id in block_courses) %>
+        <% course_verification_status = verification_status_by_course.get(enrollment.course_id, {}) %>
+        <% course_requirements = courses_requirements_not_met.get(enrollment.course_id) %>
+        <% course_program_info = course_programs.get(unicode(enrollment.course_id)) %>
+        <%include file = 'dashboard/_dashboard_course_listing.html' args="course_overview=enrollment.course_overview, enrollment=enrollment, show_courseware_link=show_courseware_link, cert_status=cert_status, can_unenroll=can_unenroll, credit_status=credit_status, show_email_settings=show_email_settings, course_mode_info=course_mode_info, show_refund_option=show_refund_option, is_paid_course=is_paid_course, is_course_blocked=is_course_blocked, verification_status=course_verification_status, course_requirements=course_requirements, dashboard_index=dashboard_index, share_settings=share_settings, user=user, course_program_info=course_program_info" />
       % endfor
 
       </ul>
     % else:
       <section class="empty-dashboard-message">
+        <p>${_("Looks like you haven't enrolled in any courses yet.")}</p>
+
         % if settings.FEATURES.get('COURSES_ARE_BROWSABLE'):
-          <p>${_("Looks like you haven't registered for any courses yet.")}</p>
           <a href="${marketing_link('COURSES')}">
             ${_("Find courses now!")}
           </a>
-        % else:
-          <p>${_("Looks like you haven't been enrolled in any courses yet.")}</p>
         %endif
       </section>
     % endif
@@ -238,16 +126,85 @@
            % endfor
              </ul>
       % endfor
+      </div>
     % endif
   </section>
+
+  % if settings.FEATURES.get('ENABLE_DASHBOARD_SEARCH'):
+    <div id="dashboard-search-bar" class="search-bar dashboard-search-bar" role="search" aria-label="Dashboard">
+      <form>
+        <label for="dashboard-search-input">${_('Search Your Courses')}</label>
+        <div class="search-field-wrapper">
+          <input id="dashboard-search-input" type="text" class="search-field"/>
+          <button type="submit" class="search-button" aria-label="${_('Search')}">
+            <i class="icon fa fa-search" aria-hidden="true"></i>
+          </button>
+          <button type="button" class="cancel-button" aria-label="${_('Clear search')}">
+            <i class="icon fa fa-remove" aria-hidden="true"></i>
+          </button>
+        </div>
+      </form>
+    </div>
+  % endif
+
+  % if settings.FEATURES.get('ENABLE_DASHBOARD_SEARCH'):
+    <section id="dashboard-search-results" class="search-results dashboard-search-results"></section>
+  % endif
+
+  <section class="profile-sidebar" id="profile-sidebar" role="region" aria-label="Account Status Info">
+    <header class="profile">
+      <h2 class="account-status-title sr">${_("Account Status Info")}: </h2>
+    </header>
+    <section class="user-info">
+      <ul>
+
+        % if len(order_history_list):
+        <li class="order-history">
+          <span class="title">${_("Order History")}</span>
+          % for order_history_item in order_history_list:
+            <span><a href="${order_history_item['receipt_url']}" target="_blank" class="edit-name">${order_history_item['order_date']}</a></span>
+          % endfor
+        </li>
+        % endif
+
+        <%include file="${static.get_template_path('dashboard/_dashboard_status_verification.html')}" />
+
+      </ul>
+    </section>
+  </section>
+  % if xseries_credentials:
+    <div class="wrapper-xseries-certificates">
+      <p class="title">${_("XSeries Program Certificates")}</p>
+      <p class="copy">${_("You have received a certificate for the following XSeries programs:")}</p>
+      <ul>
+      % for xseries_credential in xseries_credentials:
+        <li>
+          <a class="copy" href="${xseries_credential['credential_url']}">${xseries_credential['display_name']}</a>
+        </li>
+      % endfor
+      </ul>
+    </div>
+  % endif
 </section>
 
 <section id="email-settings-modal" class="modal" aria-hidden="true">
   <div class="inner-wrapper" role="dialog" aria-labelledby="email-settings-title">
-    <button class="close-modal">&#10005; <span class="sr">${_('Close Modal')}</span></button>
+    <button class="close-modal">
+      <i class="icon fa fa-remove"></i>
+      <span class="sr">
+        ## Translators: this is a control to allow users to exit out of this modal interface (a menu or piece of UI that takes the full focus of the screen)
+        ${_("Close")}
+      </span>
+    </button>
 
     <header>
-      <h2 id="email-settings-title">${_('Email Settings for {course_number}').format(course_number='<span id="email_settings_course_number"></span>')}<span class="sr">, ${_("modal open")}</span></h2>
+      <h2 id="email-settings-title">
+        ${_("Email Settings for {course_number}").format(course_number='<span id="email_settings_course_number"></span>')}
+        <span class="sr">,
+          ## Translators: this text gives status on if the modal interface (a menu or piece of UI that takes the full focus of the screen) is open or not
+          ${_("window open")}
+        </span>
+      </h2>
       <hr/>
     </header>
 
@@ -255,96 +212,31 @@
       <input name="course_id" id="email_settings_course_id" type="hidden" />
       <label>${_("Receive course emails")} <input type="checkbox" id="receive_emails" name="receive_emails" /></label>
       <div class="submit">
-        <input type="submit" id="submit" value="${_('Save Settings')}" />
+        <input type="submit" id="submit" value="${_("Save Settings")}" />
       </div>
     </form>
   </div>
 </section>
 
-
-
-<section id="password_reset_complete" class="modal" aria-hidden="true">
-  <div class="inner-wrapper" role="dialog" aria-labelledby="password-reset-email">
-    <button class="close-modal">&#10005; <span class="sr">${_('Close Modal')}</span></button>
-
-    <header>
-      <h2 id="password-reset-email">${_('Password Reset Email Sent')}<span class="sr">, ${_("modal open")}</span></h2>
-      <hr/>
-    </header>
-    <div>
-      <form> <!-- Here for styling reasons -->
-        <section>
-          <p>${_('An email has been sent to {email}. Follow the link in the email to change your password.').format(email=user.email)}</p>
-        </section>
-      </form>
-    </div>
-  </div>
-</section>
-
-<section id="change_email" class="modal" aria-hidden="true">
-  <div class="inner-wrapper" role="dialog" aria-labelledby="change_email_title">
-    <button class="close-modal">&#10005; <span class="sr">${_('Close Modal')}</span></button>
-
-    <header>
-      <h2><span id="change_email_title">${_("Change Email")}</span><span class="sr">, ${_("modal open")}</span></h2>
-      <hr/>
-    </header>
-    <div id="change_email_body">
-      <form id="change_email_form">
-        <div id="change_email_error" class="modal-form-error"> </div>
-        <fieldset>
-          <div class="input-group">
-            <label>${_('Please enter your new email address:')}</label>
-            <input id="new_email_field" type="email" value="" />
-            <label>${_('Please confirm your password:')}</label>
-            <input id="new_email_password" value="" type="password" />
-          </div>
-          <section>
-            <p>${_('We will send a confirmation to both {email} and your new email as part of the process.').format(email=user.email)}</p>
-          </section>
-          <div class="submit">
-            <input type="submit" id="submit_email_change" value="${_('Change Email')}"/>
-          </div>
-        </fieldset>
-      </form>
-    </div>
-  </div>
-</section>
-
-<section id="apply_name_change" class="modal" aria-hidden="true">
-  <div class="inner-wrapper" role="dialog" aria-labelledby="change-name-title">
-    <button class="close-modal">&#10005; <span class="sr">${_('Close Modal')}</span></button>
-
-    <header>
-      <h2 id="change-name-title">${_("Change your name")}<span class="sr">, ${_("modal open")}</span></h2>
-      <hr/>
-    </header>
-    <div id="change_name_body">
-      <form id="change_name_form">
-        <div id="change_name_error" class="modal-form-error"> </div>
-        <p>${_("To uphold the credibility of {platform} certificates, all name changes will be logged and recorded.").format(platform=settings.PLATFORM_NAME)}</p>
-        <br/>
-        <fieldset>
-          <div class="input-group">
-            <label>${_("Enter your desired full name, as it will appear on the {platform} certificates:").format(platform=settings.PLATFORM_NAME)}</label>
-            <input id="new_name_field" value="" type="text" />
-            <label>${_("Reason for name change:")}</label>
-            <textarea id="name_rationale_field" value=""></textarea>
-          </div>
-          <div class="submit">
-            <input type="submit" id="submit" value="${_('Change My Name')}">
-          </div>
-        </fieldset>
-      </form>
-    </div>
-  </div>
-</section>
-
 <section id="unenroll-modal" class="modal unenroll-modal" aria-hidden="true">
-  <div class="inner-wrapper" role="alertdialog" aria-labelledy="unenrollment-modal-title">
-    <button class="close-modal">&#10005; <span class="sr">${_('Close Modal')}</span></button>
+  <div class="inner-wrapper" role="dialog" aria-labelledby="unenrollment-modal-title">
+    <button class="close-modal">
+      <i class="icon fa fa-remove"></i>
+      <span class="sr">
+        ## Translators: this is a control to allow users to exit out of this modal interface (a menu or piece of UI that takes the full focus of the screen)
+        ${_("Close")}
+      </span>
+    </button>
+
     <header>
-      <h2 id="unenrollment-modal-title">${_('<span id="track-info"></span> {course_number}?  <span id="refund-info"></span>').format(course_number='<span id="unenroll_course_number"></span>')}<span class="sr">, ${_("modal open")}</span></h2>
+      <h2 id="unenrollment-modal-title">
+        <span id='track-info'></span>
+        <span id='refund-info'></span>
+        <span class="sr">,
+          ## Translators: this text gives status on if the modal interface (a menu or piece of UI that takes the full focus of the screen) is open or not
+          ${_("window open")}
+        </span>
+      </h2>
       <hr/>
     </header>
     <div id="unenroll_error" class="modal-form-error"></div>
@@ -352,7 +244,7 @@
       <input name="course_id" id="unenroll_course_id" type="hidden" />
       <input name="enrollment_action" type="hidden" value="unenroll" />
       <div class="submit">
-        <input name="submit" type="submit" value="${_('Unregister')}" />
+        <input name="submit" type="submit" value="${_("Unenroll")}" />
       </div>
     </form>
   </div>

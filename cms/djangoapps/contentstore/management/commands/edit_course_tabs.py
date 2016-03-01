@@ -5,8 +5,6 @@
 #
 # Run it this way:
 #   ./manage.py cms --settings dev edit_course_tabs --course Stanford/CS99/2013_spring
-# Or via rake:
-#   rake django-admin[edit_course_tabs,cms,dev,"--course Stanford/CS99/2013_spring --delete 4"]
 #
 from optparse import make_option
 from django.core.management.base import BaseCommand, CommandError
@@ -15,6 +13,9 @@ from .prompt import query_yes_no
 from courseware.courses import get_course_by_id
 
 from contentstore.views import tabs
+from opaque_keys import InvalidKeyError
+from opaque_keys.edx.locations import SlashSeparatedCourseKey
+from opaque_keys.edx.keys import CourseKey
 
 
 def print_course(course):
@@ -66,7 +67,12 @@ command again, adding --insert or --delete to edit the list.
         if not options['course']:
             raise CommandError(Command.course_option.help)
 
-        course = get_course_by_id(options['course'])
+        try:
+            course_key = CourseKey.from_string(options['course'])
+        except InvalidKeyError:
+            course_key = SlashSeparatedCourseKey.from_deprecated_string(options['course'])
+
+        course = get_course_by_id(course_key)
 
         print 'Warning: this command directly edits the list of course tabs in mongo.'
         print 'Tabs before any changes:'

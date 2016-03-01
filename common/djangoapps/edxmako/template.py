@@ -12,14 +12,14 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 
-from django.conf import settings
-from mako.template import Template as MakoTemplate
-from edxmako.shortcuts import marketing_link
-
 import edxmako
-import edxmako.middleware
 
-django_variables = ['lookup', 'output_encoding', 'encoding_errors']
+from django.conf import settings
+from edxmako.middleware import get_template_request_context
+from edxmako.shortcuts import marketing_link
+from mako.template import Template as MakoTemplate
+
+DJANGO_VARIABLES = ['output_encoding', 'encoding_errors']
 
 # TODO: We should make this a Django Template subclass that simply has the MakoTemplate inside of it? (Intead of inheriting from MakoTemplate)
 
@@ -34,8 +34,8 @@ class Template(MakoTemplate):
     def __init__(self, *args, **kwargs):
         """Overrides base __init__ to provide django variable overrides"""
         if not kwargs.get('no_django', False):
-            overrides = dict([(k, getattr(edxmako, k, None),) for k in django_variables])
-            overrides['lookup'] = overrides['lookup']['main']
+            overrides = {k: getattr(edxmako, k, None) for k in DJANGO_VARIABLES}
+            overrides['lookup'] = edxmako.LOOKUP['main']
             kwargs.update(overrides)
         super(Template, self).__init__(*args, **kwargs)
 
@@ -48,11 +48,12 @@ class Template(MakoTemplate):
         context_dictionary = {}
 
         # In various testing contexts, there might not be a current request context.
-        if edxmako.middleware.requestcontext is not None:
-            for d in edxmako.middleware.requestcontext:
-                context_dictionary.update(d)
-        for d in context_instance:
-            context_dictionary.update(d)
+        request_context = get_template_request_context()
+        if request_context:
+            for item in request_context:
+                context_dictionary.update(item)
+        for item in context_instance:
+            context_dictionary.update(item)
         context_dictionary['settings'] = settings
         context_dictionary['EDX_ROOT_URL'] = settings.EDX_ROOT_URL
         context_dictionary['django_context'] = context_instance

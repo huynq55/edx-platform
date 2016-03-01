@@ -1,10 +1,14 @@
-<%! 
-    from django.utils.translation import ugettext as _
-%>
 <%inherit file="base.html" />
+<%def name="online_help_token()"><% return "updates" %></%def>
 <%namespace name='static' file='static_content.html'/>
+<%!
+from django.utils.translation import ugettext as _
+from openedx.core.djangolib.js_utils import (
+    dump_js_escaped_json, js_escaped_string
+)
+%>
 
-<!-- TODO decode course # from context_course into title -->
+## TODO decode course # from context_course into title.
 <%block name="title">${_("Course Updates")}</%block>
 <%block name="bodyclass">is-signedin course course-info updates view-updates</%block>
 
@@ -17,30 +21,15 @@
 % endfor
 </%block>
 
-<%block name="jsextra">
-  <script type="text/javascript" charset="utf-8">
-  
-require(["domReady!", "jquery", "js/collections/course_update", "js/models/module_info", "js/models/course_info", "js/views/course_info_edit"],
-  function(doc, $, CourseUpdateCollection, ModuleInfoModel, CourseInfoModel, CourseInfoEditView) {
-    var course_updates = new CourseUpdateCollection();
-    course_updates.url = '${updates_url}';
-    course_updates.fetch({reset: true});
-
-    var course_handouts = new ModuleInfoModel({
-        id: '${handouts_locator}'
-      });
-
-    var editor = new CourseInfoEditView({
-      el: $('.main-wrapper'),
-      model : new CourseInfoModel({
-        updates : course_updates,
-        base_asset_url : '${base_asset_url}',
-        handouts : course_handouts
-        })
-    });
-    editor.render();
-});
-  </script>
+<%block name="requirejs">
+  require(["js/factories/course_info"], function(CourseInfoFactory) {
+      CourseInfoFactory(
+        "${updates_url | n, js_escaped_string}",
+        "${handouts_locator | n, js_escaped_string}",
+        "${base_asset_url | n, js_escaped_string}",
+        ${push_notification_enabled | n, dump_js_escaped_json}
+       );
+  });
 </%block>
 
 <%block name="content">
@@ -51,11 +40,11 @@ require(["domReady!", "jquery", "js/collections/course_update", "js/models/modul
         <span class="sr">&gt; </span>${_("Course Updates")}
       </h1>
 
-      <nav class="nav-actions">
+      <nav class="nav-actions" aria-label="${_('Page Actions')}">
         <h3 class="sr">${_('Page Actions')}</h3>
         <ul>
           <li class="nav-item">
-            <a href="#" class=" button new-button new-update-button"><i class="icon-plus"></i> ${_('New Update')}</a>
+            <a href="#" class=" button new-button new-update-button"><i class="icon fa fa-plus"></i> ${_('New Update')}</a>
           </li>
         </ul>
       </nav>
@@ -65,7 +54,7 @@ require(["domReady!", "jquery", "js/collections/course_update", "js/models/modul
   <div class="wrapper-content wrapper">
     <section class="content">
       <div class="introduction">
-        <p clas="copy">${_('Use course updates to notify students of important dates or exams, highlight particular discussions in the forums, announce schedule changes, and respond to student questions. You add or edit updates in HTML.')}</p>
+        <p class="copy">${_('Use course updates to notify students of important dates or exams, highlight particular discussions in the forums, announce schedule changes, and respond to student questions. You add or edit updates in HTML.')}</p>
       </div>
     </section>
   </div>

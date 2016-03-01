@@ -1,87 +1,38 @@
 if Backbone?
-  class @ThreadResponseShowView extends DiscussionContentView
-    events:
-        "click .vote-btn":
-          (event) -> @toggleVote(event)
-        "keydown .vote-btn":
-          (event) -> DiscussionUtil.activateOnSpace(event, @toggleVote)
-        "click .action-endorse": "toggleEndorse"
-        "click .action-delete": "_delete"
-        "click .action-edit": "edit"
-        "click .discussion-flag-abuse": "toggleFlagAbuse"
-        "keydown .discussion-flag-abuse":
-          (event) -> DiscussionUtil.activateOnSpace(event, @toggleFlagAbuse)
-
-    $: (selector) ->
-        @$el.find(selector)
-
+  class @ThreadResponseShowView extends DiscussionContentShowView
     initialize: ->
         super()
-        @model.on "change", @updateModelDetails
+        @listenTo(@model, "change", @render)
 
     renderTemplate: ->
         @template = _.template($("#thread-response-show-template").html())
-        @template(@model.toJSON())
+        context = _.extend(
+            {
+                cid: @model.cid,
+                author_display: @getAuthorDisplay(),
+                endorser_display: @getEndorserDisplay(),
+                readOnly: $('.discussion-module').data('read-only')
+            },
+            @model.attributes
+        )
+        @template(context)
 
     render: ->
       @$el.html(@renderTemplate())
       @delegateEvents()
-      @renderVote()
       @renderAttrs()
-      @renderFlagged()
-      @$el.find(".posted-details").timeago()
+      @$el.find(".posted-details .timeago").timeago()
       @convertMath()
-      @markAsStaff()
       @
 
     convertMath: ->
       element = @$(".response-body")
       element.html DiscussionUtil.postMathJaxProcessor DiscussionUtil.markdownWithHighlight element.text()
-      MathJax.Hub.Queue ["Typeset", MathJax.Hub, element[0]]
-
-    markAsStaff: ->
-      if DiscussionUtil.isStaff(@model.get("user_id"))
-        @$el.addClass("staff")
-        @$el.prepend('<div class="staff-banner">' + gettext('staff') + '</div>')
-      else if DiscussionUtil.isTA(@model.get("user_id"))
-        @$el.addClass("community-ta")
-        @$el.prepend('<div class="community-ta-banner">' + gettext('Community TA') + '</div>')
+      if MathJax?
+        MathJax.Hub.Queue ["Typeset", MathJax.Hub, element[0]]
 
     edit: (event) ->
         @trigger "response:edit", event
 
     _delete: (event) ->
         @trigger "response:_delete", event
-
-    toggleEndorse: (event) ->
-      event.preventDefault()
-      if not @model.can('can_endorse')
-        return
-      $elem = $(event.target)
-      url = @model.urlFor('endorse')
-      endorsed = @model.get('endorsed')
-      data = { endorsed: not endorsed }
-      @model.set('endorsed', not endorsed)
-      @trigger "comment:endorse", not endorsed
-      DiscussionUtil.safeAjax
-        $elem: $elem
-        url: url
-        data: data
-        type: "POST"
-
-            
-    renderFlagged: =>
-      if window.user.id in @model.get("abuse_flaggers") or (DiscussionUtil.isFlagModerator and @model.get("abuse_flaggers").length > 0)
-        @$("[data-role=thread-flag]").addClass("flagged")  
-        @$("[data-role=thread-flag]").removeClass("notflagged")
-        @$(".discussion-flag-abuse").attr("aria-pressed", "true")
-        @$(".discussion-flag-abuse .flag-label").html(gettext("Misuse Reported"))
-      else
-        @$("[data-role=thread-flag]").removeClass("flagged")  
-        @$("[data-role=thread-flag]").addClass("notflagged")      
-        @$(".discussion-flag-abuse").attr("aria-pressed", "false")
-        @$(".discussion-flag-abuse .flag-label").html(gettext("Report Misuse"))
-        
-    updateModelDetails: =>
-      @renderVote()
-      @renderFlagged()

@@ -1,7 +1,6 @@
-#pylint: disable=C0111
-#pylint: disable=W0621
+# pylint: disable=missing-docstring
 
-#EVERY PROBLEM TYPE MUST HAVE THE FOLLOWING:
+# EVERY PROBLEM TYPE MUST HAVE THE FOLLOWING:
 # -Section in Dictionary containing:
 #   -factory
 #   -kwargs
@@ -84,7 +83,7 @@ PROBLEM_DICT = {
             'answer': 'correct string'},
         'correct': ['div.correct'],
         'incorrect': ['div.incorrect'],
-        'unanswered': ['div.unanswered']},
+        'unanswered': ['div.unanswered', 'div.unsubmitted']},
 
     'numerical': {
         'factory': NumericalResponseXMLFactory(),
@@ -95,7 +94,7 @@ PROBLEM_DICT = {
             'math_display': True},
         'correct': ['div.correct'],
         'incorrect': ['div.incorrect'],
-        'unanswered': ['div.unanswered']},
+        'unanswered': ['div.unanswered', 'div.unsubmitted']},
 
     'formula': {
         'factory': FormulaResponseXMLFactory(),
@@ -108,7 +107,7 @@ PROBLEM_DICT = {
             'answer': 'x^2+2*x+y'},
         'correct': ['div.correct'],
         'incorrect': ['div.incorrect'],
-        'unanswered': ['div.unanswered']},
+        'unanswered': ['div.unanswered', 'div.unsubmitted']},
 
     'script': {
         'factory': CustomResponseXMLFactory(),
@@ -129,7 +128,7 @@ PROBLEM_DICT = {
             """)},
         'correct': ['div.correct'],
         'incorrect': ['div.incorrect'],
-        'unanswered': ['div.unanswered']},
+        'unanswered': ['div.unanswered', 'div.unsubmitted']},
 
     'code': {
         'factory': CodeResponseXMLFactory(),
@@ -170,7 +169,7 @@ PROBLEM_DICT = {
     'image': {
         'factory': ImageResponseXMLFactory(),
         'kwargs': {
-            'src': '/static/images/mit_dome.jpg',
+            'src': '/static/images/placeholder-image.png',
             'rectangle': '(50,50)-(100,100)'
         },
         'correct': ['span.correct'],
@@ -187,7 +186,9 @@ def answer_problem(course, problem_type, correctness):
     section_loc = section_location(course)
 
     if problem_type == "drop down":
-        select_name = "input_i4x-{0.org}-{0.course}-problem-drop_down_2_1".format(section_loc)
+        select_name = "input_{}_2_1".format(
+            section_loc.course_key.make_usage_key('problem', 'drop_down').html_id()
+        )
         option_text = 'Option 2' if correctness == 'correct' else 'Option 3'
         world.select_option(select_name, option_text)
 
@@ -263,8 +264,9 @@ def answer_problem(course, problem_type, correctness):
         offset = 25 if correctness == "correct" else -25
 
         def try_click():
-            image_selector = "#imageinput_i4x-{0.org}-{0.course}-problem-image_2_1".format(section_loc)
-            input_selector = "#input_i4x-{0.org}-{0.course}-problem-image_2_1".format(section_loc)
+            problem_html_loc = section_loc.course_key.make_usage_key('problem', 'image').html_id()
+            image_selector = "#imageinput_{}_2_1".format(problem_html_loc)
+            input_selector = "#input_{}_2_1".format(problem_html_loc)
 
             world.browser.execute_script('$("body").on("click", function(event) {console.log(event);})')
 
@@ -353,12 +355,12 @@ def add_problem_to_course(course, problem_type, extra_meta=None):
     Add a problem to the course we have created using factories.
     '''
 
-    assert(problem_type in PROBLEM_DICT)
+    assert problem_type in PROBLEM_DICT
 
     # Generate the problem XML using capa.tests.response_xml_factory
     factory_dict = PROBLEM_DICT[problem_type]
     problem_xml = factory_dict['factory'].build_xml(**factory_dict['kwargs'])
-    metadata = {'rerandomize': 'always'} if not 'metadata' in factory_dict else factory_dict['metadata']
+    metadata = {'rerandomize': 'always'} if 'metadata' not in factory_dict else factory_dict['metadata']
     if extra_meta:
         metadata = dict(metadata, **extra_meta)
 
@@ -385,16 +387,15 @@ def inputfield(course, problem_type, choice=None, input_num=1):
 
     section_loc = section_location(course)
 
+    ptype = problem_type.replace(" ", "_")
     # this is necessary due to naming requirement for this problem type
     if problem_type in ("radio_text", "checkbox_text"):
-        selector_template = "input#i4x-{org}-{course}-problem-{ptype}_2_{input}"
+        selector_template = "input#{}_2_{input}"
     else:
-        selector_template = "input#input_i4x-{org}-{course}-problem-{ptype}_2_{input}"
+        selector_template = "input#input_{}_2_{input}"
 
     sel = selector_template.format(
-        org=section_loc.org,
-        course=section_loc.course,
-        ptype=problem_type.replace(" ", "_"),
+        section_loc.course_key.make_usage_key('problem', ptype).html_id(),
         input=input_num,
     )
 

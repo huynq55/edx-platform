@@ -1,13 +1,12 @@
-# pylint: disable=C0111
-# pylint: disable=W0621
+# pylint: disable=missing-docstring
+# pylint: disable=redefined-outer-name
 
-import time
 import os
 from lettuce import world, step
-from nose.tools import assert_true, assert_in  # pylint: disable=no-name-in-module
+from nose.tools import assert_true, assert_in
 from django.conf import settings
 
-from student.roles import CourseRole, CourseStaffRole, CourseInstructorRole
+from student.roles import CourseStaffRole, CourseInstructorRole, GlobalStaff
 from student.models import get_user
 
 from selenium.webdriver.common.keys import Keys
@@ -58,6 +57,26 @@ def i_have_opened_a_new_course(_step):
     open_new_course()
 
 
+@step('I have populated a new course in Studio$')
+def i_have_populated_a_new_course(_step):
+    world.clear_courses()
+    course = world.CourseFactory.create()
+    world.scenario_dict['COURSE'] = course
+    section = world.ItemFactory.create(parent_location=course.location)
+    world.ItemFactory.create(
+        parent_location=section.location,
+        category='sequential',
+        display_name='Subsection One',
+    )
+    user = create_studio_user(is_staff=False)
+    add_course_author(user, course)
+
+    log_into_studio()
+
+    world.css_click('a.course-link')
+    world.wait_for_js_to_load()
+
+
 @step('(I select|s?he selects) the new course')
 def select_new_course(_step, whom):
     course_link_css = 'a.course-link'
@@ -73,7 +92,7 @@ def press_the_notification_button(_step, name):
     # the "Save" button at the UI level.
     # Instead, we use JavaScript to reliably click
     # the button.
-    btn_css = 'div#page-notification a.action-%s' % name.lower()
+    btn_css = 'div#page-notification button.action-%s' % name.lower()
     world.trigger_event(btn_css, event='focus')
     world.browser.execute_script("$('{}').click()".format(btn_css))
     world.wait_for_ajax_complete()
@@ -152,7 +171,7 @@ def log_into_studio(
     world.log_in(username=uname, password=password, email=email, name=name)
     # Navigate to the studio dashboard
     world.visit('/')
-    assert_in(uname, world.css_text('h2.title', timeout=10))
+    assert_in(uname, world.css_text('span.account-username', timeout=10))
 
 
 def add_course_author(user, course):
@@ -162,7 +181,7 @@ def add_course_author(user, course):
     """
     global_admin = AdminFactory()
     for role in (CourseStaffRole, CourseInstructorRole):
-        auth.add_users(global_admin, role(course.location), user)
+        auth.add_users(global_admin, role(course.id), user)
 
 
 def create_a_course():
@@ -183,36 +202,27 @@ def create_a_course():
     assert_true(world.is_css_present(course_title_css))
 
 
-def add_section(name='My Section'):
-    link_css = 'a.new-courseware-section-button'
-    world.css_click(link_css)
-    name_css = 'input.new-section-name'
-    save_css = 'input.new-section-name-save'
-    world.css_fill(name_css, name)
-    world.css_click(save_css)
-    span_css = 'span.section-name-span'
-    assert_true(world.is_css_present(span_css))
+def add_section():
+    world.css_click('.outline .button-new')
+    assert_true(world.is_css_present('.outline-section .xblock-field-value'))
 
 
-def add_subsection(name='Subsection One'):
-    css = 'a.new-subsection-item'
-    world.css_click(css)
-    name_css = 'input.new-subsection-name-input'
-    save_css = 'input.new-subsection-name-save'
-    world.css_fill(name_css, name)
-    world.css_click(save_css)
+def set_date_and_time(date_css, desired_date, time_css, desired_time, key=None):
+    set_element_value(date_css, desired_date, key)
+    world.wait_for_ajax_complete()
+
+    set_element_value(time_css, desired_time, key)
+    world.wait_for_ajax_complete()
 
 
-def set_date_and_time(date_css, desired_date, time_css, desired_time):
-    world.css_fill(date_css, desired_date)
-    # hit TAB to get to the time field
-    e = world.css_find(date_css).first
-    # pylint: disable=W0212
-    e._element.send_keys(Keys.TAB)
-    world.css_fill(time_css, desired_time)
-    e = world.css_find(time_css).first
-    e._element.send_keys(Keys.TAB)
-    time.sleep(float(1))
+def set_element_value(element_css, element_value, key=None):
+    element = world.css_find(element_css).first
+    element.fill(element_value)
+    # hit TAB or provided key to trigger save content
+    if key is not None:
+        element._element.send_keys(getattr(Keys, key))  # pylint: disable=protected-access
+    else:
+        element._element.send_keys(Keys.TAB)  # pylint: disable=protected-access
 
 
 @step('I have enabled the (.*) advanced module$')
@@ -225,50 +235,37 @@ def i_enabled_the_advanced_module(step, module):
 
 
 @world.absorb
-def create_course_with_unit():
+def create_unit_from_course_outline():
     """
-    Prepare for tests by creating a course with a section, subsection, and unit.
-    Performs the following:
-        Clear out all courseware
-        Create a course with a section, subsection, and unit
-        Create a user and make that user a course author
-        Log the user into studio
-        Open the course from the dashboard
-        Expand the section and click on the New Unit link
-    The end result is the page where the user is editing the new unit
+    Expands the section and clicks on the New Unit link.
+    The end result is the page where the user is editing the new unit.
     """
-    world.clear_courses()
-    course = world.CourseFactory.create()
-    world.scenario_dict['COURSE'] = course
-    section = world.ItemFactory.create(parent_location=course.location)
-    world.ItemFactory.create(
-        parent_location=section.location,
-        category='sequential',
-        display_name='Subsection One',
-    )
-    user = create_studio_user(is_staff=False)
-    add_course_author(user, course)
-
-    log_into_studio()
-    world.css_click('a.course-link')
-
-    world.wait_for_js_to_load()
     css_selectors = [
-        'div.section-item a.expand-collapse', 'a.new-unit-item'
+        '.outline-subsection .expand-collapse', '.outline-subsection .button-new'
     ]
     for selector in css_selectors:
         world.css_click(selector)
 
     world.wait_for_mathjax()
     world.wait_for_xmodule()
+    world.wait_for_loading()
 
     assert world.is_css_present('ul.new-component-type')
+
+
+@world.absorb
+def wait_for_loading():
+    """
+    Waits for the loading indicator to be hidden.
+    """
+    world.wait_for(lambda _driver: len(world.browser.find_by_css('div.ui-loading.is-hidden')) > 0)
 
 
 @step('I have clicked the new unit button$')
 @step(u'I am in Studio editing a new unit$')
 def edit_new_unit(step):
-    create_course_with_unit()
+    step.given('I have populated a new course in Studio')
+    create_unit_from_course_outline()
 
 
 @step('the save notification button is disabled')
@@ -287,15 +284,22 @@ def button_disabled(step, value):
 def _do_studio_prompt_action(intent, action):
     """
     Wait for a studio prompt to appear and press the specified action button
-    See cms/static/js/views/feedback_prompt.js for implementation
+    See common/js/components/views/feedback_prompt.js for implementation
     """
-    assert intent in ['warning', 'error', 'confirmation', 'announcement',
-        'step-required', 'help', 'mini']
+    assert intent in [
+        'warning',
+        'error',
+        'confirmation',
+        'announcement',
+        'step-required',
+        'help',
+        'mini',
+    ]
     assert action in ['primary', 'secondary']
 
     world.wait_for_present('div.wrapper-prompt.is-shown#prompt-{}'.format(intent))
 
-    action_css = 'li.nav-item > a.action-{}'.format(action)
+    action_css = 'li.nav-item > button.action-{}'.format(action)
     world.trigger_event(action_css, event='focus')
     world.browser.execute_script("$('{}').click()".format(action_css))
 
@@ -318,28 +322,45 @@ def i_am_shown_a_notification(step):
     assert world.is_css_present('.wrapper-prompt')
 
 
-def type_in_codemirror(index, text):
-    world.wait(1)  # For now, slow this down so that it works. TODO: fix it.
-    world.css_click("div.CodeMirror-lines", index=index)
-    world.browser.execute_script("$('div.CodeMirror.CodeMirror-focused > div').css('overflow', '')")
-    g = world.css_find("div.CodeMirror.CodeMirror-focused > div > textarea")
-    if world.is_mac():
-        g._element.send_keys(Keys.COMMAND + 'a')
-    else:
-        g._element.send_keys(Keys.CONTROL + 'a')
-    g._element.send_keys(Keys.DELETE)
-    g._element.send_keys(text)
-    if world.is_firefox():
-        world.trigger_event('div.CodeMirror', index=index, event='blur')
+def type_in_codemirror(index, text, find_prefix="$"):
+    script = """
+    var cm = {find_prefix}('div.CodeMirror:eq({index})').get(0).CodeMirror;
+    cm.getInputField().focus();
+    cm.setValue(arguments[0]);
+    cm.getInputField().blur();""".format(index=index, find_prefix=find_prefix)
+    world.browser.driver.execute_script(script, str(text))
     world.wait_for_ajax_complete()
 
 
-def upload_file(filename):
-    path = os.path.join(TEST_ROOT, filename)
+def get_codemirror_value(index=0, find_prefix="$"):
+    return world.browser.driver.execute_script(
+        """
+        return {find_prefix}('div.CodeMirror:eq({index})').get(0).CodeMirror.getValue();
+        """.format(index=index, find_prefix=find_prefix)
+    )
+
+
+def attach_file(filename, sub_path):
+    path = os.path.join(TEST_ROOT, sub_path, filename)
     world.browser.execute_script("$('input.file-input').css('display', 'block')")
+    assert_true(os.path.exists(path))
     world.browser.attach_file('file', os.path.abspath(path))
-    button_css = '.upload-dialog .action-upload'
+
+
+def upload_file(filename, sub_path=''):
+    # The file upload dialog is a faux modal, a div that takes over the display
+    attach_file(filename, sub_path)
+    modal_css = 'div.wrapper-modal-window-assetupload'
+    button_css = '{} .action-upload'.format(modal_css)
     world.css_click(button_css)
+
+    # Clicking the Upload button triggers an AJAX POST.
+    world.wait_for_ajax_complete()
+
+    # The modal stays up with a "File uploaded succeeded" confirmation message, then goes away.
+    # It should take under 2 seconds, so wait up to 10.
+    # Note that is_css_not_present will return as soon as the element is gone.
+    assert world.is_css_not_present(modal_css, wait_time=10)
 
 
 @step(u'"([^"]*)" logs in$')
@@ -367,35 +388,19 @@ def create_other_user(_step, name, has_extra_perms, role_name):
     user = create_studio_user(uname=name, password="test", email=email)
     if has_extra_perms:
         if role_name == "is_staff":
-            user.is_staff = True
-            user.save()
+            GlobalStaff().add_users(user)
         else:
             if role_name == "admin":
                 # admins get staff privileges, as well
                 roles = (CourseStaffRole, CourseInstructorRole)
             else:
                 roles = (CourseStaffRole,)
-            location = world.scenario_dict["COURSE"].location
+            course_key = world.scenario_dict["COURSE"].id
             global_admin = AdminFactory()
             for role in roles:
-                auth.add_users(global_admin, role(location), user)
+                auth.add_users(global_admin, role(course_key), user)
 
 
 @step('I log out')
 def log_out(_step):
     world.visit('logout')
-
-
-@step(u'I click on "edit a draft"$')
-def i_edit_a_draft(_step):
-    world.css_click("a.create-draft")
-
-
-@step(u'I click on "replace with draft"$')
-def i_replace_w_draft(_step):
-    world.css_click("a.publish-draft")
-
-
-@step(u'I publish the unit$')
-def publish_unit(_step):
-    world.select_option('visibility-select', 'public')

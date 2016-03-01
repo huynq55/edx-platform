@@ -39,6 +39,7 @@ graded status as'status'
 # makes sense, but a bunch of problems have markup that assumes block.  Bigger TODO: figure out a
 # general css and layout strategy for capa, document it, then implement it.
 
+import time
 import json
 import logging
 from lxml import etree
@@ -46,11 +47,15 @@ import re
 import shlex  # for splitting quoted strings
 import sys
 import pyparsing
+import html5lib
+import bleach
 
+from .util import sanitize_html
 from .registry import TagRegistry
 from chem import chemcalc
 from calc.preview import latex_preview
 import xqueue_interface
+from xqueue_interface import XQUEUE_TIMEOUT
 from datetime import datetime
 from xmodule.stringify import stringify_children
 
@@ -58,7 +63,58 @@ log = logging.getLogger(__name__)
 
 #########################################################################
 
-registry = TagRegistry()
+registry = TagRegistry()  # pylint: disable=invalid-name
+
+
+class Status(object):
+    """
+    Problem status
+    attributes: classname, display_name, display_tooltip
+    """
+    css_classes = {
+        # status: css class
+        'unsubmitted': 'unanswered',
+        'incomplete': 'incorrect',
+        'queued': 'processing',
+    }
+    __slots__ = ('classname', '_status', 'display_name', 'display_tooltip')
+
+    def __init__(self, status, gettext_func=unicode):
+        self.classname = self.css_classes.get(status, status)
+        _ = gettext_func
+        names = {
+            'correct': _('correct'),
+            'incorrect': _('incorrect'),
+            'partially-correct': _('partially correct'),
+            'incomplete': _('incomplete'),
+            'unanswered': _('unanswered'),
+            'unsubmitted': _('unanswered'),
+            'queued': _('processing'),
+        }
+        tooltips = {
+            # Translators: these are tooltips that indicate the state of an assessment question
+            'correct': _('This answer is correct.'),
+            'incorrect': _('This answer is incorrect.'),
+            'partially-correct': _('This answer is partially correct.'),
+            'unanswered': _('This answer is unanswered.'),
+            'unsubmitted': _('This answer is unanswered.'),
+            'queued': _('This answer is being processed.'),
+        }
+        self.display_name = names.get(status, unicode(status))
+        self.display_tooltip = tooltips.get(status, u'')
+        self._status = status or ''
+
+    def __str__(self):
+        return self._status
+
+    def __unicode__(self):
+        return self._status.decode('utf8')
+
+    def __repr__(self):
+        return 'Status(%r)' % self._status
+
+    def __eq__(self, other):
+        return self._status == str(other)
 
 
 class Attribute(object):
@@ -168,6 +224,7 @@ class InputTypeBase(object):
         self.hint = feedback.get('hint', '')
         self.hintmode = feedback.get('hintmode', None)
         self.input_state = state.get('input_state', {})
+        self.answervariable = state.get("answervariable", None)
 
         # put hint above msg if it should be displayed
         if self.hintmode == 'always':
@@ -176,7 +233,7 @@ class InputTypeBase(object):
         self.status = state.get('status', 'unanswered')
 
         try:
-            # Pre-parse and propcess all the declared requirements.
+            # Pre-parse and process all the declared requirements.
             self.process_requirements()
 
             # Call subclass "constructor" -- means they don't have to worry about calling
@@ -185,8 +242,8 @@ class InputTypeBase(object):
             self.setup()
         except Exception as err:
             # Something went wrong: add xml to message, but keep the traceback
-            msg = "Error in xml '{x}': {err} ".format(
-                x=etree.tostring(xml), err=str(err))
+            msg = u"Error in xml '{x}': {err} ".format(
+                x=etree.tostring(xml), err=err.message)
             raise Exception, msg, sys.exc_info()[2]
 
     @classmethod
@@ -257,7 +314,7 @@ class InputTypeBase(object):
         context = {
             'id': self.input_id,
             'value': self.value,
-            'status': self.status,
+            'status': Status(self.status, self.capa_system.i18n.ugettext),
             'msg': self.msg,
             'STATIC_URL': self.capa_system.STATIC_URL,
         }
@@ -265,6 +322,8 @@ class InputTypeBase(object):
             (a, v) for (a, v) in self.loaded_attributes.iteritems() if a in self.to_render
         )
         context.update(self._extra_context())
+        if self.answervariable:
+            context.update({'answervariable': self.answervariable})
         return context
 
     def _extra_context(self):
@@ -286,7 +345,26 @@ class InputTypeBase(object):
         context = self._get_render_context()
 
         html = self.capa_system.render_template(self.template, context)
-        return etree.XML(html)
+
+        try:
+            output = etree.XML(html)
+        except etree.XMLSyntaxError as ex:
+            # If `html` contains attrs with no values, like `controls` in <audio controls src='smth'/>,
+            # XML parser will raise exception, so wee fallback to html5parser, which will set empty "" values for such attrs.
+            try:
+                output = html5lib.parseFragment(html, treebuilder='lxml', namespaceHTMLElements=False)[0]
+            except IndexError:
+                raise ex
+
+        return output
+
+    def get_user_visible_answer(self, internal_answer):
+        """
+        Given the internal representation of the answer provided by the user, return the representation of the answer
+        as the user saw it.  Subclasses should override this method if and only if the internal represenation of the
+        answer is different from the answer that is displayed to the user.
+        """
+        return internal_answer
 
 
 #-----------------------------------------------------------------------------
@@ -299,7 +377,7 @@ class OptionInput(InputTypeBase):
 
     Example:
 
-    <optioninput options="('Up','Down')" correct="Up"/><text>The location of the sky</text>
+    <optioninput options="('Up','Down')" label="Where is the sky?" correct="Up"/><text>The location of the sky</text>
 
     # TODO: allow ordering to be randomized
     """
@@ -335,6 +413,7 @@ class OptionInput(InputTypeBase):
         Convert options to a convenient format.
         """
         return [Attribute('options', transform=cls.parse_options),
+                Attribute('label', ''),
                 Attribute('inline', False)]
 
 #-----------------------------------------------------------------------------
@@ -353,7 +432,7 @@ class ChoiceGroup(InputTypeBase):
 
     Example:
 
-    <choicegroup>
+    <choicegroup label="Which foil?">
       <choice correct="false" name="foil1">
         <text>This is foil One.</text>
       </choice>
@@ -369,6 +448,7 @@ class ChoiceGroup(InputTypeBase):
     tags = ['choicegroup', 'radiogroup', 'checkboxgroup']
 
     def setup(self):
+        i18n = self.capa_system.i18n
         # suffix is '' or [] to change the way the input is handled in --as a scalar or vector
         # value.  (VS: would be nice to make this less hackish).
         if self.tag == 'choicegroup':
@@ -381,14 +461,22 @@ class ChoiceGroup(InputTypeBase):
             self.html_input_type = "checkbox"
             self.suffix = '[]'
         else:
-            raise Exception("ChoiceGroup: unexpected tag {0}".format(self.tag))
+            _ = i18n.ugettext
+            # Translators: 'ChoiceGroup' is an input type and should not be translated.
+            msg = _("ChoiceGroup: unexpected tag {tag_name}").format(tag_name=self.tag)
+            raise Exception(msg)
 
-        self.choices = self.extract_choices(self.xml)
+        self.choices = self.extract_choices(self.xml, i18n)
+        self._choices_map = dict(self.choices,)
 
     @classmethod
     def get_attributes(cls):
+        # Make '_' a no-op so we can scrape strings. Using lambda instead of
+        #  `django.utils.translation.ugettext_noop` because Django cannot be imported in this file
+        _ = lambda text: text
         return [Attribute("show_correctness", "always"),
-                Attribute("submitted_message", "Answer received.")]
+                Attribute('label', ''),
+                Attribute("submitted_message", _("Answer received."))]
 
     def _extra_context(self):
         return {'input_type': self.html_input_type,
@@ -396,7 +484,7 @@ class ChoiceGroup(InputTypeBase):
                 'name_array_suffix': self.suffix}
 
     @staticmethod
-    def extract_choices(element):
+    def extract_choices(element, i18n):
         """
         Extracts choices for a few input types, such as ChoiceGroup, RadioGroup and
         CheckboxGroup.
@@ -408,14 +496,27 @@ class ChoiceGroup(InputTypeBase):
         """
 
         choices = []
+        _ = i18n.ugettext
 
         for choice in element:
-            if choice.tag != 'choice':
-                raise Exception(
-                    "[capa.inputtypes.extract_choices] Expected a <choice> tag; got %s instead"
-                    % choice.tag)
-            choices.append((choice.get("name"), stringify_children(choice)))
+            if choice.tag == 'choice':
+                choices.append((choice.get("name"), stringify_children(choice)))
+            else:
+                if choice.tag != 'compoundhint':
+                    msg = u'[capa.inputtypes.extract_choices] {error_message}'.format(
+                        # Translators: '<choice>' and '<compoundhint>' are tag names and should not be translated.
+                        error_message=_('Expected a <choice> or <compoundhint> tag; got {given_tag} instead').format(
+                            given_tag=choice.tag
+                        )
+                    )
+                    raise Exception(msg)
         return choices
+
+    def get_user_visible_answer(self, internal_answer):
+        if isinstance(internal_answer, basestring):
+            return self._choices_map[internal_answer]
+
+        return [self._choices_map[i] for i in internal_answer]
 
 
 #-----------------------------------------------------------------------------
@@ -497,6 +598,7 @@ class JSInput(InputTypeBase):
             Attribute('gradefn', "gradefn"),
             Attribute('get_statefn', None),  # Function to call in iframe
                                              #   to get current state.
+            Attribute('initial_state', None),  # JSON string to be used as initial state
             Attribute('set_statefn', None),  # Function to call iframe to
                                              #   set state
             Attribute('width', "400"),       # iframe width
@@ -535,7 +637,7 @@ class TextLine(InputTypeBase):
     is used e.g. for embedding simulations turned into questions.
 
     Example:
-        <textline math="1" trailing_text="m/s" />
+        <textline math="1" trailing_text="m/s" label="How fast is a cheetah?" />
 
     This example will render out a text line with a math preview and the text 'm/s'
     after the end of the text line.
@@ -551,7 +653,7 @@ class TextLine(InputTypeBase):
         """
         return [
             Attribute('size', None),
-
+            Attribute('label', ''),
 
             Attribute('hidden', False),
             Attribute('inline', False),
@@ -598,7 +700,6 @@ class FileSubmission(InputTypeBase):
     template = "filesubmission.html"
     tags = ['filesubmission']
 
-
     @staticmethod
     def parse_files(files):
         """
@@ -612,6 +713,7 @@ class FileSubmission(InputTypeBase):
         Convert the list of allowed files to a convenient format.
         """
         return [Attribute('allowed_files', '[]', transform=cls.parse_files),
+                Attribute('label', ''),
                 Attribute('required_files', '[]', transform=cls.parse_files), ]
 
     def setup(self):
@@ -620,7 +722,7 @@ class FileSubmission(InputTypeBase):
         pull queue_len from the msg field.  (TODO: get rid of the queue_len hack).
         """
         _ = self.capa_system.i18n.ugettext
-        submitted_msg = _("Your file(s) have been submitted. As soon as your submission is"
+        submitted_msg = _("Your files have been submitted. As soon as your submission is"
                           " graded, this message will be replaced with the grader's feedback.")
         self.submitted_msg = submitted_msg
 
@@ -654,21 +756,21 @@ class CodeInput(InputTypeBase):
         # non-codemirror editor.
     ]
 
-
     @classmethod
     def get_attributes(cls):
         """
         Convert options to a convenient format.
         """
-        return [Attribute('rows', '30'),
-                Attribute('cols', '80'),
-                Attribute('hidden', ''),
+        return [
+            Attribute('rows', '30'),
+            Attribute('cols', '80'),
+            Attribute('hidden', ''),
 
-                # For CodeMirror
-                Attribute('mode', 'python'),
-                Attribute('linenumbers', 'true'),
-                # Template expects tabsize to be an int it can do math with
-                Attribute('tabsize', 4, transform=int),
+            # For CodeMirror
+            Attribute('mode', 'python'),
+            Attribute('linenumbers', 'true'),
+            # Template expects tabsize to be an int it can do math with
+            Attribute('tabsize', 4, transform=int),
         ]
 
     def setup_code_response_rendering(self):
@@ -687,7 +789,7 @@ class CodeInput(InputTypeBase):
         if self.status == 'incomplete':
             self.status = 'queued'
             self.queue_len = self.msg
-            self.msg = self.submitted_msg
+            self.msg = bleach.clean(self.submitted_msg)
 
     def setup(self):
         """ setup this input type """
@@ -711,24 +813,20 @@ class MatlabInput(CodeInput):
     """
     InputType for handling Matlab code input
 
-    TODO: API_KEY will go away once we have a way to specify it per-course
     Example:
      <matlabinput rows="10" cols="80" tabsize="4">
         Initial Text
-        <plot_payload>
-          %api_key=API_KEY
-        </plot_payload>
-    </matlabinput>
+     </matlabinput>
     """
     template = "matlabinput.html"
     tags = ['matlabinput']
-
 
     def setup(self):
         """
         Handle matlab-specific parsing
         """
         _ = self.capa_system.i18n.ugettext
+
         submitted_msg = _("Submitted. As soon as a response is returned, "
                           "this message will be replaced by that feedback.")
         self.submitted_msg = submitted_msg
@@ -736,19 +834,28 @@ class MatlabInput(CodeInput):
         self.setup_code_response_rendering()
 
         xml = self.xml
-        self.plot_payload = xml.findtext('./plot_payload')
 
+        self.plot_payload = xml.findtext('./plot_payload')
         # Check if problem has been queued
         self.queuename = 'matlab'
         self.queue_msg = ''
         # this is only set if we don't have a graded response
         # the graded response takes precedence
         if 'queue_msg' in self.input_state and self.status in ['queued', 'incomplete', 'unsubmitted']:
-            self.queue_msg = self.input_state['queue_msg']
+            self.queue_msg = sanitize_html(self.input_state['queue_msg'])
+
         if 'queuestate' in self.input_state and self.input_state['queuestate'] == 'queued':
             self.status = 'queued'
             self.queue_len = 1
             self.msg = self.submitted_msg
+            # Handle situation if no response from xqueue arrived during specified time.
+            if ('queuetime' not in self.input_state or
+                    time.time() - self.input_state['queuetime'] > XQUEUE_TIMEOUT):
+                self.queue_len = 0
+                self.status = 'unsubmitted'
+                self.msg = _(
+                    'No response from Xqueue within {xqueue_timeout} seconds. Aborted.'
+                ).format(xqueue_timeout=XQUEUE_TIMEOUT)
 
     def handle_ajax(self, dispatch, data):
         """
@@ -793,17 +900,34 @@ class MatlabInput(CodeInput):
         Right now, we only want this button to show up when a problem has not been
         checked.
         """
-        if self.status in ['correct', 'incorrect']:
+        if self.status in ['correct', 'incorrect', 'partially-correct']:
             return False
         else:
             return True
 
     def _extra_context(self):
         """ Set up additional context variables"""
+
+        _ = self.capa_system.i18n.ugettext
+
+        queue_msg = self.queue_msg
+        if len(self.queue_msg) > 0:  # An empty string cannot be parsed as XML but is okay to include in the template.
+            try:
+                etree.XML(u'<div>{0}</div>'.format(self.queue_msg))
+            except etree.XMLSyntaxError:
+                try:
+                    html5lib.parseFragment(self.queue_msg, treebuilder='lxml', namespaceHTMLElements=False)[0]
+                except (IndexError, ValueError):
+                    # If neither can parse queue_msg, it contains invalid xml.
+                    queue_msg = u"<span>{0}</span>".format(_("Error running code."))
+
         extra_context = {
             'queue_len': str(self.queue_len),
-            'queue_msg': self.queue_msg,
+            'queue_msg': queue_msg,
             'button_enabled': self.button_enabled(),
+            'matlab_editor_js': '{static_url}js/vendor/CodeMirror/octave.js'.format(
+                static_url=self.capa_system.STATIC_URL),
+            'msg': sanitize_html(self.msg)  # sanitize msg before rendering into template
         }
         return extra_context
 
@@ -833,9 +957,10 @@ class MatlabInput(CodeInput):
             dict - 'success' - whether or not we successfully queued this submission
                  - 'message' - message to be rendered in case of error
         """
+        _ = self.capa_system.i18n.ugettext
         # only send data if xqueue exists
         if self.capa_system.xqueue is None:
-            return {'success': False, 'message': 'Cannot connect to the queue'}
+            return {'success': False, 'message': _('Cannot connect to the queue')}
 
         # pull relevant info out of get
         response = data['submission']
@@ -862,7 +987,10 @@ class MatlabInput(CodeInput):
         contents = {
             'grader_payload': self.plot_payload,
             'student_info': json.dumps(student_info),
-            'student_response': response
+            'student_response': response,
+            'token': getattr(self.capa_system, 'matlab_api_key', None),
+            'endpoint_version': "2",
+            'requestor_id': anonymous_student_id,
         }
 
         (error, msg) = qinterface.send_to_queue(header=xheader,
@@ -871,6 +999,7 @@ class MatlabInput(CodeInput):
         if error == 0:
             self.input_state['queuekey'] = queuekey
             self.input_state['queuestate'] = 'queued'
+            self.input_state['queuetime'] = time.time()
 
         return {'success': error == 0, 'message': msg}
 
@@ -898,8 +1027,16 @@ class Schematic(InputTypeBase):
             Attribute('analyses', None),
             Attribute('initial_value', None),
             Attribute('submit_analyses', None),
+            Attribute('label', ''),
         ]
 
+    def _extra_context(self):
+        context = {
+            'setup_script': '{static_url}js/capa/schematicinput.js'.format(
+                static_url=self.capa_system.STATIC_URL),
+        }
+
+        return context
 
 #-----------------------------------------------------------------------------
 
@@ -926,6 +1063,7 @@ class ImageInput(InputTypeBase):
         """
         return [Attribute('src'),
                 Attribute('height'),
+                Attribute('label', ''),
                 Attribute('width'), ]
 
     def setup(self):
@@ -936,7 +1074,7 @@ class ImageInput(InputTypeBase):
                      self.value.strip().replace(' ', ''))
         if m:
             # Note: we subtract 15 to compensate for the size of the dot on the screen.
-            # (is a 30x30 image--lms/static/green-pointer.png).
+            # (is a 30x30 image--lms/static/images/green-pointer.png).
             (self.gx, self.gy) = [int(x) - 15 for x in m.groups()]
         else:
             (self.gx, self.gy) = (0, 0)
@@ -1016,7 +1154,8 @@ class ChemicalEquationInput(InputTypeBase):
         """
         Can set size of text field.
         """
-        return [Attribute('size', '20'), ]
+        return [Attribute('size', '20'),
+                Attribute('label', ''), ]
 
     def _extra_context(self):
         """
@@ -1048,23 +1187,24 @@ class ChemicalEquationInput(InputTypeBase):
         }
         """
 
+        _ = self.capa_system.i18n.ugettext
         result = {'preview': '',
                   'error': ''}
         try:
             formula = data['formula']
         except KeyError:
-            result['error'] = "No formula specified."
+            result['error'] = _("No formula specified.")
             return result
 
         try:
             result['preview'] = chemcalc.render_to_html(formula)
         except pyparsing.ParseException as err:
-            result['error'] = u"Couldn't parse formula: {0}".format(err.msg)
+            result['error'] = _("Couldn't parse formula: {error_msg}").format(error_msg=err.msg)
         except Exception:
             # this is unexpected, so log
             log.warning(
                 "Error while previewing chemical formula", exc_info=True)
-            result['error'] = "Error while rendering preview"
+            result['error'] = _("Error while rendering preview")
 
         return result
 
@@ -1078,9 +1218,11 @@ class FormulaEquationInput(InputTypeBase):
 
     Example:
 
-    <formulaequationinput size="50"/>
+    <formulaequationinput size="50" label="Enter the equation for motion" />
 
     options: size -- width of the textbox.
+             trailing_text -- text to show after the input textbox when
+                              rendered, same as textline (useful for units)
     """
 
     template = "formulaequationinput.html"
@@ -1094,6 +1236,8 @@ class FormulaEquationInput(InputTypeBase):
         return [
             Attribute('size', '20'),
             Attribute('inline', False),
+            Attribute('label', ''),
+            Attribute('trailing_text', ''),
         ]
 
     def _extra_context(self):
@@ -1101,16 +1245,10 @@ class FormulaEquationInput(InputTypeBase):
         TODO (vshnayder): Get rid of 'previewer' once we have a standard way of requiring js to be loaded.
         """
         # `reported_status` is basically `status`, except we say 'unanswered'
-        reported_status = ''
-        if self.status == 'unsubmitted':
-            reported_status = 'unanswered'
-        elif self.status in ('correct', 'incorrect', 'incomplete'):
-            reported_status = self.status
 
         return {
             'previewer': '{static_url}js/capa/src/formula_equation_preview.js'.format(
                 static_url=self.capa_system.STATIC_URL),
-            'reported_status': reported_status,
         }
 
     def handle_ajax(self, dispatch, get):
@@ -1134,14 +1272,14 @@ class FormulaEquationInput(InputTypeBase):
            'request_start' : <time sent with request>
         }
         """
-
+        _ = self.capa_system.i18n.ugettext
         result = {'preview': '',
                   'error': ''}
 
         try:
             formula = get['formula']
         except KeyError:
-            result['error'] = "No formula specified."
+            result['error'] = _("No formula specified.")
             return result
 
         result['request_start'] = int(get.get('request_start', 0))
@@ -1152,14 +1290,14 @@ class FormulaEquationInput(InputTypeBase):
             # or something, and this is where we would need to pass those in.
             result['preview'] = latex_preview(formula)
         except pyparsing.ParseException as err:
-            result['error'] = "Sorry, couldn't parse formula"
+            result['error'] = _("Sorry, couldn't parse formula")
             result['formula'] = formula
         except Exception:
             # this is unexpected, so log
             log.warning(
                 "Error while previewing formula", exc_info=True
             )
-            result['error'] = "Error while rendering preview"
+            result['error'] = _("Error while rendering preview")
 
         return result
 
@@ -1288,8 +1426,6 @@ class EditAMoleculeInput(InputTypeBase):
                 Attribute('missing', None)]
 
     def _extra_context(self):
-        """
-        """
         context = {
             'applet_loader': '{static_url}js/capa/editamolecule.js'.format(
                 static_url=self.capa_system.STATIC_URL),
@@ -1324,8 +1460,6 @@ class DesignProtein2dInput(InputTypeBase):
                 ]
 
     def _extra_context(self):
-        """
-        """
         context = {
             'applet_loader': '{static_url}js/capa/design-protein-2d.js'.format(
                 static_url=self.capa_system.STATIC_URL),
@@ -1360,8 +1494,6 @@ class EditAGeneInput(InputTypeBase):
                 ]
 
     def _extra_context(self):
-        """
-            """
         context = {
             'applet_loader': '{static_url}js/capa/edit-a-gene.js'.format(
                 static_url=self.capa_system.STATIC_URL),
@@ -1446,7 +1578,7 @@ class AnnotationInput(InputTypeBase):
     def _unpack(self, json_value):
         """ Unpacks the json input state into a dict. """
         d = json.loads(json_value)
-        if type(d) != dict:
+        if not isinstance(d, dict):
             d = {}
 
         comment_value = d.get('comment', '')
@@ -1494,7 +1626,7 @@ class ChoiceTextGroup(InputTypeBase):
         select the correct choice and fill in numbers to make it accurate.
       <endouttext/>
       <choicetextresponse>
-        <radiotextgroup>
+        <radiotextgroup label="What is the correct choice?">
           <choice correct="false">The lowest number rolled was:
             <decoy_input/> and the highest number rolled was:
             <decoy_input/> .</choice>
@@ -1517,7 +1649,7 @@ class ChoiceTextGroup(InputTypeBase):
         select the correct choices and fill in numbers to make them accurate.
       <endouttext/>
       <choicetextresponse>
-        <checkboxtextgroup>
+        <checkboxtextgroup label="What is the answer?">
              <choice correct="true">
                 The lowest number selected was <numtolerance_input answer="1.4142" tolerance="0.01"/>
              </choice>
@@ -1559,23 +1691,31 @@ class ChoiceTextGroup(InputTypeBase):
         elif self.tag == 'checkboxtextgroup':
             self.html_input_type = "checkbox"
         else:
-            raise Exception("ChoiceGroup: unexpected tag {0}".format(self.tag))
+            _ = self.capa_system.i18n.ugettext
+            msg = _("{input_type}: unexpected tag {tag_name}").format(
+                input_type="ChoiceTextGroup", tag_name=self.tag
+            )
+            raise Exception(msg)
 
         if self.value == '':
             # Make `value` an empty dictionary, if it currently has an empty
             # value. This is necessary because the template expects a
             # dictionary.
             self.value = {}
-        self.choices = self.extract_choices(self.xml)
+        self.choices = self.extract_choices(self.xml, self.capa_system.i18n)
 
     @classmethod
     def get_attributes(cls):
         """
         Returns a list of `Attribute` for this problem type
         """
+        # Make '_' a no-op so we can scrape strings. Using lambda instead of
+        #  `django.utils.translation.ugettext_noop` because Django cannot be imported in this file
+        _ = lambda text: text
         return [
             Attribute("show_correctness", "always"),
-            Attribute("submitted_message", "Answer received.")
+            Attribute("submitted_message", _("Answer received.")),
+            Attribute("label", ""),
         ]
 
     def _extra_context(self):
@@ -1591,7 +1731,7 @@ class ChoiceTextGroup(InputTypeBase):
         }
 
     @staticmethod
-    def extract_choices(element):
+    def extract_choices(element, i18n):
         """
         Extracts choices from the xml for this problem type.
         If we have xml that is as follows(choice names will have been assigned
@@ -1631,14 +1771,19 @@ class ChoiceTextGroup(InputTypeBase):
         ]
         """
 
+        _ = i18n.ugettext
         choices = []
 
         for choice in element:
             if choice.tag != 'choice':
-                raise Exception(
-                    "[capa.inputtypes.extract_choices] Expected a <choice>" +
-                    "tag; got {0} instead".format(choice.tag)
+                msg = u"[capa.inputtypes.extract_choices] {0}".format(
+                    # Translators: a "tag" is an XML element, such as "<b>" in HTML
+                    _("Expected a {expected_tag} tag; got {given_tag} instead").format(
+                        expected_tag=u"<choice>",
+                        given_tag=choice.tag,
+                    )
                 )
+                raise Exception(msg)
 
             components = []
             choice_text = ''

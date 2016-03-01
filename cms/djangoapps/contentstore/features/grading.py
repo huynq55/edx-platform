@@ -1,12 +1,12 @@
-#pylint: disable=C0111
-#pylint: disable=W0621
+# pylint: disable=missing-docstring
+# pylint: disable=redefined-outer-name
 
 from lettuce import world, step
 from common import *
 from terrain.steps import reload_the_page
-from selenium.common.exceptions import (
-    InvalidElementStateException, WebDriverException)
-from nose.tools import assert_in, assert_not_in, assert_equal, assert_not_equal  # pylint: disable=E0611
+from selenium.common.exceptions import InvalidElementStateException
+from contentstore.utils import reverse_course_url
+from nose.tools import assert_in, assert_equal, assert_not_equal
 
 
 @step(u'I am viewing the grading settings')
@@ -30,6 +30,14 @@ def delete_grade(step):
     #world.css_find(range_css)[1].mouseover()
     #world.css_click(grade_css)
     world.browser.execute_script('document.getElementsByClassName("remove-button")[0].click()')
+
+
+@step(u'Grade list has "([^"]*)" grades$')
+def check_grade_values(step, grade_list):  # pylint: disable=unused-argument
+    visible_list = ''.join(
+        [grade.text for grade in world.css_find('.letter-grade')]
+    )
+    assert_equal(visible_list, grade_list, 'Grade lists should be equal')
 
 
 @step(u'I see I now have "([^"]*)" grades$')
@@ -60,19 +68,14 @@ def change_assignment_name(step, old_name, new_name):
     index = get_type_index(old_name)
     f = world.css_find(name_id)[index]
     assert_not_equal(index, -1)
-    for count in range(len(old_name)):
+    for __ in xrange(len(old_name)):
         f._element.send_keys(Keys.END, Keys.BACK_SPACE)
     f._element.send_keys(new_name)
 
 
 @step(u'I go back to the main course page')
 def main_course_page(step):
-    course_name = world.scenario_dict['COURSE'].display_name.replace(' ', '_')
-    main_page_link = '/course/{org}.{number}.{name}/branch/draft/block/{name}'.format(
-        org=world.scenario_dict['COURSE'].org,
-        number=world.scenario_dict['COURSE'].number,
-        name=course_name
-    )
+    main_page_link = reverse_course_url('course_handler', world.scenario_dict['COURSE'].id)
 
     world.visit(main_page_link)
     assert_in('Course Outline', world.css_text('h1.page-header'))
@@ -80,19 +83,21 @@ def main_course_page(step):
 
 @step(u'I do( not)? see the assignment name "([^"]*)"$')
 def see_assignment_name(step, do_not, name):
-    assignment_menu_css = 'ul.menu > li > a'
-    # First assert that it is there, make take a bit to redraw
-    assert_true(
-        world.css_find(assignment_menu_css),
-        msg="Could not find assignment menu"
-    )
-
-    assignment_menu = world.css_find(assignment_menu_css)
-    allnames = [item.html for item in assignment_menu]
-    if do_not:
-        assert_not_in(name, allnames)
-    else:
-        assert_in(name, allnames)
+    # TODO: rewrite this once grading has been added back to the course outline
+    pass
+    # assignment_menu_css = 'ul.menu > li > a'
+    # # First assert that it is there, make take a bit to redraw
+    # assert_true(
+    #     world.css_find(assignment_menu_css),
+    #     msg="Could not find assignment menu"
+    # )
+    #
+    # assignment_menu = world.css_find(assignment_menu_css)
+    # allnames = [item.html for item in assignment_menu]
+    # if do_not:
+    #     assert_not_in(name, allnames)
+    # else:
+    #     assert_in(name, allnames)
 
 
 @step(u'I delete the assignment type "([^"]*)"$')
@@ -124,12 +129,6 @@ def set_weight(step, weight):
 def verify_weight(step, weight):
     weight_id = '#course-grading-assignment-gradeweight'
     assert_equal(world.css_value(weight_id, -1), weight)
-
-
-@step(u'I have populated the course')
-def populate_course(step):
-    step.given('I have added a new section')
-    step.given('I have added a new subsection')
 
 
 @step(u'I do not see the changes persisted on refresh$')
@@ -171,7 +170,7 @@ def cannot_edit_fail(_step):
     # try to change the grade range -- this should throw an exception
     try:
         ranges.last.value = 'Failure'
-    except (InvalidElementStateException):
+    except InvalidElementStateException:
         pass  # We should get this exception on failing to edit the element
 
     # check to be sure that nothing has changed

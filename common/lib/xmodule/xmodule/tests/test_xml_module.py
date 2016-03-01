@@ -1,10 +1,10 @@
 # disable missing docstring
-#pylint: disable=C0111
+# pylint: disable=missing-docstring
 
 import unittest
 
 from mock import Mock
-from nose.tools import assert_equals, assert_not_equals, assert_true, assert_false, assert_in, assert_not_in  # pylint: disable=E0611
+from nose.tools import assert_equals, assert_not_equals, assert_true, assert_false, assert_in, assert_not_in  # pylint: disable=no-name-in-module
 
 from xblock.field_data import DictFieldData
 from xblock.fields import Scope, String, Dict, Boolean, Integer, Float, Any, List
@@ -44,11 +44,7 @@ class TestFields(object):
         values=[{'display_name': 'first', 'value': 'value a'},
                 {'display_name': 'second', 'value': 'value b'}]
     )
-    showanswer = String(
-        help="When to show the problem answer to the student",
-        scope=Scope.settings,
-        default="finished"
-    )
+    showanswer = InheritanceMixin.showanswer
     # Used for testing select type
     float_select = Float(scope=Scope.settings, default=.999, values=[1.23, 0.98])
     # Used for testing float type
@@ -68,6 +64,7 @@ class InheritingFieldDataTest(unittest.TestCase):
         not_inherited = String(scope=Scope.settings, default="nothing")
 
     def setUp(self):
+        super(InheritingFieldDataTest, self).setUp()
         self.system = get_test_descriptor_system()
         self.all_blocks = {}
         self.system.get_block = self.all_blocks.get
@@ -119,13 +116,11 @@ class InheritingFieldDataTest(unittest.TestCase):
         parent = self.get_a_block(usage_id="parent")
         parent.inherited = "Changed!"
         self.assertEqual(parent.inherited, "Changed!")
-        parent_id = "parent"
         for child_num in range(10):
             usage_id = "child_{}".format(child_num)
             child = self.get_a_block(usage_id=usage_id)
             child.parent = "parent"
             self.assertEqual(child.inherited, "Changed!")
-            parent_id = usage_id
 
     def test_not_inherited(self):
         # Fields not in the inherited_names list won't be inherited.
@@ -136,7 +131,6 @@ class InheritingFieldDataTest(unittest.TestCase):
         child = self.get_a_block(usage_id="child")
         child.parent = "parent"
         self.assertEqual(child.not_inherited, "nothing")
-
 
 
 class EditableMetadataFieldsTest(unittest.TestCase):
@@ -337,7 +331,6 @@ class TestDeserializeInteger(TestDeserialize):
         # 2.78 can be converted to int, so the string will be deserialized
         self.assertDeserializeEqual(-2.78, '-2.78')
 
-
     def test_deserialize_unsupported_types(self):
         self.assertDeserializeEqual('[3]', '[3]')
         # '2.78' cannot be converted to int, so input value is returned
@@ -421,7 +414,7 @@ class TestDeserializeAny(TestDeserialize):
     def test_deserialize(self):
         self.assertDeserializeEqual('hAlf', '"hAlf"')
         self.assertDeserializeEqual('false', '"false"')
-        self.assertDeserializeEqual({'bar': 'hat', 'frog' : 'green'}, '{"bar": "hat", "frog": "green"}')
+        self.assertDeserializeEqual({'bar': 'hat', 'frog': 'green'}, '{"bar": "hat", "frog": "green"}')
         self.assertDeserializeEqual([3.5, 5.6], '[3.5, 5.6]')
         self.assertDeserializeEqual('[', '[')
         self.assertDeserializeEqual(False, 'false')
@@ -463,10 +456,14 @@ class TestDeserializeTimedelta(TestDeserialize):
     test_field = Timedelta
 
     def test_deserialize(self):
-        self.assertDeserializeEqual('1 day 12 hours 59 minutes 59 seconds',
-            '1 day 12 hours 59 minutes 59 seconds')
-        self.assertDeserializeEqual('1 day 12 hours 59 minutes 59 seconds',
-            '"1 day 12 hours 59 minutes 59 seconds"')
+        self.assertDeserializeEqual(
+            '1 day 12 hours 59 minutes 59 seconds',
+            '1 day 12 hours 59 minutes 59 seconds'
+        )
+        self.assertDeserializeEqual(
+            '1 day 12 hours 59 minutes 59 seconds',
+            '"1 day 12 hours 59 minutes 59 seconds"'
+        )
         self.assertDeserializeNonString()
 
 
@@ -501,10 +498,10 @@ class TestXmlAttributes(XModuleXmlImportTest):
         assert_equals('value', course.xml_attributes['unknown_attr'])
 
     def test_known_attribute(self):
-        assert_true(hasattr(CourseDescriptor, 'show_chat'))
-        course = self.process_xml(CourseFactory.build(show_chat='true'))
-        assert_true(course.show_chat)
-        assert_not_in('show_chat', course.xml_attributes)
+        assert_true(hasattr(CourseDescriptor, 'show_calculator'))
+        course = self.process_xml(CourseFactory.build(show_calculator='true'))
+        assert_true(course.show_calculator)
+        assert_not_in('show_calculator', course.xml_attributes)
 
     def test_rerandomize_in_policy(self):
         # Rerandomize isn't a basic attribute of Sequence
@@ -540,14 +537,14 @@ class TestXmlAttributes(XModuleXmlImportTest):
         # name)
         assert_in('attempts', seq.xml_attributes)
 
-    def test_inheritable_attribute(self):
-        # days_early_for_beta isn't a basic attribute of Sequence
-        assert_false(hasattr(SequenceDescriptor, 'days_early_for_beta'))
+    def check_inheritable_attribute(self, attribute, value):
+        # `attribute` isn't a basic attribute of Sequence
+        assert_false(hasattr(SequenceDescriptor, attribute))
 
-        # days_early_for_beta is added by InheritanceMixin
-        assert_true(hasattr(InheritanceMixin, 'days_early_for_beta'))
+        # `attribute` is added by InheritanceMixin
+        assert_true(hasattr(InheritanceMixin, attribute))
 
-        root = SequenceFactory.build(policy={'days_early_for_beta': '2'})
+        root = SequenceFactory.build(policy={attribute: str(value)})
         ProblemFactory.build(parent=root)
 
         # InheritanceMixin will be used when processing the XML
@@ -558,10 +555,15 @@ class TestXmlAttributes(XModuleXmlImportTest):
         assert_equals(seq.unmixed_class, SequenceDescriptor)
         assert_not_equals(type(seq), SequenceDescriptor)
 
-        # days_early_for_beta is added to the constructed sequence, because
+        # `attribute` is added to the constructed sequence, because
         # it's in the InheritanceMixin
-        assert_equals(2, seq.days_early_for_beta)
+        assert_equals(value, getattr(seq, attribute))
 
-        # days_early_for_beta is a known attribute, so we shouldn't include it
+        # `attribute` is a known attribute, so we shouldn't include it
         # in xml_attributes
-        assert_not_in('days_early_for_beta', seq.xml_attributes)
+        assert_not_in(attribute, seq.xml_attributes)
+
+    def test_inheritable_attributes(self):
+        self.check_inheritable_attribute('days_early_for_beta', 2)
+        self.check_inheritable_attribute('max_attempts', 5)
+        self.check_inheritable_attribute('visible_to_staff_only', True)

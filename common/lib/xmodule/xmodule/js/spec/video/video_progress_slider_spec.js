@@ -11,6 +11,8 @@
         afterEach(function () {
             $('source').remove();
             window.onTouchBasedDevice = oldOTBD;
+            state.storage.clear();
+            state.videoPlayer.destroy();
         });
 
         describe('constructor', function () {
@@ -25,6 +27,8 @@
                     expect(state.videoProgressSlider.slider).toBe('.slider');
                     expect($.fn.slider).toHaveBeenCalledWith({
                         range: 'min',
+                        min: 0,
+                        max: null,
                         change: state.videoProgressSlider.onChange,
                         slide: state.videoProgressSlider.onSlide,
                         stop: state.videoProgressSlider.onStop
@@ -34,6 +38,18 @@
                 it('build the seek handle', function () {
                     expect(state.videoProgressSlider.handle)
                         .toBe('.slider .ui-slider-handle');
+                });
+
+                it('add ARIA attributes to time control', function () {
+                    var timeControl = $('div.slider > a');
+
+                    expect(timeControl).toHaveAttrs({
+                        'role': 'slider',
+                        'title': 'Video position',
+                        'aria-disabled': 'false'
+                    });
+
+                    expect(timeControl).toHaveAttr('aria-valuetext');
                 });
             });
 
@@ -120,6 +136,11 @@
                     expect($.fn.slider).toHaveBeenCalledWith(
                         'option', 'value', 20
                     );
+                });
+
+                it('required aria values updated', function () {
+                    expect(state.videoProgressSlider.handle.attr('aria-valuenow')).toBe('20');
+                    expect(state.videoProgressSlider.handle.attr('aria-valuemax')).toBe('120');
                 });
             });
         });
@@ -241,7 +262,7 @@
                 state.videoProgressSlider.notifyThroughHandleEnd({end: true});
 
                 expect(state.videoProgressSlider.handle.attr('title'))
-                    .toBe('video ended');
+                    .toBe('Video ended');
 
                 expect('focus').toHaveBeenTriggeredOn(
                     state.videoProgressSlider.handle
@@ -252,7 +273,7 @@
                 state.videoProgressSlider.notifyThroughHandleEnd({end: false});
 
                 expect(state.videoProgressSlider.handle.attr('title'))
-                    .toBe('video position');
+                    .toBe('Video position');
 
                 expect('focus').not.toHaveBeenTriggeredOn(
                     state.videoProgressSlider.handle
@@ -272,6 +293,37 @@
                 });
             });
         });
+
+        it('getTimeDescription', function () {
+            var cases = {
+                    '0': '0 seconds',
+                    '1': '1 second',
+                    '10': '10 seconds',
+
+                    '60': '1 minute 0 seconds',
+                    '121': '2 minutes 1 second',
+
+                    '3670': '1 hour 1 minute 10 seconds',
+                    '21541': '5 hours 59 minutes 1 second',
+                },
+                getTimeDescription;
+
+            state = jasmine.initializePlayer();
+
+            getTimeDescription = state.videoProgressSlider.getTimeDescription;
+
+            $.each(cases, function(input, output) {
+                expect(getTimeDescription(input)).toBe(output);
+            });
+        });
+
+        it('can destroy itself', function () {
+            state = jasmine.initializePlayer();
+            state.videoProgressSlider.destroy();
+            expect(state.videoProgressSlider).toBeUndefined();
+            expect($('.slider')).toBeEmpty();
+        });
+
     });
 
 }).call(this);

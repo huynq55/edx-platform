@@ -1,11 +1,13 @@
 """
 Script for importing courseware from XML format
 """
+from optparse import make_option
 
-from django.core.management.base import BaseCommand, CommandError, make_option
+from django.core.management.base import BaseCommand, CommandError
 from django_comment_common.utils import (seed_permissions_roles,
                                          are_permissions_roles_seeded)
-from xmodule.modulestore.xml_importer import import_from_xml
+from xmodule.modulestore.xml_importer import import_course_from_xml
+from xmodule.modulestore import ModuleStoreEnum
 from xmodule.modulestore.django import modulestore
 from xmodule.contentstore.django import contentstore
 
@@ -28,30 +30,26 @@ class Command(BaseCommand):
             raise CommandError("import requires at least one argument: <data directory> [--nostatic] [<course dir>...]")
 
         data_dir = args[0]
-        do_import_static = not (options.get('nostatic', False))
+        do_import_static = not options.get('nostatic', False)
         if len(args) > 1:
-            course_dirs = args[1:]
+            source_dirs = args[1:]
         else:
-            course_dirs = None
-        self.stdout.write("Importing.  Data_dir={data}, course_dirs={courses}\n".format(
+            source_dirs = None
+        self.stdout.write("Importing.  Data_dir={data}, source_dirs={courses}\n".format(
             data=data_dir,
-            courses=course_dirs,
-            dis=do_import_static))
-        try:
-            mstore = modulestore('direct')
-        except KeyError:
-            self.stdout.write('Unable to load direct modulestore, trying '
-                              'default\n')
-            mstore = modulestore('default')
+            courses=source_dirs,
+        ))
+        mstore = modulestore()
 
-        _, course_items = import_from_xml(
-            mstore, data_dir, course_dirs, load_error_modules=False,
+        course_items = import_course_from_xml(
+            mstore, ModuleStoreEnum.UserID.mgmt_command, data_dir, source_dirs, load_error_modules=False,
             static_content_store=contentstore(), verbose=True,
-            do_import_static=do_import_static
+            do_import_static=do_import_static,
+            create_if_not_present=True,
         )
 
-        for module in course_items:
-            course_id = module.location.course_id
+        for course in course_items:
+            course_id = course.id
             if not are_permissions_roles_seeded(course_id):
-                self.stdout.write('Seeding forum roles for course {0}'.format(course_id))
+                self.stdout.write('Seeding forum roles for course {0}\n'.format(course_id))
                 seed_permissions_roles(course_id)

@@ -1,5 +1,5 @@
-define(["js/views/baseview", "underscore", "codemirror", "js/views/feedback_notification", "js/views/course_info_helper", "js/utils/modal"],
-    function(BaseView, _, CodeMirror, NotificationView, CourseInfoHelper, ModalUtils) {
+define(["js/views/baseview", "codemirror", "common/js/components/views/feedback_notification", "js/views/course_info_helper", "js/utils/modal"],
+    function(BaseView, CodeMirror, NotificationView, CourseInfoHelper, ModalUtils) {
 
     // the handouts view is dumb right now; it needs tied to a model and all that jazz
     var CourseInfoHandoutsView = BaseView.extend({
@@ -11,7 +11,7 @@ define(["js/views/baseview", "underscore", "codemirror", "js/views/feedback_noti
         },
 
         initialize: function() {
-            this.template = _.template($("#course_info_handouts-tpl").text());
+            this.template = this.loadTemplate('course_info_handouts');
             var self = this;
             this.model.fetch({
                 complete: function() {
@@ -52,11 +52,11 @@ define(["js/views/baseview", "underscore", "codemirror", "js/views/feedback_noti
 
         onSave: function(event) {
             $('#handout_error').removeClass('is-shown');
-            $('.save-button').removeClass('is-disabled');
+            $('.save-button').removeClass('is-disabled').attr('aria-disabled', false);
             if ($('.CodeMirror-lines').find('.cm-error').length == 0){
                 this.model.set('data', this.$codeMirror.getValue());
                 var saving = new NotificationView.Mini({
-                    title: gettext('Saving&hellip;')
+                    title: gettext('Saving')
                 });
                 saving.show();
                 this.model.save({}, {
@@ -73,21 +73,21 @@ define(["js/views/baseview", "underscore", "codemirror", "js/views/feedback_noti
                 });
             }else{
                 $('#handout_error').addClass('is-shown');
-                $('.save-button').addClass('is-disabled');
+                $('.save-button').addClass('is-disabled').attr('aria-disabled', true);
                 event.preventDefault();
             }
         },
 
         onCancel: function(event) {
             $('#handout_error').removeClass('is-shown');
-            $('.save-button').removeClass('is-disabled');
+            $('.save-button').removeClass('is-disabled').attr('aria-disabled', false);
             this.$form.hide();
             this.closeEditor();
         },
 
         closeEditor: function() {
             $('#handout_error').removeClass('is-shown');
-            $('.save-button').removeClass('is-disabled');
+            $('.save-button').removeClass('is-disabled').attr('aria-disabled', false);
             this.$form.hide();
             ModalUtils.hideModalCover();
             this.$form.find('.CodeMirror').remove();

@@ -1,7 +1,6 @@
 """
 Urls for sysadmin dashboard feature
 """
-# pylint: disable=E1120
 
 from django.conf.urls import patterns, url
 

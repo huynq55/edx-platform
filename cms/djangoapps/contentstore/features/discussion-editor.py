@@ -1,12 +1,12 @@
 # disable missing docstring
-#pylint: disable=C0111
+# pylint: disable=missing-docstring
 
 from lettuce import world, step
 
 
 @step('I have created a Discussion Tag$')
 def i_created_discussion_tag(step):
-    world.create_course_with_unit()
+    step.given('I am in Studio editing a new unit')
     world.create_component_instance(
         step=step,
         category='discussion',
@@ -21,3 +21,8 @@ def i_see_only_the_settings_and_values(step):
             ['Display Name', "Discussion", False],
             ['Subcategory', "Topic-Level Student-Visible Label", False]
         ])
+
+
+@step('I edit the component$')
+def i_edit_and_select_settings(_step):
+    world.edit_component()

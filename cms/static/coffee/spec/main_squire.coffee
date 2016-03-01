@@ -7,29 +7,34 @@ requirejs.config({
         "jquery.ui": "xmodule_js/common_static/js/vendor/jquery-ui.min",
         "jquery.form": "xmodule_js/common_static/js/vendor/jquery.form",
         "jquery.markitup": "xmodule_js/common_static/js/vendor/markitup/jquery.markitup",
-        "jquery.leanModal": "xmodule_js/common_static/js/vendor/jquery.leanModal.min",
+        "jquery.leanModal": "xmodule_js/common_static/js/vendor/jquery.leanModal",
         "jquery.smoothScroll": "xmodule_js/common_static/js/vendor/jquery.smooth-scroll.min",
         "jquery.scrollTo": "xmodule_js/common_static/js/vendor/jquery.scrollTo-1.4.2-min",
         "jquery.timepicker": "xmodule_js/common_static/js/vendor/timepicker/jquery.timepicker",
         "jquery.cookie": "xmodule_js/common_static/js/vendor/jquery.cookie",
         "jquery.qtip": "xmodule_js/common_static/js/vendor/jquery.qtip.min",
         "jquery.fileupload": "xmodule_js/common_static/js/vendor/jQuery-File-Upload/js/jquery.fileupload",
+        "jquery.fileupload-process": "xmodule_js/common_static/js/vendor/jQuery-File-Upload/js/jquery.fileupload-process",
+        "jquery.fileupload-validate": "xmodule_js/common_static/js/vendor/jQuery-File-Upload/js/jquery.fileupload-validate",
         "jquery.iframe-transport": "xmodule_js/common_static/js/vendor/jQuery-File-Upload/js/jquery.iframe-transport",
         "jquery.inputnumber": "xmodule_js/common_static/js/vendor/html5-input-polyfills/number-polyfill",
         "jquery.immediateDescendents": "xmodule_js/common_static/coffee/src/jquery.immediateDescendents",
         "datepair": "xmodule_js/common_static/js/vendor/timepicker/datepair",
         "date": "xmodule_js/common_static/js/vendor/date",
+        "text": "xmodule_js/common_static/js/vendor/requirejs/text",
         "underscore": "xmodule_js/common_static/js/vendor/underscore-min",
         "underscore.string": "xmodule_js/common_static/js/vendor/underscore.string.min",
         "backbone": "xmodule_js/common_static/js/vendor/backbone-min",
         "backbone.associations": "xmodule_js/common_static/js/vendor/backbone-associations-min",
         "backbone.paginator": "xmodule_js/common_static/js/vendor/backbone.paginator.min",
-        "tinymce": "xmodule_js/common_static/js/vendor/tiny_mce/tiny_mce",
-        "jquery.tinymce": "xmodule_js/common_static/js/vendor/tiny_mce/jquery.tinymce",
+        "tinymce": "xmodule_js/common_static/js/vendor/tinymce/js/tinymce/tinymce.full.min",
+        "jquery.tinymce": "xmodule_js/common_static/js/vendor/tinymce/js/tinymce/jquery.tinymce",
         "xmodule": "xmodule_js/src/xmodule",
+        "xblock/cms.runtime.v1": "coffee/src/xblock/cms.runtime.v1",
+        "xblock/core": "xmodule_js/common_static/js/xblock/core",
         "xblock": "xmodule_js/common_static/coffee/src/xblock",
         "utility": "xmodule_js/common_static/js/src/utility",
-        "sinon": "xmodule_js/common_static/js/vendor/sinon-1.7.1",
+        "sinon": "xmodule_js/common_static/js/vendor/sinon-1.17.0",
         "squire": "xmodule_js/common_static/js/vendor/Squire",
         "jasmine-stealth": "xmodule_js/common_static/js/vendor/jasmine-stealth",
         "jasmine.async": "xmodule_js/common_static/js/vendor/jasmine.async",
@@ -37,9 +42,8 @@ requirejs.config({
         "domReady": "xmodule_js/common_static/js/vendor/domReady",
         "URI": "xmodule_js/common_static/js/vendor/URI.min",
 
-        "mathjax": "//edx-static.s3.amazonaws.com/mathjax-MathJax-727332c/MathJax.js?config=TeX-MML-AM_HTMLorMML-full&delayStartupUntil=configured",
+        "mathjax": "//cdn.mathjax.org/mathjax/2.6-latest/MathJax.js?config=TeX-MML-AM_SVG&delayStartupUntil=configured",
         "youtube": "//www.youtube.com/player_api?noext",
-        "tender": "//edxedge.tenderapp.com/tender_widget.js"
 
         "coffee/src/ajax_prefix": "xmodule_js/common_static/coffee/src/ajax_prefix"
     }
@@ -83,8 +87,14 @@ requirejs.config({
             exports: "jQuery.fn.qtip"
         },
         "jquery.fileupload": {
-            deps: ["jquery.iframe-transport"],
+            deps: ["jquery.ui", "jquery.iframe-transport"],
             exports: "jQuery.fn.fileupload"
+        },
+        "jquery.fileupload-process": {
+            deps: ["jquery.fileupload"]
+        },
+        "jquery.fileupload-validate": {
+            deps: ["jquery.fileupload"]
         },
         "jquery.inputnumber": {
             deps: ["jquery"],
@@ -173,5 +183,8 @@ requirejs.config({
 jasmine.getFixtures().fixturesPath += 'coffee/fixtures'
 
 define([
-    "coffee/spec/views/assets_spec"
+    "coffee/spec/views/assets_spec",
+    "js/spec/video/translations_editor_spec",
+    "js/spec/video/file_uploader_editor_spec",
+    "js/spec/models/group_configuration_spec"
     ])

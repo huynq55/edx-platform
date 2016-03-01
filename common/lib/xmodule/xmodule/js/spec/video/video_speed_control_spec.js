@@ -1,4 +1,5 @@
 (function (undefined) {
+    'use strict';
     describe('VideoSpeedControl', function () {
         var state, oldOTBD;
 
@@ -11,6 +12,8 @@
         afterEach(function () {
             $('source').remove();
             window.onTouchBasedDevice = oldOTBD;
+            state.storage.clear();
+            state.videoPlayer.destroy();
         });
 
         describe('constructor', function () {
@@ -20,44 +23,26 @@
                 });
 
                 it('add the video speed control to player', function () {
-                    var li, secondaryControls;
-
-                    secondaryControls = $('.secondary-controls');
-                    li = secondaryControls.find('.video_speeds li');
+                    var secondaryControls = $('.secondary-controls'),
+                        li = secondaryControls.find('.video-speeds li');
 
                     expect(secondaryControls).toContain('.speeds');
-                    expect(secondaryControls).toContain('.video_speeds');
-                    expect(secondaryControls.find('p.active').text())
+                    expect(secondaryControls).toContain('.video-speeds');
+                    expect(secondaryControls.find('.value').text())
                         .toBe('1.50x');
-                    expect(li.filter('.active')).toHaveData(
+                    expect(li.filter('.is-active')).toHaveData(
                         'speed', state.videoSpeedControl.currentSpeed
                     );
-                    expect(li.length).toBe(state.videoSpeedControl.speeds.length);
+                    expect(li.length).toBe(state.speeds.length);
 
                     $.each(li.toArray().reverse(), function (index, link) {
                         expect($(link)).toHaveData(
-                            'speed', state.videoSpeedControl.speeds[index]
+                            'speed', state.speeds[index]
                         );
-                        expect($(link).find('a').text()).toBe(
-                            state.videoSpeedControl.speeds[index] + 'x'
+                        expect($(link).find('.speed-option').text()).toBe(
+                            state.speeds[index] + 'x'
                         );
                     });
-                });
-
-                it('add ARIA attributes to speed control', function () {
-                    var speedControl = $('div.speeds>a');
-
-                    expect(speedControl).toHaveAttrs({
-                        'role': 'button',
-                        'title': 'Speeds',
-                        'aria-disabled': 'false'
-                    });
-                });
-
-                it('bind to change video speed link', function () {
-                    expect($('.video_speeds a')).toHandleWith(
-                        'click', state.videoSpeedControl.changeVideoSpeed
-                    );
                 });
             });
 
@@ -67,77 +52,129 @@
                         window.onTouchBasedDevice.andReturn([device]);
                         state = jasmine.initializePlayer();
 
-                        expect(state.el.find('div.speeds')).not.toExist();
+                        expect(state.el.find('.speeds')).not.toExist();
                     });
                 });
             });
 
             describe('when running on non-touch based device', function () {
+                var speedControl, speedEntries, speedButton, speedsContainer,
+                    KEY = $.ui.keyCode,
+
+                    keyPressEvent = function(key) {
+                        return $.Event('keydown', {keyCode: key});
+                    };
+
                 beforeEach(function () {
                     state = jasmine.initializePlayer();
+                    speedControl = $('.speeds');
+                    speedButton = $('.speed-button');
+                    speedsContainer = $('.video-speeds');
+                    speedEntries = speedsContainer.find('.speed-option');
                 });
 
-                it('open the speed toggle on hover', function () {
-                    $('.speeds').mouseenter();
-                    expect($('.speeds')).toHaveClass('open');
-
-                    $('.speeds').mouseleave();
-                    expect($('.speeds')).not.toHaveClass('open');
+                it('open/close the speed menu on mouseenter/mouseleave',
+                   function () {
+                    speedControl.mouseenter();
+                    expect(speedControl).toHaveClass('is-opened');
+                    speedControl.mouseleave();
+                    expect(speedControl).not.toHaveClass('is-opened');
                 });
 
-                it('close the speed toggle on mouse out', function () {
-                    $('.speeds').mouseenter().mouseleave();
-
-                    expect($('.speeds')).not.toHaveClass('open');
+                it('do not close the speed menu on mouseleave if a speed ' +
+                    'entry has focus', function () {
+                    // Open speed meenu. Focus is on last speed entry.
+                    speedControl.trigger(keyPressEvent(KEY.ENTER));
+                    speedControl.mouseenter().mouseleave();
+                    expect(speedControl).toHaveClass('is-opened');
                 });
 
-                it('close the speed toggle on click', function () {
-                    $('.speeds').mouseenter().click();
-
-                    expect($('.speeds')).not.toHaveClass('open');
+                it('close the speed menu on outside click', function () {
+                    speedControl.trigger(keyPressEvent(KEY.ENTER));
+                    $(window).click();
+                    expect(speedControl).not.toHaveClass('is-opened');
                 });
 
-                // Tabbing depends on the following order:
-                // 1. Play anchor
-                // 2. Speed anchor
-                // 3. A number of speed entry anchors
-                // 4. Volume anchor
-                // If another focusable element is inserted or if the order is
-                // changed, things will malfunction as a flag,
-                // state.previousFocus, is set in the 1,3,4 elements and is
-                // used to determine the behavior of foucus() and blur() for
-                // the speed anchor.
-                it(
-                    'checks for a certain order in focusable elements in ' +
-                    'video controls',
-                    function ()
-                {
-                    var foundFirst = false,
-                        playIndex, speedIndex, firstSpeedEntry, lastSpeedEntry,
-                        volumeIndex;
+                it('open the speed menu on ENTER keydown', function () {
+                    speedControl.trigger(keyPressEvent(KEY.ENTER));
+                    expect(speedControl).toHaveClass('is-opened');
+                    expect(speedEntries.last()).toBeFocused();
+                });
 
-                    $('.video-controls').find('a, :focusable').each(
-                        function (index)
-                    {
-                        if ($(this).hasClass('video_control')) {
-                            playIndex = index;
-                        } else if ($(this).parent().hasClass('speeds')) {
-                            speedIndex = index;
-                        } else if ($(this).hasClass('speed_link')) {
-                            if (!foundFirst) {
-                                firstSpeedEntry = index;
-                                foundFirst = true;
-                            }
+                it('open the speed menu on SPACE keydown', function () {
+                    speedControl.trigger(keyPressEvent(KEY.SPACE));
+                    expect(speedControl).toHaveClass('is-opened');
+                    expect(speedEntries.last()).toBeFocused();
+                });
 
-                            lastSpeedEntry = index;
-                        } else if ($(this).parent().hasClass('volume')) {
-                            volumeIndex = index;
-                        }
-                    });
+                it('open the speed menu on UP keydown', function () {
+                    speedControl.trigger(keyPressEvent(KEY.UP));
+                    expect(speedControl).toHaveClass('is-opened');
+                    expect(speedEntries.last()).toBeFocused();
+                });
 
-                    expect(playIndex+1).toEqual(speedIndex);
-                    expect(speedIndex+1).toEqual(firstSpeedEntry);
-                    expect(lastSpeedEntry+1).toEqual(volumeIndex);
+                it('close the speed menu on ESCAPE keydown', function () {
+                    speedControl.trigger(keyPressEvent(KEY.ESCAPE));
+                    expect(speedControl).not.toHaveClass('is-opened');
+                });
+
+                it('UP and DOWN keydown function as expected on speed entries',
+                   function () {
+                    var speed_0_75 = speedEntries.filter(':contains("0.75x")'),
+                        speed_1_0 = speedEntries.filter(':contains("1.0x")');
+
+                    // First open menu
+                    speedControl.trigger(keyPressEvent(KEY.UP));
+                    expect(speed_0_75).toBeFocused();
+
+                    speed_0_75.trigger(keyPressEvent(KEY.UP));
+                    expect(speed_1_0).toBeFocused();
+
+                    speed_1_0.trigger(keyPressEvent(KEY.DOWN));
+                    expect(speed_0_75).toBeFocused();
+                });
+
+                it('ESC keydown on speed entry closes menu', function () {
+                    // First open menu. Focus is on last speed entry.
+                    speedControl.trigger(keyPressEvent(KEY.UP));
+                    speedEntries.last().trigger(keyPressEvent(KEY.ESCAPE));
+
+                    // Menu is closed and focus has been returned to speed
+                    // control.
+                    expect(speedControl).not.toHaveClass('is-opened');
+                    expect(speedButton).toBeFocused();
+                });
+
+                it('ENTER keydown on speed entry selects speed and closes menu',
+                   function () {
+                    // First open menu.
+                    speedControl.trigger(keyPressEvent(KEY.UP));
+                    // Focus on 1.50x speed
+                    speedEntries.eq(0).focus();
+                    speedEntries.eq(0).trigger(keyPressEvent(KEY.ENTER));
+
+                    // Menu is closed, focus has been returned to speed
+                    // control and video speed is 1.50x.
+                    expect(speedButton).toBeFocused();
+                    expect($('.video-speeds li[data-speed="1.50"]'))
+                        .toHaveClass('is-active');
+                    expect($('.speeds .value')).toHaveHtml('1.50x');
+                });
+
+                it('SPACE keydown on speed entry selects speed and closes menu',
+                   function () {
+                    // First open menu.
+                    speedControl.trigger(keyPressEvent(KEY.UP));
+                    // Focus on 1.50x speed
+                    speedEntries.eq(0).focus();
+                    speedEntries.eq(0).trigger(keyPressEvent(KEY.SPACE));
+
+                    // Menu is closed, focus has been returned to speed
+                    // control and video speed is 1.50x.
+                    expect(speedButton).toBeFocused();
+                    expect($('.video-speeds li[data-speed="1.50"]'))
+                        .toHaveClass('is-active');
+                    expect($('.speeds .value')).toHaveHtml('1.50x');
                 });
             });
         });
@@ -153,38 +190,14 @@
                 beforeEach(function () {
                     state = jasmine.initializePlayer();
                     state.videoSpeedControl.setSpeed(1.0);
-                    spyOn(state.videoPlayer, 'onSpeedChange').andCallThrough();
-
-                    $('li[data-speed="0.75"] a').click();
                 });
 
                 it('trigger speedChange event', function () {
-                    expect(state.videoPlayer.onSpeedChange).toHaveBeenCalled();
-                    expect(state.videoSpeedControl.currentSpeed).toEqual(0.75);
-                });
-            });
+                    spyOnEvent(state.el, 'speedchange');
 
-            describe(
-                'make sure the speed control gets the focus afterwards',
-                function ()
-            {
-                var anchor;
-
-                beforeEach(function () {
-                    state = jasmine.initializePlayer();
-                    anchor= $('.speeds > a').first();
-                    state.videoSpeedControl.setSpeed(1.0);
-                    spyOnEvent(anchor, 'focus');
-                });
-
-                it('when the speed is the same', function () {
-                    $('li[data-speed="1.0"] a').click();
-                    expect('focus').toHaveBeenTriggeredOn(anchor);
-                });
-
-                it('when the speed is not the same', function () {
-                    $('li[data-speed="0.75"] a').click();
-                    expect('focus').toHaveBeenTriggeredOn(anchor);
+                    $('li[data-speed="0.75"] .speed-option').click();
+                    expect('speedchange').toHaveBeenTriggeredOn(state.el);
+                    expect(state.videoSpeedControl.currentSpeed).toEqual('0.75');
                 });
             });
         });
@@ -192,17 +205,25 @@
         describe('onSpeedChange', function () {
             beforeEach(function () {
                 state = jasmine.initializePlayer();
-                $('li[data-speed="1.0"] a').addClass('active');
+                $('li[data-speed="1.0"]').addClass('is-active');
                 state.videoSpeedControl.setSpeed(0.75);
             });
 
             it('set the new speed as active', function () {
-                expect($('.video_speeds li[data-speed="1.0"]'))
-                    .not.toHaveClass('active');
-                expect($('.video_speeds li[data-speed="0.75"]'))
-                    .toHaveClass('active');
-                expect($('.speeds p.active')).toHaveHtml('0.75x');
+                expect($('.video-speeds li[data-speed="1.0"]'))
+                    .not.toHaveClass('is-active');
+                expect($('.video-speeds li[data-speed="0.75"]'))
+                    .toHaveClass('is-active');
+                expect($('.speeds .value')).toHaveHtml('0.75x');
             });
+        });
+
+        it('can destroy itself', function () {
+            state = jasmine.initializePlayer();
+            state.videoSpeedControl.destroy();
+            expect(state.videoSpeedControl).toBeUndefined();
+            expect($('.video-speeds')).not.toExist();
+            expect($('.speed-button')).not.toExist();
         });
     });
 }).call(this);

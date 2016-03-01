@@ -3,10 +3,13 @@
 
 import json
 from operator import itemgetter
+from nose.plugins.attrib import attr
 
 from . import BaseTestXmodule
+from xmodule.x_module import STUDENT_VIEW
 
 
+@attr('shard_1')
 class TestWordCloud(BaseTestXmodule):
     """Integration test for word cloud xmodule."""
     CATEGORY = "word_cloud"
@@ -225,12 +228,8 @@ class TestWordCloud(BaseTestXmodule):
             for user in self.users
         }
 
-        self.assertEqual(
-            set([
-                response.status_code
-                for _, response in responses.items()
-                ]).pop(),
-            200)
+        status_codes = {response.status_code for response in responses.values()}
+        self.assertEqual(status_codes.pop(), 200)
 
         for user in self.users:
             self.assertDictEqual(
@@ -238,16 +237,17 @@ class TestWordCloud(BaseTestXmodule):
                 {
                     'status': 'fail',
                     'error': 'Unknown Command!'
-                })
+                }
+            )
 
     def test_word_cloud_constructor(self):
         """Make sure that all parameters extracted correclty from xml"""
-        fragment = self.runtime.render(self.item_module, 'student_view')
+        fragment = self.runtime.render(self.item_descriptor, STUDENT_VIEW)
 
         expected_context = {
-            'ajax_url': self.item_module.xmodule_runtime.ajax_url,
-            'element_class': self.item_module.location.category,
-            'element_id': self.item_module.location.html_id(),
+            'ajax_url': self.item_descriptor.xmodule_runtime.ajax_url,
+            'element_class': self.item_descriptor.location.category,
+            'element_id': self.item_descriptor.location.html_id(),
             'num_inputs': 5,  # default value
             'submitted': False  # default value
         }

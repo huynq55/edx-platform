@@ -7,40 +7,69 @@
 #       http://www.apache.org/licenses/LICENSE-2.0
 #
 #   Unless required by applicable law or agreed to in writing, software
-#   distribuetd under the License is distributed on an "AS IS" BASIS,
+#   distributed under the License is distributed on an "AS IS" BASIS,
 #   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 
-import ConfigParser
+import threading
 from django.conf import settings
 from django.template import RequestContext
+from django.template.context import _builtin_context_processors
+from django.utils.module_loading import import_string
 from util.request import safe_get_host
-requestcontext = None
+
+from request_cache.middleware import RequestCache
+
+REQUEST_CONTEXT = threading.local()
 
 
 class MakoMiddleware(object):
 
     def process_request(self, request):
-        global requestcontext
-        requestcontext = RequestContext(request)
-        requestcontext['is_secure'] = request.is_secure()
-        requestcontext['site'] = safe_get_host(request)
-        requestcontext['doc_url'] = self.get_doc_url_func(request)
+        """ Process the middleware request. """
+        REQUEST_CONTEXT.request = request
 
-    def get_doc_url_func(self, request):
-        config_file = open(settings.REPO_ROOT / "docs" / "config.ini")
-        config = ConfigParser.ConfigParser()
-        config.readfp(config_file)
+    def process_response(self, __, response):
+        """ Process the middleware response. """
+        REQUEST_CONTEXT.request = None
+        return response
 
-        # in the future, we will detect the locale; for now, we will
-        # hardcode en_us, since we only have English documentation
-        locale = "en_us"
 
-        def doc_url(token):
-            try:
-                return config.get(locale, token)
-            except ConfigParser.NoOptionError:
-                return config.get(locale, "default")
+def get_template_context_processors():
+    """
+    Returns the context processors defined in settings.TEMPLATES.
+    """
+    context_processors = _builtin_context_processors
+    context_processors += tuple(settings.DEFAULT_TEMPLATE_ENGINE['OPTIONS']['context_processors'])
+    return tuple(import_string(path) for path in context_processors)
 
-        return doc_url
+
+def get_template_request_context():
+    """
+    Returns the template processing context to use for the current request,
+    or returns None if there is not a current request.
+    """
+    request = getattr(REQUEST_CONTEXT, "request", None)
+    if not request:
+        return None
+
+    request_cache_dict = RequestCache.get_request_cache().data
+    cache_key = "edxmako_request_context"
+    if cache_key in request_cache_dict:
+        return request_cache_dict[cache_key]
+
+    context = RequestContext(request)
+    context['is_secure'] = request.is_secure()
+    context['site'] = safe_get_host(request)
+
+    # This used to happen when a RequestContext object was initialized but was
+    # moved to a different part of the logic when template engines were introduced.
+    # Since we are not using template engines we do this here.
+    # https://github.com/django/django/commit/37505b6397058bcc3460f23d48a7de9641cd6ef0
+    for processor in get_template_context_processors():
+        context.update(processor(request))
+
+    request_cache_dict[cache_key] = context
+
+    return context

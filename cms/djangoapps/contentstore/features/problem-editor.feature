@@ -30,6 +30,12 @@ Feature: CMS.Problem Editor
     Then I can revert the display name to unset
     And my display name is unset on save
 
+  Scenario: User can specify html in display name and it will be escaped
+    Given I have created a Blank Common Problem
+    When I edit and select Settings
+    Then I can specify html in the display name and save
+    And the problem display name is "<script>alert('test')</script>"
+
   # IE will not click the revert button properly
   @skip_internetexplorer
   Scenario: User can select values in a Select
@@ -81,20 +87,20 @@ Feature: CMS.Problem Editor
     When I edit and select Settings
     Then Edit High Level Source is visible
 
-  # This is a very specific scenario that was failing with some of the
-  # DB rearchitecture changes. It had to do with children IDs being stored
-  # with @draft at the end. To reproduce, must update children while in draft mode.
-  Scenario: Problems can be deleted after being public
+  Scenario: Cheat sheet visible on toggle
     Given I have created a Blank Common Problem
-    And I have created another Blank Common Problem
-    When I publish the unit
-    And I click on "edit a draft"
-    And I delete "1" component
-    And I click on "replace with draft"
-    And I click on "edit a draft"
-    And I delete "1" component
-    Then I see no components
+    And I can edit the problem
+    Then I can see cheatsheet
 
+  Scenario: Reply on Annotation and Return to Annotation link works for Annotation problem
+    Given I have created a unit with advanced module "annotatable"
+    And I have created an advanced component "Annotation" of type "annotatable"
+    And I have created an advanced problem of type "Blank Advanced Problem"
+    And I edit first blank advanced problem for annotation response
+    When I mouseover on "annotatable-span"
+    Then I can see Reply to Annotation link
+    And I see that page has scrolled "down" when I click on "annotatable-reply" link
+    And I see that page has scrolled "up" when I click on "annotation-return" link
 
   # Disabled 11/13/2013 after failing in master
   # The screenshot showed that the LaTeX editor had the text "hi",

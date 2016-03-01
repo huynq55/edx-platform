@@ -1,15 +1,26 @@
+import re
+import uuid
+
+from xmodule.assetstore.assetmgr import AssetManager
+
 XASSET_LOCATION_TAG = 'c4x'
 XASSET_SRCREF_PREFIX = 'xasset:'
 
 XASSET_THUMBNAIL_TAIL_NAME = '.jpg'
 
+STREAM_DATA_CHUNK_SIZE = 1024
+
 import os
 import logging
 import StringIO
-from urlparse import urlparse, urlunparse
+from urlparse import urlparse, urlunparse, parse_qsl
+from urllib import urlencode
 
-from xmodule.modulestore import Location
-from .django import contentstore
+from opaque_keys.edx.locator import AssetLocator
+from opaque_keys.edx.keys import CourseKey, AssetKey
+from opaque_keys import InvalidKeyError
+from xmodule.modulestore.exceptions import ItemNotFoundError
+from xmodule.exceptions import NotFoundError
 from PIL import Image
 
 
@@ -22,7 +33,7 @@ class StaticContent(object):
         self._data = data
         self.length = length
         self.last_modified_at = last_modified_at
-        self.thumbnail_location = Location(thumbnail_location) if thumbnail_location is not None else None
+        self.thumbnail_location = thumbnail_location
         # optional information about where this file was imported from. This is needed to support import/export
         # cycles
         self.import_path = import_path
@@ -33,48 +44,62 @@ class StaticContent(object):
         return self.location.category == 'thumbnail'
 
     @staticmethod
-    def generate_thumbnail_name(original_name):
-        return ('{0}' + XASSET_THUMBNAIL_TAIL_NAME).format(os.path.splitext(original_name)[0])
+    def generate_thumbnail_name(original_name, dimensions=None):
+        """
+        - original_name: Name of the asset (typically its location.name)
+        - dimensions: `None` or a tuple of (width, height) in pixels
+        """
+        name_root, ext = os.path.splitext(original_name)
+        if not ext == XASSET_THUMBNAIL_TAIL_NAME:
+            name_root = name_root + ext.replace(u'.', u'-')
+
+        if dimensions:
+            width, height = dimensions  # pylint: disable=unpacking-non-sequence
+            name_root += "-{}x{}".format(width, height)
+
+        return u"{name_root}{extension}".format(
+            name_root=name_root,
+            extension=XASSET_THUMBNAIL_TAIL_NAME,
+        )
 
     @staticmethod
-    def compute_location(org, course, name, revision=None, is_thumbnail=False):
-        name = name.replace('/', '_')
-        return Location([XASSET_LOCATION_TAG, org, course, 'asset' if not is_thumbnail else 'thumbnail',
-                         Location.clean_keeping_underscores(name), revision])
+    def compute_location(course_key, path, revision=None, is_thumbnail=False):
+        """
+        Constructs a location object for static content.
+
+        - course_key: the course that this asset belongs to
+        - path: is the name of the static asset
+        - revision: is the object's revision information
+        - is_thumbnail: is whether or not we want the thumbnail version of this
+            asset
+        """
+        path = path.replace('/', '_')
+        return course_key.make_asset_key(
+            'asset' if not is_thumbnail else 'thumbnail',
+            AssetLocator.clean_keeping_underscores(path)
+        ).for_branch(None)
 
     def get_id(self):
-        return StaticContent.get_id_from_location(self.location)
-
-    def get_url_path(self):
-        return StaticContent.get_url_path_from_location(self.location)
+        return self.location
 
     @property
     def data(self):
         return self._data
 
-    @staticmethod
-    def get_url_path_from_location(location):
-        if location is not None:
-            return u"/{tag}/{org}/{course}/{category}/{name}".format(**location.dict())
-        else:
-            return None
+    ASSET_URL_RE = re.compile(r"""
+        /?c4x/
+        (?P<org>[^/]+)/
+        (?P<course>[^/]+)/
+        (?P<category>[^/]+)/
+        (?P<name>[^/]+)
+    """, re.VERBOSE | re.IGNORECASE)
 
     @staticmethod
     def is_c4x_path(path_string):
         """
         Returns a boolean if a path is believed to be a c4x link based on the leading element
         """
-        return path_string.startswith('/{0}/'.format(XASSET_LOCATION_TAG))
-
-    @staticmethod
-    def renamespace_c4x_path(path_string, target_location):
-        """
-        Returns an updated string which incorporates a new org/course in order to remap an asset path
-        to a new namespace
-        """
-        location = StaticContent.get_location_from_path(path_string)
-        location = location.replace(org=target_location.org, course=target_location.course)
-        return StaticContent.get_url_path_from_location(location)
+        return StaticContent.ASSET_URL_RE.match(path_string) is not None
 
     @staticmethod
     def get_static_path_from_location(location):
@@ -86,56 +111,129 @@ class StaticContent(object):
         the actual /c4x/... path which the client needs to reference static content
         """
         if location is not None:
-            return "/static/{name}".format(**location.dict())
+            return u"/static/{name}".format(name=location.name)
         else:
             return None
 
     @staticmethod
-    def get_base_url_path_for_course_assets(loc):
-        if loc is not None:
-            return "/c4x/{org}/{course}/asset".format(**loc.dict())
+    def get_base_url_path_for_course_assets(course_key):
+        if course_key is None:
+            return None
 
-    @staticmethod
-    def get_id_from_location(location):
-        return {'tag': location.tag, 'org': location.org, 'course': location.course,
-                'category': location.category, 'name': location.name,
-                'revision': location.revision}
+        assert isinstance(course_key, CourseKey)
+        placeholder_id = uuid.uuid4().hex
+        # create a dummy asset location with a fake but unique name. strip off the name, and return it
+        url_path = StaticContent.serialize_asset_key_with_slash(
+            course_key.make_asset_key('asset', placeholder_id).for_branch(None)
+        )
+        return url_path.replace(placeholder_id, '')
 
     @staticmethod
     def get_location_from_path(path):
-        # remove leading / character if it is there one
-        if path.startswith('/'):
-            path = path[1:]
-
-        return Location(path.split('/'))
-
-    @staticmethod
-    def get_id_from_path(path):
-        return get_id_from_location(get_location_from_path(path))
-
-    @staticmethod
-    def convert_legacy_static_url(path, course_namespace):
-        loc = StaticContent.compute_location(course_namespace.org, course_namespace.course, path)
-        return StaticContent.get_url_path_from_location(loc)
-
-    @staticmethod
-    def convert_legacy_static_url_with_course_id(path, course_id):
         """
-        Returns a path to a piece of static content when we are provided with a filepath and
-        a course_id
+        Generate an AssetKey for the given path (old c4x/org/course/asset/name syntax)
         """
-        org, course_num, __ = course_id.split("/")
+        try:
+            return AssetKey.from_string(path)
+        except InvalidKeyError:
+            # TODO - re-address this once LMS-11198 is tackled.
+            if path.startswith('/'):
+                # try stripping off the leading slash and try again
+                return AssetKey.from_string(path[1:])
 
-        # Generate url of urlparse.path component
-        scheme, netloc, orig_path, params, query, fragment = urlparse(path)
-        loc = StaticContent.compute_location(org, course_num, orig_path)
-        loc_url = StaticContent.get_url_path_from_location(loc)
+    @staticmethod
+    def get_asset_key_from_path(course_key, path):
+        """
+        Parses a path, extracting an asset key or creating one.
 
-        # Reconstruct with new path
-        return urlunparse((scheme, netloc, loc_url, params, query, fragment))
+        Args:
+            course_key: key to the course which owns this asset
+            path: the path to said content
+
+        Returns:
+            AssetKey: the asset key that represents the path
+        """
+
+        # Clean up the path, removing any static prefix and any leading slash.
+        if path.startswith('/static/'):
+            path = path[len('/static/'):]
+
+        path = path.lstrip('/')
+
+        try:
+            return AssetKey.from_string(path)
+        except InvalidKeyError:
+            # If we couldn't parse the path, just let compute_location figure it out.
+            # It's most likely a path like /image.png or something.
+            return StaticContent.compute_location(course_key, path)
+
+    @staticmethod
+    def get_canonicalized_asset_path(course_key, path, base_url, excluded_exts):
+        """
+        Returns a fully-qualified path to a piece of static content.
+
+        If a static asset CDN is configured, this path will include it.
+        Otherwise, the path will simply be relative.
+
+        Args:
+            course_key: key to the course which owns this asset
+            path: the path to said content
+
+        Returns:
+            string: fully-qualified path to asset
+        """
+
+        # Break down the input path.
+        _, _, relative_path, params, query_string, fragment = urlparse(path)
+
+        # Convert our path to an asset key if it isn't one already.
+        asset_key = StaticContent.get_asset_key_from_path(course_key, relative_path)
+
+        # Check the status of the asset to see if this can be served via CDN aka publicly.
+        serve_from_cdn = False
+        try:
+            content = AssetManager.find(asset_key, as_stream=True)
+            is_locked = getattr(content, "locked", True)
+            serve_from_cdn = not is_locked
+        except (ItemNotFoundError, NotFoundError):
+            # If we can't find the item, just treat it as if it's locked.
+            serve_from_cdn = False
+
+        # See if this is an allowed file extension to serve.  Some files aren't served through the
+        # CDN in order to avoid same-origin policy/CORS-related issues.
+        if any(relative_path.lower().endswith(excluded_ext.lower()) for excluded_ext in excluded_exts):
+            serve_from_cdn = False
+
+        # Update any query parameter values that have asset paths in them. This is for assets that
+        # require their own after-the-fact values, like a Flash file that needs the path of a config
+        # file passed to it e.g. /static/visualization.swf?configFile=/static/visualization.xml
+        query_params = parse_qsl(query_string)
+        updated_query_params = []
+        for query_name, query_val in query_params:
+            if query_val.startswith("/static/"):
+                new_val = StaticContent.get_canonicalized_asset_path(course_key, query_val, base_url, excluded_exts)
+                updated_query_params.append((query_name, new_val))
+            else:
+                updated_query_params.append((query_name, query_val))
+
+        serialized_asset_key = StaticContent.serialize_asset_key_with_slash(asset_key)
+        base_url = base_url if serve_from_cdn else ''
+
+        return urlunparse((None, base_url, serialized_asset_key, params, urlencode(updated_query_params), fragment))
 
     def stream_data(self):
         yield self._data
+
+    @staticmethod
+    def serialize_asset_key_with_slash(asset_key):
+        """
+        Legacy code expects the serialized asset key to start w/ a slash; so, do that in one place
+        :param asset_key:
+        """
+        url = unicode(asset_key)
+        if not url.startswith('/'):
+            url = '/' + url  # TODO - re-address this once LMS-11198 is tackled.
+        return url
 
 
 class StaticContentStream(StaticContent):
@@ -148,9 +246,24 @@ class StaticContentStream(StaticContent):
 
     def stream_data(self):
         while True:
-            chunk = self._stream.read(1024)
+            chunk = self._stream.read(STREAM_DATA_CHUNK_SIZE)
             if len(chunk) == 0:
                 break
+            yield chunk
+
+    def stream_data_in_range(self, first_byte, last_byte):
+        """
+        Stream the data between first_byte and last_byte (included)
+        """
+        self._stream.seek(first_byte)
+        position = first_byte
+        while True:
+            if last_byte < position + STREAM_DATA_CHUNK_SIZE - 1:
+                chunk = self._stream.read(last_byte - position + 1)
+                yield chunk
+                break
+            chunk = self._stream.read(STREAM_DATA_CHUNK_SIZE)
+            position += STREAM_DATA_CHUNK_SIZE
             yield chunk
 
     def close(self):
@@ -174,38 +287,56 @@ class ContentStore(object):
     def find(self, filename):
         raise NotImplementedError
 
-    def get_all_content_for_course(self, location, start=0, maxresults=-1, sort=None):
+    def get_all_content_for_course(self, course_key, start=0, maxresults=-1, sort=None, filter_params=None):
         '''
         Returns a list of static assets for a course, followed by the total number of assets.
         By default all assets are returned, but start and maxresults can be provided to limit the query.
 
-        The return format is a list of dictionary elements. Example:
-
-            [
-
-            {u'displayname': u'profile.jpg', u'chunkSize': 262144, u'length': 85374,
-            u'uploadDate': datetime.datetime(2012, 10, 3, 5, 41, 54, 183000), u'contentType': u'image/jpeg',
-            u'_id': {u'category': u'asset', u'name': u'profile.jpg', u'course': u'6.002x', u'tag': u'c4x',
-            u'org': u'MITx', u'revision': None}, u'md5': u'36dc53519d4b735eb6beba51cd686a0e'},
-
-            {u'displayname': u'profile.thumbnail.jpg', u'chunkSize': 262144, u'length': 4073,
-            u'uploadDate': datetime.datetime(2012, 10, 3, 5, 41, 54, 196000), u'contentType': u'image/jpeg',
-            u'_id': {u'category': u'asset', u'name': u'profile.thumbnail.jpg', u'course': u'6.002x', u'tag': u'c4x',
-            u'org': u'MITx', u'revision': None}, u'md5': u'ff1532598830e3feac91c2449eaa60d6'},
-
-            ....
-
-            ]
+        The return format is a list of asset data dictionaries.
+        The asset data dictionaries have the following keys:
+            asset_key (:class:`opaque_keys.edx.AssetKey`): The key of the asset
+            displayname: The human-readable name of the asset
+            uploadDate (datetime.datetime): The date and time that the file was uploadDate
+            contentType: The mimetype string of the asset
+            md5: An md5 hash of the asset content
         '''
         raise NotImplementedError
 
-    def generate_thumbnail(self, content, tempfile_path=None):
+    def delete_all_course_assets(self, course_key):
+        """
+        Delete all of the assets which use this course_key as an identifier
+        :param course_key:
+        """
+        raise NotImplementedError
+
+    def copy_all_course_assets(self, source_course_key, dest_course_key):
+        """
+        Copy all the course assets from source_course_key to dest_course_key
+        """
+        raise NotImplementedError
+
+    def generate_thumbnail(self, content, tempfile_path=None, dimensions=None):
+        """Create a thumbnail for a given image.
+
+        Returns a tuple of (StaticContent, AssetKey)
+
+        `content` is the StaticContent representing the image you want to make a
+        thumbnail out of.
+
+        `tempfile_path` is a string path to the location of a file to read from
+        in order to grab the image data, instead of relying on `content.data`
+
+        `dimensions` is an optional param that represents (width, height) in
+        pixels. It defaults to None.
+        """
         thumbnail_content = None
         # use a naming convention to associate originals with the thumbnail
-        thumbnail_name = StaticContent.generate_thumbnail_name(content.location.name)
-
-        thumbnail_file_location = StaticContent.compute_location(content.location.org, content.location.course,
-                                                                 thumbnail_name, is_thumbnail=True)
+        thumbnail_name = StaticContent.generate_thumbnail_name(
+            content.location.name, dimensions=dimensions
+        )
+        thumbnail_file_location = StaticContent.compute_location(
+            content.location.course_key, thumbnail_name, is_thumbnail=True
+        )
 
         # if we're uploading an image, then let's generate a thumbnail so that we can
         # serve it up when needed without having to rescale on the fly
@@ -223,8 +354,11 @@ class ContentStore(object):
                 # I've seen some exceptions from the PIL library when trying to save palletted
                 # PNG files to JPEG. Per the google-universe, they suggest converting to RGB first.
                 im = im.convert('RGB')
-                size = 128, 128
-                im.thumbnail(size, Image.ANTIALIAS)
+
+                if not dimensions:
+                    dimensions = (128, 128)
+
+                im.thumbnail(dimensions, Image.ANTIALIAS)
                 thumbnail_file = StringIO.StringIO()
                 im.save(thumbnail_file, 'JPEG')
                 thumbnail_file.seek(0)
@@ -233,10 +367,17 @@ class ContentStore(object):
                 thumbnail_content = StaticContent(thumbnail_file_location, thumbnail_name,
                                                   'image/jpeg', thumbnail_file)
 
-                contentstore().save(thumbnail_content)
+                self.save(thumbnail_content)
 
             except Exception, e:
                 # log and continue as thumbnails are generally considered as optional
-                logging.exception("Failed to generate thumbnail for {0}. Exception: {1}".format(content.location, str(e)))
+                logging.exception(u"Failed to generate thumbnail for {0}. Exception: {1}".format(content.location, str(e)))
 
         return thumbnail_content, thumbnail_file_location
+
+    def ensure_indexes(self):
+        """
+        Ensure that all appropriate indexes are created that are needed by this modulestore, or raise
+        an exception if unable to.
+        """
+        pass

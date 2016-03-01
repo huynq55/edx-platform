@@ -12,10 +12,10 @@ class TestHandlerUrl(TestCase):
     """Test the LMS handler_url"""
 
     def setUp(self):
+        super(TestHandlerUrl, self).setUp()
         self.block = Mock()
-        self.course_id = "org/course/run"
 
-    def test_trailing_charecters(self):
+    def test_trailing_characters(self):
         self.assertFalse(handler_url(self.block, 'handler').endswith('?'))
         self.assertFalse(handler_url(self.block, 'handler').endswith('/'))
 

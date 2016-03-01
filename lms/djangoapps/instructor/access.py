@@ -12,7 +12,17 @@ TO DO sync instructor and staff flags
 import logging
 from django_comment_common.models import Role
 
-from student.roles import CourseBetaTesterRole, CourseInstructorRole, CourseStaffRole
+from student.roles import (
+    CourseBetaTesterRole,
+    CourseInstructorRole,
+    CourseCcxCoachRole,
+    CourseStaffRole,
+)
+
+from instructor.enrollment import (
+    enroll_email,
+    get_email_params,
+)
 
 log = logging.getLogger(__name__)
 
@@ -20,6 +30,7 @@ ROLES = {
     'beta': CourseBetaTesterRole,
     'instructor': CourseInstructorRole,
     'staff': CourseStaffRole,
+    'ccx_coach': CourseCcxCoachRole,
 }
 
 
@@ -31,28 +42,28 @@ def list_with_level(course, level):
     There could be other levels specific to the course.
     If there is no Group for that course-level, returns an empty list
     """
-    return ROLES[level](course.location).users_with_role()
+    return ROLES[level](course.id).users_with_role()
 
 
-def allow_access(course, user, level):
+def allow_access(course, user, level, send_email=True):
     """
     Allow user access to course modification.
 
     `level` is one of ['instructor', 'staff', 'beta']
     """
-    _change_access(course, user, level, 'allow')
+    _change_access(course, user, level, 'allow', send_email)
 
 
-def revoke_access(course, user, level):
+def revoke_access(course, user, level, send_email=True):
     """
     Revoke access from user to course modification.
 
     `level` is one of ['instructor', 'staff', 'beta']
     """
-    _change_access(course, user, level, 'revoke')
+    _change_access(course, user, level, 'revoke', send_email)
 
 
-def _change_access(course, user, level, action):
+def _change_access(course, user, level, action, send_email=True):
     """
     Change access of user.
 
@@ -63,11 +74,20 @@ def _change_access(course, user, level, action):
     """
 
     try:
-        role = ROLES[level](course.location)
+        role = ROLES[level](course.id)
     except KeyError:
         raise ValueError("unrecognized level '{}'".format(level))
 
     if action == 'allow':
+        if level == 'ccx_coach':
+            email_params = get_email_params(course, True)
+            enroll_email(
+                course_id=course.id,
+                student_email=user.email,
+                auto_enroll=True,
+                email_students=send_email,
+                email_params=email_params,
+            )
         role.add_users(user)
     elif action == 'revoke':
         role.remove_users(user)

@@ -10,7 +10,7 @@ class CorrectMap(object):
     in a capa problem.  The response evaluation result for each answer_id includes
     (correctness, npoints, msg, hint, hintmode).
 
-    - correctness : either 'correct' or 'incorrect'
+    - correctness : 'correct', 'incorrect', or 'partially-correct'
     - npoints     : None, or integer specifying number of points awarded for this answer_id
     - msg         : string (may have HTML) giving extra message response
                     (displayed below textline or textbox)
@@ -46,17 +46,19 @@ class CorrectMap(object):
         hint='',
         hintmode=None,
         queuestate=None,
+        answervariable=None,    # pylint: disable=C0330
         **kwargs
     ):
 
         if answer_id is not None:
-            self.cmap[str(answer_id)] = {
+            self.cmap[answer_id] = {
                 'correctness': correctness,
                 'npoints': npoints,
                 'msg': msg,
                 'hint': hint,
                 'hintmode': hintmode,
                 'queuestate': queuestate,
+                'answervariable': answervariable,
             }
 
     def __repr__(self):
@@ -99,8 +101,21 @@ class CorrectMap(object):
                 self.set(k, **correct_map[k])
 
     def is_correct(self, answer_id):
+        """
+        Takes an answer_id
+        Returns true if the problem is correct OR partially correct.
+        """
         if answer_id in self.cmap:
             return self.cmap[answer_id]['correctness'] in ['correct', 'partially-correct']
+        return None
+
+    def is_partially_correct(self, answer_id):
+        """
+        Takes an answer_id
+        Returns true if the problem is partially correct.
+        """
+        if answer_id in self.cmap:
+            return self.cmap[answer_id]['correctness'] == 'partially-correct'
         return None
 
     def is_queued(self, answer_id):
@@ -122,7 +137,7 @@ class CorrectMap(object):
             return npoints
         elif self.is_correct(answer_id):
             return 1
-         # if not correct and no points have been assigned, return 0
+        # if not correct and no points have been assigned, return 0
         return 0
 
     def set_property(self, answer_id, property, value):
@@ -164,7 +179,6 @@ class CorrectMap(object):
             raise Exception('CorrectMap.update called with invalid argument %s' % other_cmap)
         self.cmap.update(other_cmap.get_dict())
         self.set_overall_message(other_cmap.get_overall_message())
-
 
     def set_overall_message(self, message_str):
         """ Set a message that applies to the question as a whole,

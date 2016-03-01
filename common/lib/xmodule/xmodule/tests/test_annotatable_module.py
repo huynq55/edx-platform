@@ -8,9 +8,10 @@ from mock import Mock
 from xblock.field_data import DictFieldData
 from xblock.fields import ScopeIds
 from xmodule.annotatable_module import AnnotatableModule
-from xmodule.modulestore import Location
+from opaque_keys.edx.locations import Location
 
 from . import get_test_system
+
 
 class AnnotatableModuleTestCase(unittest.TestCase):
     sample_xml = '''
@@ -31,18 +32,19 @@ class AnnotatableModuleTestCase(unittest.TestCase):
     '''
 
     def setUp(self):
+        super(AnnotatableModuleTestCase, self).setUp()
         self.annotatable = AnnotatableModule(
             Mock(),
             get_test_system(),
             DictFieldData({'data': self.sample_xml}),
-            ScopeIds(None, None, None, None)
+            ScopeIds(None, None, None, Location('org', 'course', 'run', 'category', 'name', None))
         )
 
     def test_annotation_data_attr(self):
         el = etree.fromstring('<annotation title="bar" body="foo" problem="0">test</annotation>')
 
         expected_attr = {
-            'data-comment-body': {'value': 'foo', '_delete': 'body' },
+            'data-comment-body': {'value': 'foo', '_delete': 'body'},
             'data-comment-title': {'value': 'bar', '_delete': 'title'},
             'data-problem-id': {'value': '0', '_delete': 'problem'}
         }
@@ -56,7 +58,7 @@ class AnnotatableModuleTestCase(unittest.TestCase):
         xml = '<annotation title="x" body="y" problem="0">test</annotation>'
         el = etree.fromstring(xml)
 
-        expected_attr = { 'class': { 'value': 'annotatable-span highlight' } }
+        expected_attr = {'class': {'value': 'annotatable-span highlight'}}
         actual_attr = self.annotatable._get_annotation_class_attr(0, el)
 
         self.assertIsInstance(actual_attr, dict)
@@ -69,9 +71,11 @@ class AnnotatableModuleTestCase(unittest.TestCase):
             el = etree.fromstring(xml.format(highlight=color))
             value = 'annotatable-span highlight highlight-{highlight}'.format(highlight=color)
 
-            expected_attr = { 'class': {
-                'value': value,
-                '_delete': 'highlight' }
+            expected_attr = {
+                'class': {
+                    'value': value,
+                    '_delete': 'highlight'
+                }
             }
             actual_attr = self.annotatable._get_annotation_class_attr(0, el)
 
@@ -83,9 +87,11 @@ class AnnotatableModuleTestCase(unittest.TestCase):
 
         for invalid_color in ['rainbow', 'blink', 'invisible', '', None]:
             el = etree.fromstring(xml.format(highlight=invalid_color))
-            expected_attr = { 'class': {
-                'value': 'annotatable-span highlight',
-                '_delete': 'highlight' }
+            expected_attr = {
+                'class': {
+                    'value': 'annotatable-span highlight',
+                    '_delete': 'highlight'
+                }
             }
             actual_attr = self.annotatable._get_annotation_class_attr(0, el)
 

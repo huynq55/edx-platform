@@ -1,259 +1,532 @@
-(function (requirejs, require, define) {
-
+(function(define) {
+'use strict';
 // VideoVolumeControl module.
 define(
-'video/07_video_volume_control.js',
-[],
-function () {
-
-    // VideoVolumeControl() function - what this module "exports".
-    return function (state) {
-        var dfd = $.Deferred();
-
-        if (state.isTouch) {
-            // iOS doesn't support volume change
-            state.el.find('div.volume').remove();
-            dfd.resolve();
-            return dfd.promise();
+'video/07_video_volume_control.js', [],
+function() {
+    /**
+     * Video volume control module.
+     * @exports video/07_video_volume_control.js
+     * @constructor
+     * @param {Object} state The object containing the state of the video
+     * @param {Object} i18n The object containing strings with translations.
+     * @return {jquery Promise}
+     */
+    var VolumeControl = function(state, i18n) {
+        if (!(this instanceof VolumeControl)) {
+            return new VolumeControl(state, i18n);
         }
 
-        state.videoVolumeControl = {};
+        _.bindAll(this, 'keyDownHandler', 'updateVolumeSilently',
+            'onVolumeChangeHandler', 'openMenu', 'closeMenu',
+            'toggleMuteHandler', 'keyDownButtonHandler', 'destroy'
+        );
+        this.state = state;
+        this.state.videoVolumeControl = this;
+        this.i18n = i18n;
+        this.initialize();
 
-        _makeFunctionsPublic(state);
-        _renderElements(state);
-        _bindHandlers(state);
-
-        dfd.resolve();
-        return dfd.promise();
+        return $.Deferred().resolve().promise();
     };
 
-    // ***************************************************************
-    // Private functions start here.
-    // ***************************************************************
+    VolumeControl.prototype = {
+        /** Minimum value for the volume slider. */
+        min: 0,
+        /** Maximum value for the volume slider. */
+        max: 100,
+        /** Step to increase/decrease volume level via keyboard. */
+        step: 20,
 
-    // function _makeFunctionsPublic(state)
-    //
-    //     Functions which will be accessible via 'state' object. When called, these functions will
-    //     get the 'state' object as a context.
-    function _makeFunctionsPublic(state) {
-        var methodsDict = {
-            onChange: onChange,
-            toggleMute: toggleMute
-        };
+        template: [
+            '<div class="volume" role="application">',
+                '<button class="control" aria-disabled="false" aria-label="',
+                    gettext('Volume: Click on this button to mute or unmute this video or press UP or ' +
+                        'DOWN buttons to increase or decrease volume level.'),
+                    '" aria-expanded="false">',
+                    '<span class="icon-fallback-img">',
+                        '<span class="icon fa fa-volume-up" aria-hidden="true"></span>',
+                        '<span class="sr control-text">',
+                            gettext('Volume'),
+                        '</span>',
+                    '</span>',
+                '</button>',
+                '<div class="volume-slider-container" aria-hidden="true">',
+                    '<div class="volume-slider" ',
+                        'role="slider"',
+                        'aria-orientation="vertical" ',
+                        'aria-valuemin="0" ',
+                        'aria-valuemax="100" ',
+                        'aria-valuenow=""></div>',
+                '</div>',
+            '</div>'
+        ].join(''),
 
-        state.bindTo(methodsDict, state.videoVolumeControl, state);
-    }
+        destroy: function () {
+            this.volumeSlider.slider('destroy');
+            this.state.el.find('iframe').removeAttr('tabindex');
+            this.a11y.destroy();
+            this.cookie = this.a11y = null;
+            this.closeMenu();
 
-    // function _renderElements(state)
-    //
-    //     Create any necessary DOM elements, attach them, and set their initial configuration. Also
-    //     make the created DOM elements available via the 'state' object. Much easier to work this
-    //     way - you don't have to do repeated jQuery element selects.
-    function _renderElements(state) {
-        var volumeControl = state.videoVolumeControl,
-            element = state.el.find('div.volume'),
-            button = element.find('a'),
-            volumeSlider = element.find('.volume-slider'),
-            // Figure out what the current volume is. If no information about
-            // volume level could be retrieved, then we will use the default 100
-            // level (full volume).
-            currentVolume = parseInt($.cookie('video_player_volume_level'), 10),
-            // Set it up so that muting/unmuting works correctly.
-            previousVolume = 100,
-            slider, buttonStr, volumeSliderHandleEl;
+            this.state.el
+                .off('play.volume')
+                .off({
+                    'keydown': this.keyDownHandler,
+                    'volumechange': this.onVolumeChangeHandler
+                });
+            this.el.off({
+                'mouseenter': this.openMenu,
+                'mouseleave': this.closeMenu
+            });
+            this.button.off({
+                'mousedown': this.toggleMuteHandler,
+                'keydown': this.keyDownButtonHandler,
+                'focus': this.openMenu,
+                'blur': this.closeMenu
+            });
+            this.el.remove();
+            delete this.state.videoVolumeControl;
+        },
 
-        state.videoControl.secondaryControlsEl.prepend(element);
+        /** Initializes the module. */
+        initialize: function() {
+            var volume;
 
-        if (!isFinite(currentVolume)) {
-            currentVolume = 100;
+            if (this.state.isTouch) {
+                // iOS doesn't support volume change
+                return false;
+            }
+
+            this.el = $(this.template);
+            // Youtube iframe react on key buttons and has his own handlers.
+            // So, we disallow focusing on iframe.
+            this.state.el.find('iframe').attr('tabindex', -1);
+            this.button = this.el.children('.control');
+            this.cookie = new CookieManager(this.min, this.max);
+            this.a11y = new Accessibility(
+                this.button, this.min, this.max, this.i18n
+            );
+            volume = this.cookie.getVolume();
+            this.storedVolume = this.max;
+
+            this.render();
+            this.bindHandlers();
+            this.setVolume(volume, true, false);
+            this.checkMuteButtonStatus(volume);
+        },
+
+        /**
+         * Creates any necessary DOM elements, attach them, and set their,
+         * initial configuration.
+         */
+        render: function() {
+            var container = this.el.find('.volume-slider');
+
+            this.volumeSlider = container.slider({
+                orientation: 'vertical',
+                range: 'min',
+                min: this.min,
+                max: this.max,
+                slide: this.onSlideHandler.bind(this)
+            });
+
+            // We provide an independent behavior to adjust volume level.
+            // Therefore, we do not need redundant focusing on slider in TAB
+            // order.
+            container.find('a').attr('tabindex', -1);
+            this.state.el.find('.secondary-controls').append(this.el);
+        },
+
+        /** Bind any necessary function callbacks to DOM events. */
+        bindHandlers: function() {
+            this.state.el.on({
+                'play.volume': _.once(this.updateVolumeSilently),
+                'volumechange': this.onVolumeChangeHandler
+            });
+            this.state.el.find('.volume').on({
+                'mouseenter': this.openMenu,
+                'mouseleave': this.closeMenu
+            });
+            this.button.on({
+                'keydown': this.keyDownHandler,
+                'click': false,
+                'mousedown': this.toggleMuteHandler,
+                'focus': this.openMenu,
+                'blur': this.closeMenu
+            });
+            this.state.el.on('destroy', this.destroy);
+        },
+
+        /**
+         * Updates volume level without updating view and triggering
+         * `volumechange` event.
+         */
+        updateVolumeSilently: function() {
+            this.state.el.trigger(
+                'volumechange:silent', [this.getVolume()]
+            );
+        },
+
+        /**
+         * Returns current volume level.
+         * @return {Number}
+         */
+        getVolume: function() {
+            return this.volume;
+        },
+
+        /**
+         * Sets current volume level.
+         * @param {Number} volume Suggested volume level
+         * @param {Boolean} [silent] Sets the new volume level without
+         * triggering `volumechange` event and updating the cookie.
+         * @param {Boolean} [withoutSlider] Disables updating the slider.
+         */
+        setVolume: function(volume, silent, withoutSlider) {
+            if (volume === this.getVolume()) {
+                return false;
+            }
+
+            this.volume = volume;
+            this.a11y.update(this.getVolume());
+
+            if (!withoutSlider) {
+                this.updateSliderView(this.getVolume());
+            }
+
+            if (!silent) {
+                this.cookie.setVolume(this.getVolume());
+                this.state.el.trigger('volumechange', [this.getVolume()]);
+            }
+        },
+
+        /** Increases current volume level using previously defined step. */
+        increaseVolume: function() {
+            var volume = Math.min(this.getVolume() + this.step, this.max);
+
+            this.setVolume(volume, false, false);
+            this.el.find('.volume-slider')
+                .attr('aria-valuenow', volume);
+        },
+
+        /** Decreases current volume level using previously defined step. */
+        decreaseVolume: function() {
+            var volume = Math.max(this.getVolume() - this.step, this.min);
+
+            this.setVolume(volume, false, false);
+            this.el.find('.volume-slider')
+                .attr('aria-valuenow', volume);
+        },
+
+        /** Updates volume slider view. */
+        updateSliderView: function (volume) {
+            this.volumeSlider.slider('value', volume);
+            this.el.find('.volume-slider')
+                .attr('aria-valuenow', volume);
+        },
+
+        /**
+         * Mutes or unmutes volume.
+         * @param {Number} muteStatus Flag to mute/unmute volume.
+         */
+        mute: function(muteStatus) {
+            var volume;
+
+            this.updateMuteButtonView(muteStatus);
+
+            if (muteStatus) {
+                this.storedVolume = this.getVolume() || this.max;
+            }
+
+            volume = muteStatus ? 0 : this.storedVolume;
+            this.setVolume(volume, false, false);
+            this.el.find('.volume-slider')
+                .attr('aria-valuenow', volume);
+        },
+
+        /**
+         * Returns current volume state (is it muted or not?).
+         * @return {Boolean}
+         */
+        getMuteStatus: function () {
+            return this.getVolume() === 0;
+        },
+
+        /**
+         * Updates the volume button view.
+         * @param {Boolean} isMuted Flag to use muted or unmuted view.
+         */
+        updateMuteButtonView: function(isMuted) {
+            var action = isMuted ? 'addClass' : 'removeClass';
+
+            this.el[action]('is-muted');
+
+            if (isMuted) {
+                this.el
+                    .find('.control .icon')
+                        .removeClass('fa-volume-up')
+                        .addClass('fa-volume-off');
+            } else {
+                this.el
+                    .find('.control .icon')
+                        .removeClass('fa-volume-off')
+                        .addClass('fa-volume-up');
+            }
+        },
+
+        /** Toggles the state of the volume button. */
+        toggleMute: function() {
+            this.mute(!this.getMuteStatus());
+        },
+
+        /**
+         * Checks and updates the state of the volume button relatively to
+         * volume level.
+         * @param {Number} volume Volume level.
+         */
+        checkMuteButtonStatus: function (volume) {
+            if (volume <= this.min) {
+                this.updateMuteButtonView(true);
+                this.state.el.off('volumechange.is-muted');
+                this.state.el.on('volumechange.is-muted', _.once(function () {
+                     this.updateMuteButtonView(false);
+                }.bind(this)));
+            }
+        },
+
+        /** Opens volume menu. */
+        openMenu: function() {
+            this.el.addClass('is-opened');
+            this.button.attr('aria-expanded', 'true');
+        },
+
+        /** Closes speed menu. */
+        closeMenu: function() {
+            this.el.removeClass('is-opened');
+            this.button.attr('aria-expanded', 'false');
+        },
+
+        /**
+         * Keydown event handler for the video container.
+         * @param {jquery Event} event
+         */
+        keyDownHandler: function(event) {
+            // ALT key is used to change (alternate) the function of
+            // other pressed keys. In this case, do nothing.
+            if (event.altKey) {
+                return true;
+            }
+
+            if ($(event.target).hasClass('ui-slider-handle')) {
+                return true;
+            }
+
+            var KEY = $.ui.keyCode,
+                keyCode = event.keyCode;
+
+            switch (keyCode) {
+                case KEY.UP:
+                    // Shift + Arrows keyboard shortcut might be used by
+                    // screen readers. In this case, do nothing.
+                    if (event.shiftKey) {
+                        return true;
+                    }
+
+                    this.increaseVolume();
+                    return false;
+                case KEY.DOWN:
+                    // Shift + Arrows keyboard shortcut might be used by
+                    // screen readers. In this case, do nothing.
+                    if (event.shiftKey) {
+                        return true;
+                    }
+
+                    this.decreaseVolume();
+                    return false;
+
+                case KEY.SPACE:
+                case KEY.ENTER:
+                    // Shift + Enter keyboard shortcut might be used by
+                    // screen readers. In this case, do nothing.
+                    if (event.shiftKey) {
+                        return true;
+                    }
+
+                    this.toggleMute();
+                    return false;
+            }
+
+            return true;
+        },
+
+        /**
+         * Keydown event handler for the volume button.
+         * @param {jquery Event} event
+         */
+         keyDownButtonHandler: function(event) {
+            // ALT key is used to change (alternate) the function of
+            // other pressed keys. In this case, do nothing.
+            if (event.altKey) {
+                return true;
+            }
+
+            var KEY = $.ui.keyCode,
+                keyCode = event.keyCode;
+
+            switch (keyCode) {
+                case KEY.ENTER:
+                case KEY.SPACE:
+                    this.toggleMute();
+                    return false;
+            }
+
+            return true;
+        },
+
+        /**
+         * onSlide callback for the video slider.
+         * @param {jquery Event} event
+         * @param {jqueryuiSlider ui} ui
+         */
+        onSlideHandler: function(event, ui) {
+            this.setVolume(ui.value, false, true);
+            this.el.find('.volume-slider')
+                .attr('aria-valuenow', ui.volume);
+        },
+
+        /**
+         * Mousedown event handler for the volume button.
+         * @param {jquery Event} event
+         */
+        toggleMuteHandler: function(event) {
+            this.toggleMute();
+            event.preventDefault();
+        },
+
+        /**
+         * Volumechange event handler.
+         * @param {jquery Event} event
+         * @param {Number} volume Volume level.
+         */
+        onVolumeChangeHandler: function(event, volume) {
+            this.checkMuteButtonStatus(volume);
         }
-
-        slider = volumeSlider.slider({
-            orientation: 'vertical',
-            range: 'min',
-            min: 0,
-            max: 100,
-            value: currentVolume,
-            change: volumeControl.onChange,
-            slide: volumeControl.onChange
-        });
-
-        element.toggleClass('muted', currentVolume === 0);
-
-        // ARIA
-        // Let screen readers know that:
-        // This anchor behaves as a button named 'Volume'.
-        buttonStr = (currentVolume === 0) ? 'Volume muted' : 'Volume';
-        // We add the aria-label attribute because the title attribute cannot be
-        // read.
-        button.attr('aria-label', gettext(buttonStr));
-
-        // Let screen readers know that this anchor, representing the slider
-        // handle, behaves as a slider named 'volume'.
-        volumeSliderHandleEl = slider.find('.ui-slider-handle');
-
-        volumeSliderHandleEl.attr({
-            'role': 'slider',
-            'title': 'volume',
-            'aria-disabled': false,
-            'aria-valuemin': slider.slider('option', 'min'),
-            'aria-valuemax': slider.slider('option', 'max'),
-            'aria-valuenow': slider.slider('option', 'value'),
-            'aria-valuetext': getVolumeDescription(slider.slider('option', 'value'))
-        });
-
-
-        state.currentVolume = currentVolume;
-        $.extend(state.videoVolumeControl, {
-            el: element,
-            buttonEl: button,
-            volumeSliderEl: volumeSlider,
-            currentVolume: currentVolume,
-            previousVolume: previousVolume,
-            slider: slider,
-            volumeSliderHandleEl: volumeSliderHandleEl
-        });
-    }
+    };
 
     /**
-     * @desc Bind any necessary function callbacks to DOM events (click,
-     *     mousemove, etc.).
-     *
-     * @type {function}
-     * @access private
-     *
-     * @param {object} state The object containg the state of the video player.
-     *     All other modules, their parameters, public variables, etc. are
-     *     available via this object.
-     *
-     * @this {object} The global window object.
-     *
-     * @returns {undefined}
+     * Module responsible for the accessibility of volume controls.
+     * @constructor
+     * @private
+     * @param {jquery $} button The volume button.
+     * @param {Number} min Minimum value for the volume slider.
+     * @param {Number} max Maximum value for the volume slider.
+     * @param {Object} i18n The object containing strings with translations.
      */
-    function _bindHandlers(state) {
-        state.videoVolumeControl.buttonEl
-            .on('click', state.videoVolumeControl.toggleMute);
+    var Accessibility = function (button, min, max, i18n) {
+        this.min = min;
+        this.max = max;
+        this.button = button;
+        this.i18n = i18n;
 
-        state.videoVolumeControl.el.on('mouseenter', function() {
-            state.videoVolumeControl.el.addClass('open');
-        });
+        this.initialize();
+    };
 
-        state.videoVolumeControl.el.on('mouseleave', function() {
-            state.videoVolumeControl.el.removeClass('open');
-        });
+    Accessibility.prototype = {
+        destroy: function () {
+            this.liveRegion.remove();
+        },
 
-        // Attach a focus event to the volume button.
-        state.videoVolumeControl.buttonEl.on('blur', function() {
-            // If the focus is being trasnfered from the volume slider, then we
-            // don't do anything except for unsetting the special flag.
-            if (state.volumeBlur === true) {
-                state.volumeBlur = false;
+        /** Initializes the module. */
+        initialize: function() {
+            this.liveRegion = $('<div />', {
+                'class':  'sr video-live-region',
+                'aria-hidden': 'false',
+                'aria-live': 'polite'
+            });
+
+            this.button.after(this.liveRegion);
+        },
+
+        /**
+         * Updates text of the live region.
+         * @param {Number} volume Volume level.
+         */
+        update: function(volume) {
+            this.liveRegion.text([
+                this.getVolumeDescription(volume),
+                this.i18n['Volume'] + '.'
+            ].join(' '));
+
+            $(this.button).parent().find('.volume-slider')
+                .attr('aria-valuenow', volume);
+        },
+
+        /**
+         * Returns a string describing the level of volume.
+         * @param {Number} volume Volume level.
+         */
+        getVolumeDescription: function(volume) {
+            if (volume === 0) {
+                return this.i18n['Muted'];
+            } else if (volume <= 20) {
+                return this.i18n['Very low'];
+            } else if (volume <= 40) {
+                return this.i18n['Low'];
+            } else if (volume <= 60) {
+                return this.i18n['Average'];
+            } else if (volume <= 80) {
+                return this.i18n['Loud'];
+            } else if (volume <= 99) {
+                return this.i18n['Very loud'];
             }
 
-            //If the focus is comming from elsewhere, then we must show the
-            // volume slider and set focus to it.
-            else {
-                state.videoVolumeControl.el.addClass('open');
-                state.videoVolumeControl.volumeSliderEl.find('a').focus();
+            return this.i18n['Maximum'];
+        }
+    };
+
+    /**
+     * Module responsible for the work with volume cookie.
+     * @constructor
+     * @private
+     * @param {Number} min Minimum value for the volume slider.
+     * @param {Number} max Maximum value for the volume slider.
+     */
+    var CookieManager = function (min, max) {
+        this.min = min;
+        this.max = max;
+        this.cookieName = 'video_player_volume_level';
+    };
+
+    CookieManager.prototype = {
+        /**
+         * Returns volume level from the cookie.
+         * @return {Number} Volume level.
+         */
+        getVolume: function() {
+            var volume = parseInt($.cookie(this.cookieName), 10);
+
+            if (_.isFinite(volume)) {
+                volume = Math.max(volume, this.min);
+                volume = Math.min(volume, this.max);
+            } else {
+                volume = this.max;
             }
-        });
 
-        // Attach a blur event handler (loss of focus) to the volume slider
-        // element. More specifically, we are attaching to the handle on
-        // the slider with which you can change the volume.
-        state.videoVolumeControl.volumeSliderEl.find('a')
-            .on('blur', function () {
-                // Hide the volume slider. This is done so that we can
-                // continue to the next (or previous) element by tabbing.
-                // Otherwise, after next tab we would come back to the volume
-                // slider because it is the next element visible element that
-                // we can tab to after the volume button.
-                state.videoVolumeControl.el.removeClass('open');
+            return volume;
+        },
 
-                // Set focus to the volume button.
-                state.videoVolumeControl.buttonEl.focus();
-
-                // We store the fact that previous element that lost focus was
-                // the volume clontrol.
-                state.volumeBlur = true;
-                // The following field is used in video_speed_control to track
-                // the element that had the focus before it.
-                state.previousFocus = 'volume';
-            });
-    }
-
-    // ***************************************************************
-    // Public functions start here.
-    // These are available via the 'state' object. Their context ('this' keyword) is the 'state' object.
-    // The magic private function that makes them available and sets up their context is makeFunctionsPublic().
-    // ***************************************************************
-
-    function onChange(event, ui) {
-        var currentVolume = ui.value,
-            ariaLabelText = (currentVolume === 0) ? 'Volume muted' : 'Volume';
-
-        this.videoVolumeControl.currentVolume = currentVolume;
-        this.videoVolumeControl.el.toggleClass('muted', currentVolume === 0);
-
-        $.cookie('video_player_volume_level', ui.value, {
-            expires: 3650,
-            path: '/'
-        });
-
-        this.trigger('videoPlayer.onVolumeChange', ui.value);
-
-        // ARIA
-        this.videoVolumeControl.volumeSliderHandleEl.attr({
-            'aria-valuenow': ui.value,
-            'aria-valuetext': getVolumeDescription(ui.value)
-        });
-
-        this.videoVolumeControl.buttonEl.attr(
-            'aria-label', gettext(ariaLabelText)
-        );
-    }
-
-    function toggleMute(event) {
-        event.preventDefault();
-
-        if (this.videoVolumeControl.currentVolume > 0) {
-            this.videoVolumeControl.previousVolume = this.videoVolumeControl.currentVolume;
-            this.videoVolumeControl.slider.slider('option', 'value', 0);
-            // ARIA
-            this.videoVolumeControl.volumeSliderHandleEl.attr({
-                'aria-valuenow': 0,
-                'aria-valuetext': getVolumeDescription(0),
-            });
-        } else {
-            this.videoVolumeControl.slider.slider('option', 'value', this.videoVolumeControl.previousVolume);
-            // ARIA
-            this.videoVolumeControl.volumeSliderHandleEl.attr({
-                'aria-valuenow': this.videoVolumeControl.previousVolume,
-                'aria-valuetext': getVolumeDescription(this.videoVolumeControl.previousVolume)
+        /**
+         * Updates volume cookie.
+         * @param {Number} volume Volume level.
+         */
+        setVolume: function(value) {
+            $.cookie(this.cookieName, value, {
+                expires: 3650,
+                path: '/'
             });
         }
-    }
+    };
 
-    // ARIA
-    // Returns a string describing the level of volume.
-    function getVolumeDescription(vol) {
-        if (vol === 0) {
-            return 'muted';
-        } else if (vol <= 20) {
-            return 'very low';
-        } else if (vol <= 40) {
-            return 'low';
-        } else if (vol <= 60) {
-            return 'average';
-        } else if (vol <= 80) {
-            return 'loud';
-        } else if (vol <= 99) {
-            return 'very loud';
-        }
-
-        return 'maximum';
-    }
-
+    return VolumeControl;
 });
-
-}(RequireJS.requirejs, RequireJS.require, RequireJS.define));
+}(RequireJS.define));

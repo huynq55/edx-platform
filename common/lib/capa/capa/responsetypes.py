@@ -7,13 +7,15 @@ of a variety of types.
 
 Used by capa_problem.py
 """
-
+# TODO: Refactor this code and fix this issue.
+# pylint: disable=attribute-defined-outside-init
 # standard library imports
 import abc
 import cgi
 import inspect
 import json
 import logging
+import html5lib
 import numbers
 import numpy
 import os
@@ -26,9 +28,13 @@ import subprocess
 import textwrap
 import traceback
 import xml.sax.saxutils as saxutils
+from cmath import isnan
+from sys import float_info
 
 from collections import namedtuple
 from shapely.geometry import Point, MultiPoint
+
+import dogstats_wrapper as dog_stats_api
 
 # specific library imports
 from calc import evaluator, UndefinedVariable
@@ -36,8 +42,10 @@ from . import correctmap
 from .registry import TagRegistry
 from datetime import datetime
 from pytz import UTC
-from .util import (compare_with_tolerance, contextualize_text,  convert_files_to_filenames,
-                           is_list_of_files, find_with_default, default_tolerance)
+from .util import (
+    compare_with_tolerance, contextualize_text, convert_files_to_filenames,
+    is_list_of_files, find_with_default, default_tolerance, get_inner_html_from_xpath
+)
 from lxml import etree
 from lxml.html.soupparser import fromstring as fromstring_bs     # uses Beautiful Soup!!! FIXME?
 import capa.xqueue_interface as xqueue_interface
@@ -48,9 +56,18 @@ log = logging.getLogger(__name__)
 
 registry = TagRegistry()
 
-CorrectMap = correctmap.CorrectMap  # pylint: disable=C0103
+CorrectMap = correctmap.CorrectMap
 CORRECTMAP_PY = None
 
+# Make '_' a no-op so we can scrape strings. Using lambda instead of
+#  `django.utils.translation.ugettext_noop` because Django cannot be imported in this file
+_ = lambda text: text
+
+QUESTION_HINT_CORRECT_STYLE = 'feedback-hint-correct'
+QUESTION_HINT_INCORRECT_STYLE = 'feedback-hint-incorrect'
+QUESTION_HINT_LABEL_STYLE = 'hint-label'
+QUESTION_HINT_TEXT_STYLE = 'hint-text'
+QUESTION_HINT_MULTILINE = 'feedback-hint-multi'
 
 #-----------------------------------------------------------------------------
 # Exceptions
@@ -124,12 +141,19 @@ class LoncapaResponse(object):
 
     tags = None
     hint_tag = None
+    has_partial_credit = False
+    credit_type = []
 
     max_inputfields = None
     allowed_inputfields = []
     required_attributes = []
 
-    def __init__(self, xml, inputfields, context, system):
+    # Overridable field that specifies whether this capa response type has support for
+    # for rendering on devices of different sizes and shapes.
+    # By default, we set this to False, allowing subclasses to override as appropriate.
+    multi_device_support = False
+
+    def __init__(self, xml, inputfields, context, system, capa_module):
         """
         Init is passed the following arguments:
 
@@ -137,12 +161,13 @@ class LoncapaResponse(object):
           - inputfields : ordered list of ElementTrees for each input entry field in this Response
           - context     : script processor context
           - system      : LoncapaSystem instance which provides OS, rendering, and user context
-
+          - capa_module : Capa module, to access runtime
         """
         self.xml = xml
         self.inputfields = inputfields
         self.context = context
         self.capa_system = system
+        self.capa_module = capa_module  # njp, note None
 
         self.id = xml.get('id')
 
@@ -192,6 +217,18 @@ class LoncapaResponse(object):
                 self.default_answer_map[entry.get(
                     'id')] = contextualize_text(answer, self.context)
 
+        # Does this problem have partial credit?
+        # If so, what kind? Get it as a list of strings.
+        partial_credit = xml.xpath('.')[0].get('partial_credit', default=False)
+
+        if str(partial_credit).lower().strip() == 'false':
+            self.has_partial_credit = False
+            self.credit_type = []
+        else:
+            self.has_partial_credit = True
+            self.credit_type = partial_credit.split(',')
+            self.credit_type = [word.strip().lower() for word in self.credit_type]
+
         if hasattr(self, 'setup_response'):
             self.setup_response()
 
@@ -240,8 +277,105 @@ class LoncapaResponse(object):
         new_cmap = self.get_score(student_answers)
         self.get_hints(convert_files_to_filenames(
             student_answers), new_cmap, old_cmap)
-        # log.debug('new_cmap = %s' % new_cmap)
         return new_cmap
+
+    def make_hint_div(self, hint_node, correct, student_answer, question_tag,
+                      label=None, hint_log=None, multiline_mode=False, log_extra=None):
+        """
+        Returns the extended hint div based on the student_answer
+        or the empty string if, after processing all the arguments, there is no hint.
+        As a side effect, logs a tracking log event detailing the hint.
+
+        Keyword args:
+            * hint_node: xml node such as <optionhint>, holding extended hint text. May be passed in as None.
+            * correct: bool indication if the student answer is correct
+            * student_answer: list length 1 or more of string answers
+              (only checkboxes make multiple answers)
+            * question_tag: string name of enclosing question, e.g. 'choiceresponse'
+            * label: (optional) if None (the default), extracts the label from the node,
+              otherwise using this value. The value '' inhibits labeling of the hint.
+            * hint_log: (optional) hints to be used, passed in as list-of-dict format (below)
+            * multiline_mode: (optional) bool, default False, hints should be shown one-per line
+            * log_extra: (optional) dict items to be injected in the tracking log
+
+        There are many parameters to this method because a variety of extended hint contexts
+        all bottleneck through here. In addition, the caller must provide detailed background
+        information about the hint-trigger to go in the tracking log.
+
+        hint_log format: list of dicts with each hint as a 'text' key. Each dict has extra
+        information for logging, essentially recording the logic which triggered the feedback.
+        Case 1: records which choices triggered
+        e.g. [{'text': 'feedback 1', 'trigger': [{'choice': 'choice_0', 'selected': True}]},...
+        Case 2: a compound hint, the trigger list has 1 or more choices
+        e.g. [{'text': 'a hint', 'trigger':[{'choice': 'choice_0', 'selected': True},
+              {'choice': 'choice_1', 'selected':True}]}]
+        """
+        _ = self.capa_system.i18n.ugettext
+        # 1. Establish the hint_texts
+        # This can lead to early-exit if the hint is blank.
+        if not hint_log:
+            # .text can be None when node has immediate children nodes
+            if hint_node is None or (hint_node.text is None and len(hint_node.getchildren()) == 0):
+                return ''
+            hint_text = get_inner_html_from_xpath(hint_node)
+            if not hint_text:
+                return ''
+            hint_log = [{'text': hint_text}]
+        # invariant: xxxx
+
+        # 2. Establish the label:
+        # Passed in, or from the node, or the default
+        if not label and hint_node is not None:
+            label = hint_node.get('label', None)
+        # Tricky: label None means output defaults, while '' means output empty label
+        if label is None:
+            if correct:
+                label = _(u'Correct')
+            else:
+                label = _(u'Incorrect')
+
+        # self.runtime.track_function('get_demand_hint', event_info)
+        # This this "feedback hint" event
+        event_info = dict()
+        event_info['module_id'] = self.capa_module.location.to_deprecated_string()
+        event_info['problem_part_id'] = self.id
+        event_info['trigger_type'] = 'single'  # maybe be overwritten by log_extra
+        event_info['hint_label'] = label
+        event_info['hints'] = hint_log
+        event_info['correctness'] = correct
+        event_info['student_answer'] = student_answer
+        event_info['question_type'] = question_tag
+        if log_extra:
+            event_info.update(log_extra)
+        self.capa_module.runtime.track_function('edx.problem.hint.feedback_displayed', event_info)
+
+        # Form the div-wrapped hint texts
+        hints_wrap = u''.join(
+            [u'<div class="{0}">{1}</div>'.format(QUESTION_HINT_TEXT_STYLE, dct.get('text'))
+             for dct in hint_log]
+        )
+        if multiline_mode:
+            hints_wrap = u'<div class="{0}">{1}</div>'.format(QUESTION_HINT_MULTILINE, hints_wrap)
+        label_wrap = ''
+        if label:
+            label_wrap = u'<div class="{0}">{1}: </div>'.format(QUESTION_HINT_LABEL_STYLE, label)
+
+        # Establish the outer style
+        if correct:
+            style = QUESTION_HINT_CORRECT_STYLE
+        else:
+            style = QUESTION_HINT_INCORRECT_STYLE
+
+        # Ready to go
+        return u'<div class="{0}">{1}{2}</div>'.format(style, label_wrap, hints_wrap)
+
+    def get_extended_hints(self, student_answers, new_cmap):
+        """
+        Pull "extended hint" information out the xml based on the student answers,
+        installing it in the new_map for display.
+        Implemented by subclasses that have extended hints.
+        """
+        pass
 
     def get_hints(self, student_answers, new_cmap, old_cmap):
         """
@@ -252,13 +386,17 @@ class LoncapaResponse(object):
 
         Modifies new_cmap, by adding hints to answer_id entries as appropriate.
         """
-        hintgroup = self.xml.find('hintgroup')
-        if hintgroup is None:
-            return
 
-        # hint specified by function?
-        hintfn = hintgroup.get('hintfn')
-        if hintfn:
+        hintfn = None
+        hint_function_provided = False
+        hintgroup = self.xml.find('hintgroup')
+        if hintgroup is not None:
+            hintfn = hintgroup.get('hintfn')
+            if hintfn is not None:
+                hint_function_provided = True
+
+        if hint_function_provided:
+            # if a hint function has been supplied, it will take precedence
             # Hint is determined by a function defined in the <script> context; evaluate
             # that function to obtain list of hint, hintmode for each answer_id.
 
@@ -298,6 +436,7 @@ class LoncapaResponse(object):
                     code,
                     globals_dict,
                     python_path=self.context['python_path'],
+                    extra_files=self.context['extra_files'],
                     slug=self.id,
                     random_seed=self.context['seed'],
                     unsafely=self.capa_system.can_execute_unsafe_code(),
@@ -312,6 +451,7 @@ class LoncapaResponse(object):
             new_cmap.set_dict(globals_dict['new_cmap_dict'])
             return
 
+        # no hint function provided
         # hint specified by conditions and text dependent on conditions (a-la Loncapa design)
         # see http://help.loncapa.org/cgi-bin/fom?file=291
         #
@@ -329,7 +469,8 @@ class LoncapaResponse(object):
         # </formularesponse>
 
         if (self.hint_tag is not None
-            and hintgroup.find(self.hint_tag) is not None
+                and hintgroup is not None
+                and hintgroup.find(self.hint_tag) is not None
                 and hasattr(self, 'check_hint_condition')):
 
             rephints = hintgroup.findall(self.hint_tag)
@@ -346,6 +487,9 @@ class LoncapaResponse(object):
                     aid = self.answer_ids[-1]
                     new_cmap.set_hint_and_mode(aid, hint_text, hintmode)
             log.debug('after hint: new_cmap = %s', new_cmap)
+        else:
+            # If no other hint form matches, try extended hints.
+            self.get_extended_hints(student_answers, new_cmap)
 
     @abc.abstractmethod
     def get_score(self, student_answers):
@@ -398,7 +542,7 @@ class LoncapaResponse(object):
 
         # If we can't do that, create the <div> and set the message
         # as the text of the <div>
-        except:
+        except Exception:  # pylint: disable=broad-except
             response_msg_div = etree.Element('div')
             response_msg_div.text = str(response_msg)
 
@@ -407,8 +551,22 @@ class LoncapaResponse(object):
 
         return response_msg_div
 
+    # These accessor functions allow polymorphic checking of response
+    # objects without having to call hasattr() directly.
+    def has_mask(self):
+        """True if the response has masking."""
+        return hasattr(self, '_has_mask')
+
+    def has_shuffle(self):
+        """True if the response has a shuffle transformation."""
+        return hasattr(self, '_has_shuffle')
+
+    def has_answerpool(self):
+        """True if the response has an answer-pool transformation."""
+        return hasattr(self, '_has_answerpool')
 
 #-----------------------------------------------------------------------------
+
 
 @registry.register
 class JavascriptResponse(LoncapaResponse):
@@ -417,12 +575,12 @@ class JavascriptResponse(LoncapaResponse):
     Javascript using Node.js.
     """
 
+    human_name = _('JavaScript Input')
     tags = ['javascriptresponse']
     max_inputfields = 1
     allowed_inputfields = ['javascriptinput']
 
     def setup_response(self):
-
         # Sets up generator, grader, display, and their dependencies.
         self.parse_xml()
 
@@ -523,7 +681,9 @@ class JavascriptResponse(LoncapaResponse):
         # Node.js code is un-sandboxed. If the LoncapaSystem says we aren't
         # allowed to run unsafe code, then stop now.
         if not self.capa_system.can_execute_unsafe_code():
-            raise LoncapaProblemError("Execution of unsafe Javascript code is not allowed.")
+            _ = self.capa_system.i18n.ugettext
+            msg = _("Execution of unsafe Javascript code is not allowed.")
+            raise LoncapaProblemError(msg)
 
         subprocess_args = ["node"]
         subprocess_args.extend(args)
@@ -659,21 +819,33 @@ class ChoiceResponse(LoncapaResponse):
     and it'd be nice to change this at some point.
 
     """
-
+    human_name = _('Checkboxes')
     tags = ['choiceresponse']
     max_inputfields = 1
     allowed_inputfields = ['checkboxgroup', 'radiogroup']
     correct_choices = None
+    multi_device_support = True
 
     def setup_response(self):
-
         self.assign_choice_names()
 
-        correct_xml = self.xml.xpath('//*[@id=$id]//choice[@correct="true"]',
-                                     id=self.xml.get('id'))
+        correct_xml = self.xml.xpath(
+            '//*[@id=$id]//choice[@correct="true"]',
+            id=self.xml.get('id')
+        )
 
-        self.correct_choices = set([choice.get(
-            'name') for choice in correct_xml])
+        self.correct_choices = set([
+            choice.get('name') for choice in correct_xml
+        ])
+
+        incorrect_xml = self.xml.xpath(
+            '//*[@id=$id]//choice[@correct="false"]',
+            id=self.xml.get('id')
+        )
+
+        self.incorrect_choices = set([
+            choice.get('name') for choice in incorrect_xml
+        ])
 
     def assign_choice_names(self):
         """
@@ -683,15 +855,86 @@ class ChoiceResponse(LoncapaResponse):
         for index, choice in enumerate(self.xml.xpath('//*[@id=$id]//choice',
                                                       id=self.xml.get('id'))):
             choice.set("name", "choice_" + str(index))
+            # If a choice does not have an id, assign 'A' 'B', .. used by CompoundHint
+            if not choice.get('id'):
+                choice.set("id", chr(ord("A") + index))
 
-    def get_score(self, student_answers):
+    def grade_via_every_decision_counts(self, **kwargs):
+        """
+        Calculates partial credit on the Every Decision Counts scheme.
+        For each correctly selected or correctly blank choice, score 1 point.
+        Divide by total number of choices.
+        Arguments:
+            all_choices, the full set of checkboxes
+            student_answer, what the student actually chose
+            student_non_answers, what the student didn't choose
+        Returns a CorrectMap.
+        """
 
-        student_answer = student_answers.get(self.answer_id, [])
+        all_choices = kwargs['all_choices']
+        student_answer = kwargs['student_answer']
+        student_non_answers = kwargs['student_non_answers']
 
-        if not isinstance(student_answer, list):
-            student_answer = [student_answer]
+        edc_max_grade = len(all_choices)
+        edc_current_grade = 0
 
-        student_answer = set(student_answer)
+        good_answers = sum([1 for answer in student_answer if answer in self.correct_choices])
+        good_non_answers = sum([1 for blank in student_non_answers if blank in self.incorrect_choices])
+        edc_current_grade = good_answers + good_non_answers
+
+        return_grade = round(self.get_max_score() * float(edc_current_grade) / float(edc_max_grade), 2)
+
+        if edc_current_grade == edc_max_grade:
+            return CorrectMap(self.answer_id, correctness='correct')
+        elif edc_current_grade > 0:
+            return CorrectMap(self.answer_id, correctness='partially-correct', npoints=return_grade)
+        else:
+            return CorrectMap(self.answer_id, correctness='incorrect', npoints=0)
+
+    def grade_via_halves(self, **kwargs):
+        """
+        Calculates partial credit on the Halves scheme.
+        If no errors, full credit.
+        If one error, half credit as long as there are 3+ choices
+        If two errors, 1/4 credit as long as there are 5+ choices
+        (If not enough choices, no credit.)
+        Arguments:
+            all_choices, the full set of checkboxes
+            student_answer, what the student actually chose
+            student_non_answers, what the student didn't choose
+        Returns a CorrectMap
+        """
+
+        all_choices = kwargs['all_choices']
+        student_answer = kwargs['student_answer']
+        student_non_answers = kwargs['student_non_answers']
+
+        halves_error_count = 0
+
+        incorrect_answers = sum([1 for answer in student_answer if answer in self.incorrect_choices])
+        missed_answers = sum([1 for blank in student_non_answers if blank in self.correct_choices])
+        halves_error_count = incorrect_answers + missed_answers
+
+        if halves_error_count == 0:
+            return_grade = self.get_max_score()
+            return CorrectMap(self.answer_id, correctness='correct', npoints=return_grade)
+        elif halves_error_count == 1 and len(all_choices) > 2:
+            return_grade = round(self.get_max_score() / 2.0, 2)
+            return CorrectMap(self.answer_id, correctness='partially-correct', npoints=return_grade)
+        elif halves_error_count == 2 and len(all_choices) > 4:
+            return_grade = round(self.get_max_score() / 4.0, 2)
+            return CorrectMap(self.answer_id, correctness='partially-correct', npoints=return_grade)
+        else:
+            return CorrectMap(self.answer_id, 'incorrect')
+
+    def grade_without_partial_credit(self, **kwargs):
+        """
+        Standard grading for checkbox problems.
+        100% credit if all choices are correct; 0% otherwise
+        Arguments: student_answer, which is the items the student actually chose
+        """
+
+        student_answer = kwargs['student_answer']
 
         required_selected = len(self.correct_choices - student_answer) == 0
         no_extra_selected = len(student_answer - self.correct_choices) == 0
@@ -703,22 +946,220 @@ class ChoiceResponse(LoncapaResponse):
         else:
             return CorrectMap(self.answer_id, 'incorrect')
 
+    def get_score(self, student_answers):
+
+        # Setting up answer sets:
+        #  all_choices: the full set of checkboxes
+        #  student_answer: what the student actually chose (note no "s")
+        #  student_non_answers: what they didn't choose
+        #  self.correct_choices: boxes that should be checked
+        #  self.incorrect_choices: boxes that should NOT be checked
+
+        all_choices = self.correct_choices.union(self.incorrect_choices)
+
+        student_answer = student_answers.get(self.answer_id, [])
+
+        if not isinstance(student_answer, list):
+            student_answer = [student_answer]
+
+        # When a student leaves all the boxes unmarked, edX throws an error.
+        # This line checks for blank answers so that we can throw "false".
+        # This is not ideal. "None apply" should be a valid choice.
+        # Sadly, this is not the place where we can fix that problem.
+        empty_answer = student_answer == []
+
+        if empty_answer:
+            return CorrectMap(self.answer_id, 'incorrect')
+
+        student_answer = set(student_answer)
+
+        student_non_answers = all_choices - student_answer
+
+        # No partial credit? Get grade right now.
+        if not self.has_partial_credit:
+            return self.grade_without_partial_credit(student_answer=student_answer)
+
+        # This below checks to see whether we're using an alternate grading scheme.
+        #  Set partial_credit="false" (or remove it) to require an exact answer for any credit.
+        #  Set partial_credit="EDC" to count each choice for equal points (Every Decision Counts).
+        #  Set partial_credit="halves" to take half credit off for each error.
+
+        # Translators: 'partial_credit' and the items in the 'graders' object
+        # are attribute names or values and should not be translated.
+        graders = {
+            'edc': self.grade_via_every_decision_counts,
+            'halves': self.grade_via_halves,
+            'false': self.grade_without_partial_credit
+        }
+
+        # Only one type of credit at a time.
+        if len(self.credit_type) > 1:
+            raise LoncapaProblemError('Only one type of partial credit is allowed for Checkbox problems.')
+
+        # Make sure we're using an approved style.
+        if self.credit_type[0] not in graders:
+            raise LoncapaProblemError('partial_credit attribute should be one of: ' + ','.join(graders))
+
+        # Run the appropriate grader.
+        return graders[self.credit_type[0]](
+            all_choices=all_choices,
+            student_answer=student_answer,
+            student_non_answers=student_non_answers
+        )
+
     def get_answers(self):
         return {self.answer_id: list(self.correct_choices)}
+
+    def get_extended_hints(self, student_answers, new_cmap):
+        """
+        Extract compound and extended hint information from the xml based on the student_answers.
+        The hint information goes into the msg= in new_cmap for display.
+        Each choice in the checkboxgroup can have 2 extended hints, matching the
+        case that the student has or has not selected that choice:
+          <checkboxgroup label="Select the best snack">
+             <choice correct="true">Donut
+               <choicehint selected="tRuE">A Hint!</choicehint>
+               <choicehint selected="false">Another hint!</choicehint>
+             </choice>
+        """
+        # Tricky: student_answers may be *empty* here. That is the representation that
+        # no checkboxes were selected. For typical responsetypes, you look at
+        # student_answers[self.answer_id], but that does not work here.
+
+        # Compound hints are a special thing just for checkboxgroup, trying
+        # them first before the regular extended hints.
+        if self.get_compound_hints(new_cmap, student_answers):
+            return
+
+        # Look at all the choices - each can generate some hint text
+        choices = self.xml.xpath('//checkboxgroup[@id=$id]/choice', id=self.answer_id)
+        hint_log = []
+        label = None
+        label_count = 0
+        choice_all = []
+        # Tricky: in the case that the student selects nothing, there is simply
+        # no entry in student_answers, rather than an entry with the empty list value.
+        # That explains the following line.
+        student_choice_list = student_answers.get(self.answer_id, [])
+        # We build up several hints in hint_divs, then wrap it once at the end.
+        for choice in choices:
+            name = choice.get('name')  # generated name, e.g. choice_2
+            choice_all.append(name)
+            selected = name in student_choice_list  # looking for 'true' vs. 'false'
+            if selected:
+                selector = 'true'
+            else:
+                selector = 'false'
+            # We find the matching <choicehint> in python vs xpath so we can be case-insensitive
+            hint_nodes = choice.findall('./choicehint')
+            for hint_node in hint_nodes:
+                if hint_node.get('selected', '').lower() == selector:
+                    text = get_inner_html_from_xpath(hint_node)
+                    if hint_node.get('label') is not None:  # tricky: label '' vs None is significant
+                        label = hint_node.get('label')
+                        label_count += 1
+                    if text:
+                        hint_log.append({'text': text, 'trigger': [{'choice': name, 'selected': selected}]})
+
+        if hint_log:
+            # Complication: if there is only a single label specified, we use it.
+            # However if there are multiple, we use none.
+            if label_count > 1:
+                label = None
+            new_cmap[self.answer_id]['msg'] += self.make_hint_div(
+                None,
+                new_cmap[self.answer_id]['correctness'] == 'correct',
+                student_choice_list,
+                self.tags[0],
+                label,
+                hint_log,
+                multiline_mode=True,  # the one case where we do this
+                log_extra={'choice_all': choice_all}  # checkbox specific logging
+            )
+
+    def get_compound_hints(self, new_cmap, student_answers):
+        """
+        Compound hints are a type of extended hint specific to checkboxgroup with the
+        <compoundhint value="A C"> meaning choices A and C were selected.
+        Checks for a matching compound hint, installing it in new_cmap.
+        Returns True if compound condition hints were matched.
+        """
+        compound_hint_matched = False
+        if self.answer_id in student_answers:
+            # First create a set of the student's selected ids
+            student_set = set()
+            names = []
+            for student_answer in student_answers[self.answer_id]:
+                choice_list = self.xml.xpath('//checkboxgroup[@id=$id]/choice[@name=$name]',
+                                             id=self.answer_id, name=student_answer)
+                if choice_list:
+                    choice = choice_list[0]
+                    student_set.add(choice.get('id').upper())
+                    names.append(student_answer)
+
+            for compound_hint in self.xml.xpath('//checkboxgroup[@id=$id]/compoundhint', id=self.answer_id):
+                # Selector words are space separated and not case-sensitive
+                selectors = compound_hint.get('value').upper().split()
+                selector_set = set(selectors)
+
+                if selector_set == student_set:
+                    # This is the atypical case where the hint text is in an inner div with its own style.
+                    hint_text = compound_hint.text.strip()
+                    # Compute the choice names just for logging
+                    choices = self.xml.xpath('//checkboxgroup[@id=$id]/choice', id=self.answer_id)
+                    choice_all = [choice.get('name') for choice in choices]
+                    hint_log = [{'text': hint_text, 'trigger': [{'choice': name, 'selected': True} for name in names]}]
+                    new_cmap[self.answer_id]['msg'] += self.make_hint_div(
+                        compound_hint,
+                        new_cmap[self.answer_id]['correctness'] == 'correct',
+                        student_answers[self.answer_id],
+                        self.tags[0],
+                        hint_log=hint_log,
+                        log_extra={'trigger_type': 'compound', 'choice_all': choice_all}
+                    )
+                    compound_hint_matched = True
+                    break
+        return compound_hint_matched
 
 #-----------------------------------------------------------------------------
 
 
 @registry.register
 class MultipleChoiceResponse(LoncapaResponse):
-    # TODO: handle direction and randomize
+    """
+    Multiple Choice Response
+    The shuffle and answer-pool features on this class enable permuting and
+    subsetting the choices shown to the student.
+    Both features enable name "masking":
+    With masking, the regular names of multiplechoice choices
+    choice_0 choice_1 ... are not used. Instead we use random masked names
+    mask_2 mask_0 ... so that a view-source of the names reveals nothing about
+    the original order. We introduce the masked names right at init time, so the
+    whole software stack works with just the one system of naming.
+    The .has_mask() test on a response checks for masking, implemented by a
+    ._has_mask attribute on the response object.
+    The logging functionality in capa_base calls the unmask functions here
+    to translate back to choice_0 name style for recording in the logs, so
+    the logging is in terms of the regular names.
+    """
+    # TODO: randomize
 
+    human_name = _('Multiple Choice')
     tags = ['multiplechoiceresponse']
     max_inputfields = 1
     allowed_inputfields = ['choicegroup']
     correct_choices = None
+    multi_device_support = True
 
     def setup_response(self):
+        """
+        Collects information from the XML for later use.
+
+        correct_choices is a list of the correct choices.
+        partial_choices is a list of the partially-correct choices.
+        partial_values is a list of the scores that go with those
+          choices, defaulting to 0.5 if no value is specified.
+        """
         # call secondary setup for MultipleChoice questions, to set name
         # attributes
         self.mc_setup_response()
@@ -732,45 +1173,383 @@ class MultipleChoiceResponse(LoncapaResponse):
         self.correct_choices = [
             contextualize_text(choice.get('name'), self.context)
             for choice in cxml
-            if contextualize_text(choice.get('correct'), self.context) == "true"
+            if contextualize_text(choice.get('correct'), self.context).upper() == "TRUE"
         ]
+
+        if self.has_partial_credit:
+            self.partial_choices = [
+                contextualize_text(choice.get('name'), self.context)
+                for choice in cxml
+                if contextualize_text(choice.get('correct'), self.context).lower() == 'partial'
+            ]
+            self.partial_values = [
+                float(choice.get('point_value', default='0.5'))    # Default partial credit: 50%
+                for choice in cxml
+                if contextualize_text(choice.get('correct'), self.context).lower() == 'partial'
+            ]
+
+    def get_extended_hints(self, student_answer_dict, new_cmap):
+        """
+        Extract any hints in a <choicegroup> matching the student's answers
+        <choicegroup label="What is your favorite color?" type="MultipleChoice">
+          <choice correct="false">Red
+            <choicehint>No, Blue!</choicehint>
+          </choice>
+          ...
+        Any hint text is installed in the new_cmap.
+        """
+        if self.answer_id in student_answer_dict:
+            student_answer = student_answer_dict[self.answer_id]
+
+            # Warning: mostly student_answer is a string, but sometimes it is a list of strings.
+            if isinstance(student_answer, list):
+                student_answer = student_answer[0]
+
+            # Find the named choice used by the student. Silently ignore a non-matching
+            # choice name.
+            choice = self.xml.find('./choicegroup[@id="{0}"]/choice[@name="{1}"]'.format(self.answer_id,
+                                                                                         student_answer))
+            if choice is not None:
+                hint_node = choice.find('./choicehint')
+                new_cmap[self.answer_id]['msg'] += self.make_hint_div(
+                    hint_node,
+                    choice.get('correct').upper() == 'TRUE',
+                    [student_answer],
+                    self.tags[0]
+                )
 
     def mc_setup_response(self):
         """
         Initialize name attributes in <choice> stanzas in the <choicegroup> in this response.
+        Masks the choice names if applicable.
         """
         i = 0
         for response in self.xml.xpath("choicegroup"):
+            # Is Masking enabled? -- check for shuffle or answer-pool features
+            # Masking (self._has_mask) is off, to be re-enabled with a future PR.
             rtype = response.get('type')
             if rtype not in ["MultipleChoice"]:
                 # force choicegroup to be MultipleChoice if not valid
                 response.set("type", "MultipleChoice")
             for choice in list(response):
-                if choice.get("name") is None:
-                    choice.set("name", "choice_" + str(i))
-                    i += 1
+                # The regular, non-masked name:
+                if choice.get("name") is not None:
+                    name = "choice_" + choice.get("name")
                 else:
-                    choice.set("name", "choice_" + choice.get("name"))
+                    name = "choice_" + str(i)
+                    i += 1
+                # If using the masked name, e.g. mask_0, save the regular name
+                # to support unmasking later (for the logs).
+                # Masking is currently disabled so this code is commented, as
+                # the variable `mask_ids` is not defined. (the feature appears to not be fully implemented)
+                # The original work for masking was done by Nick Parlante as part of the OLI Hinting feature.
+                # if self.has_mask():
+                #     mask_name = "mask_" + str(mask_ids.pop())
+                #     self._mask_dict[mask_name] = name
+                #     choice.set("name", mask_name)
+                # else:
+                choice.set("name", name)
+
+    def late_transforms(self, problem):
+        """
+        Rearrangements run late in the __init__ process.
+        Cannot do these at response init time, as not enough
+        other stuff exists at that time.
+        """
+        self.do_shuffle(self.xml, problem)
+        self.do_answer_pool(self.xml, problem)
+
+    def grade_via_points(self, **kwargs):
+        """
+        Calculates partial credit based on the Points scheme.
+        Answer choices marked "partial" are given partial credit.
+        Default is 50%; other amounts may be set in point_value attributes.
+        Arguments: student_answers
+        Returns: a CorrectMap
+        """
+
+        student_answers = kwargs['student_answers']
+
+        if (self.answer_id in student_answers
+                and student_answers[self.answer_id] in self.correct_choices):
+            return CorrectMap(self.answer_id, correctness='correct')
+
+        elif (
+                self.answer_id in student_answers
+                and student_answers[self.answer_id] in self.partial_choices
+        ):
+            choice_index = self.partial_choices.index(student_answers[self.answer_id])
+            credit_amount = self.partial_values[choice_index]
+            return CorrectMap(self.answer_id, correctness='partially-correct', npoints=credit_amount)
+        else:
+            return CorrectMap(self.answer_id, 'incorrect')
+
+    def grade_without_partial_credit(self, **kwargs):
+        """
+        Standard grading for multiple-choice problems.
+        100% credit if choices are correct; 0% otherwise
+        Arguments: student_answers
+        Returns: a CorrectMap
+        """
+
+        student_answers = kwargs['student_answers']
+
+        if (self.answer_id in student_answers
+                and student_answers[self.answer_id] in self.correct_choices):
+            return CorrectMap(self.answer_id, correctness='correct')
+        else:
+            return CorrectMap(self.answer_id, 'incorrect')
 
     def get_score(self, student_answers):
         """
         grade student response.
         """
-        # log.debug('%s: student_answers=%s, correct_choices=%s' % (
-        #   unicode(self), student_answers, self.correct_choices))
-        if (self.answer_id in student_answers
-                and student_answers[self.answer_id] in self.correct_choices):
-            return CorrectMap(self.answer_id, 'correct')
-        else:
-            return CorrectMap(self.answer_id, 'incorrect')
+
+        # No partial credit? Grade it right away.
+        if not self.has_partial_credit:
+            return self.grade_without_partial_credit(student_answers=student_answers)
+
+        # This below checks to see whether we're using an alternate grading scheme.
+        #  Set partial_credit="false" (or remove it) to require an exact answer for any credit.
+        #  Set partial_credit="points" to set specific point values for specific choices.
+
+        # Translators: 'partial_credit' and the items in the 'graders' object
+        # are attribute names or values and should not be translated.
+        graders = {
+            'points': self.grade_via_points,
+            'false': self.grade_without_partial_credit
+        }
+
+        # Only one type of credit at a time.
+        if len(self.credit_type) > 1:
+            raise LoncapaProblemError('Only one type of partial credit is allowed for Multiple Choice problems.')
+
+        # Make sure we're using an approved style.
+        if self.credit_type[0] not in graders:
+            raise LoncapaProblemError('partial_credit attribute should be one of: ' + ','.join(graders))
+
+        # Run the appropriate grader.
+        return graders[self.credit_type[0]](
+            student_answers=student_answers
+        )
 
     def get_answers(self):
         return {self.answer_id: self.correct_choices}
+
+    def unmask_name(self, name):
+        """
+        Given a masked name, e.g. mask_2, returns the regular name, e.g. choice_0.
+        Fails with LoncapaProblemError if called on a response that is not masking.
+        """
+        # if not self.has_mask():
+        #     _ = self.capa_system.i18n.ugettext
+        #     # Translators: 'unmask_name' is a method name and should not be translated.
+        #     msg = "unmask_name called on response that is not masked"
+        #     raise LoncapaProblemError(msg)
+        # return self._mask_dict[name]  # TODO: this is not defined
+        raise NotImplementedError()
+
+    def unmask_order(self):
+        """
+        Returns a list of the choice names in the order displayed to the user,
+        using the regular (non-masked) names.
+        """
+        # With masking disabled, this computation remains interesting to see
+        # the displayed order, even though there is no unmasking.
+        choices = self.xml.xpath('choicegroup/choice')
+        return [choice.get("name") for choice in choices]
+
+    def do_shuffle(self, tree, problem):
+        """
+        For a choicegroup with shuffle="true", shuffles the choices in-place in the given tree
+        based on the seed. Otherwise does nothing.
+        Raises LoncapaProblemError if both shuffle and answer-pool are active:
+        a problem should use one or the other but not both.
+        Does nothing if the tree has already been processed.
+        """
+        # The tree is already pared down to this <multichoiceresponse> so this query just
+        # gets the child choicegroup (i.e. no leading //)
+        choicegroups = tree.xpath('choicegroup[@shuffle="true"]')
+        if choicegroups:
+            choicegroup = choicegroups[0]
+            if choicegroup.get('answer-pool') is not None:
+                _ = self.capa_system.i18n.ugettext
+                # Translators: 'shuffle' and 'answer-pool' are attribute names and should not be translated.
+                msg = _("Do not use shuffle and answer-pool at the same time")
+                raise LoncapaProblemError(msg)
+            # Note in the response that shuffling is done.
+            # Both to avoid double-processing, and to feed the logs.
+            if self.has_shuffle():
+                return
+            self._has_shuffle = True  # pylint: disable=attribute-defined-outside-init
+            # Move elements from tree to list for shuffling, then put them back.
+            ordering = list(choicegroup.getchildren())
+            for choice in ordering:
+                choicegroup.remove(choice)
+            ordering = self.shuffle_choices(ordering, self.get_rng(problem))
+            for choice in ordering:
+                choicegroup.append(choice)
+
+    def shuffle_choices(self, choices, rng):
+        """
+        Returns a list of choice nodes with the shuffling done,
+        using the provided random number generator.
+        Choices with 'fixed'='true' are held back from the shuffle.
+        """
+        # Separate out a list of the stuff to be shuffled
+        # vs. the head/tail of fixed==true choices to be held back from the shuffle.
+        # Rare corner case: A fixed==true choice "island" in the middle is lumped in
+        # with the tail group of fixed choices.
+        # Slightly tricky one-pass implementation using a state machine
+        head = []
+        middle = []  # only this one gets shuffled
+        tail = []
+        at_head = True
+        for choice in choices:
+            if at_head and choice.get('fixed') == 'true':
+                head.append(choice)
+                continue
+            at_head = False
+            if choice.get('fixed') == 'true':
+                tail.append(choice)
+            else:
+                middle.append(choice)
+        rng.shuffle(middle)
+        return head + middle + tail
+
+    def get_rng(self, problem):
+        """
+        Get the random number generator to be shared by responses
+        of the problem, creating it on the problem if needed.
+        """
+        # Multiple questions in a problem share one random number generator (rng) object
+        # stored on the problem. If each question got its own rng, the structure of multiple
+        # questions within a problem could appear predictable to the student,
+        # e.g. (c) keeps being the correct choice. This is due to the seed being
+        # defined at the problem level, so the multiple rng's would be seeded the same.
+        # The name _shared_rng begins with an _ to suggest that it is not a facility
+        # for general use.
+        # pylint: disable=protected-access
+        if not hasattr(problem, '_shared_rng'):
+            problem._shared_rng = random.Random(self.context['seed'])
+        return problem._shared_rng
+
+    def do_answer_pool(self, tree, problem):
+        """
+        Implements the answer-pool subsetting operation in-place on the tree.
+        Allows for problem questions with a pool of answers, from which answer options shown to the student
+        and randomly selected so that there is always 1 correct answer and n-1 incorrect answers,
+        where the author specifies n as the value of the attribute "answer-pool" within <choicegroup>
+
+        The <choicegroup> tag must have an attribute 'answer-pool' giving the desired
+        pool size. If that attribute is zero or not present, no operation is performed.
+        Calling this a second time does nothing.
+        Raises LoncapaProblemError if the answer-pool value is not an integer,
+        or if the number of correct or incorrect choices available is zero.
+        """
+        choicegroups = tree.xpath("choicegroup[@answer-pool]")
+        if choicegroups:
+            choicegroup = choicegroups[0]
+            num_str = choicegroup.get('answer-pool')
+            if num_str == '0':
+                return
+            try:
+                num_choices = int(num_str)
+            except ValueError:
+                _ = self.capa_system.i18n.ugettext
+                # Translators: 'answer-pool' is an attribute name and should not be translated.
+                msg = _("answer-pool value should be an integer")
+                raise LoncapaProblemError(msg)
+
+            # Note in the response that answerpool is done.
+            # Both to avoid double-processing, and to feed the logs.
+            if self.has_answerpool():
+                return
+            self._has_answerpool = True  # pylint: disable=attribute-defined-outside-init
+
+            choices_list = list(choicegroup.getchildren())
+
+            # Remove all choices in the choices_list (we will add some back in later)
+            for choice in choices_list:
+                choicegroup.remove(choice)
+
+            rng = self.get_rng(problem)  # random number generator to use
+            # Sample from the answer pool to get the subset choices and solution id
+            (solution_id, subset_choices) = self.sample_from_answer_pool(choices_list, rng, num_choices)
+
+            # Add back in randomly selected choices
+            for choice in subset_choices:
+                choicegroup.append(choice)
+
+            # Filter out solutions that don't correspond to the correct answer we selected to show
+            # Note that this means that if the user simply provides a <solution> tag, nothing is filtered
+            solutionset = choicegroup.xpath('../following-sibling::solutionset')
+            if len(solutionset) != 0:
+                solutionset = solutionset[0]
+                solutions = solutionset.xpath('./solution')
+                for solution in solutions:
+                    if solution.get('explanation-id') != solution_id:
+                        solutionset.remove(solution)
+
+    def sample_from_answer_pool(self, choices, rng, num_pool):
+        """
+        Takes in:
+            1. list of choices
+            2. random number generator
+            3. the requested size "answer-pool" number, in effect a max
+
+        Returns a tuple with 2 items:
+            1. the solution_id corresponding with the chosen correct answer
+            2. (subset) list of choice nodes with num-1 incorrect and 1 correct
+
+        Raises an error if the number of correct or incorrect choices is 0.
+        """
+
+        correct_choices = []
+        incorrect_choices = []
+
+        for choice in choices:
+            if choice.get('correct').upper() == 'TRUE':
+                correct_choices.append(choice)
+            else:
+                incorrect_choices.append(choice)
+                # In my small test, capa seems to treat the absence of any correct=
+                # attribute as equivalent to ="false", so that's what we do here.
+
+        # We raise an error if the problem is highly ill-formed.
+        # There must be at least one correct and one incorrect choice.
+        # IDEA: perhaps this sort semantic-lint constraint should be generalized to all multichoice
+        # not just down in this corner when answer-pool is used.
+        # Or perhaps in the overall author workflow, these errors are unhelpful and
+        # should all be removed.
+        if len(correct_choices) < 1 or len(incorrect_choices) < 1:
+            _ = self.capa_system.i18n.ugettext
+            # Translators: 'Choicegroup' is an input type and should not be translated.
+            msg = _("Choicegroup must include at least 1 correct and 1 incorrect choice")
+            raise LoncapaProblemError(msg)
+
+        # Limit the number of incorrect choices to what we actually have
+        num_incorrect = num_pool - 1
+        num_incorrect = min(num_incorrect, len(incorrect_choices))
+
+        # Select the one correct choice
+        index = rng.randint(0, len(correct_choices) - 1)
+        correct_choice = correct_choices[index]
+        solution_id = correct_choice.get('explanation-id')
+
+        # Put together the result, pushing most of the work onto rng.shuffle()
+        subset_choices = [correct_choice]
+        rng.shuffle(incorrect_choices)
+        subset_choices += incorrect_choices[:num_incorrect]
+        rng.shuffle(subset_choices)
+
+        return (solution_id, subset_choices)
 
 
 @registry.register
 class TrueFalseResponse(MultipleChoiceResponse):
 
+    human_name = _('True/False Choice')
     tags = ['truefalseresponse']
 
     def mc_setup_response(self):
@@ -786,9 +1565,11 @@ class TrueFalseResponse(MultipleChoiceResponse):
 
     def get_score(self, student_answers):
         correct = set(self.correct_choices)
-        answers = set(student_answers.get(self.answer_id, []))
+        answers = student_answers.get(self.answer_id, [])
+        if not isinstance(answers, list):
+            answers = [answers]
 
-        if correct == answers:
+        if correct == set(answers):
             return CorrectMap(self.answer_id, 'correct')
 
         return CorrectMap(self.answer_id, 'incorrect')
@@ -799,19 +1580,20 @@ class TrueFalseResponse(MultipleChoiceResponse):
 @registry.register
 class OptionResponse(LoncapaResponse):
     """
-    TODO: handle direction and randomize
+    TODO: handle randomize
     """
 
+    human_name = _('Dropdown')
     tags = ['optionresponse']
     hint_tag = 'optionhint'
     allowed_inputfields = ['optioninput']
     answer_fields = None
+    multi_device_support = True
 
     def setup_response(self):
         self.answer_fields = self.inputfields
 
     def get_score(self, student_answers):
-        # log.debug('%s: student_answers=%s' % (unicode(self),student_answers))
         cmap = CorrectMap()
         amap = self.get_answers()
         for aid in amap:
@@ -819,13 +1601,51 @@ class OptionResponse(LoncapaResponse):
                 cmap.set(aid, 'correct')
             else:
                 cmap.set(aid, 'incorrect')
+            answer_variable = self.get_student_answer_variable_name(student_answers, aid)
+            if answer_variable:
+                cmap.set_property(aid, 'answervariable', answer_variable)
         return cmap
 
     def get_answers(self):
         amap = dict([(af.get('id'), contextualize_text(af.get(
             'correct'), self.context)) for af in self.answer_fields])
-        # log.debug('%s: expected answers=%s' % (unicode(self),amap))
         return amap
+
+    def get_student_answer_variable_name(self, student_answers, aid):
+        """
+        Return student answers variable name if exist in context else None.
+        """
+        if aid in student_answers:
+            for key, val in self.context.iteritems():
+                # convert val into unicode because student answer always be a unicode string
+                # even it is a list, dict etc.
+                if unicode(val) == student_answers[aid]:
+                    return '$' + key
+        return None
+
+    def get_extended_hints(self, student_answers, new_cmap):
+        """
+        Extract optioninput extended hint, e.g.
+        <optioninput>
+          <option correct="True">Donut <optionhint>Of course</optionhint> </option>
+        """
+        answer_id = self.answer_ids[0]  # Note *not* self.answer_id
+        if answer_id in student_answers:
+            student_answer = student_answers[answer_id]
+            # If we run into an old-style optioninput, there is no <option> tag, so this safely does nothing
+            options = self.xml.xpath('//optioninput[@id=$id]/option', id=answer_id)
+            # Extra pass here to ignore whitespace around the answer in the matching
+            options = [option for option in options if option.text.strip() == student_answer]
+            if options:
+                option = options[0]
+                hint_node = option.find('./optionhint')
+                if hint_node is not None:
+                    new_cmap[answer_id]['msg'] += self.make_hint_div(
+                        hint_node,
+                        option.get('correct').upper() == 'TRUE',
+                        [student_answer],
+                        self.tags[0]
+                    )
 
 #-----------------------------------------------------------------------------
 
@@ -837,48 +1657,68 @@ class NumericalResponse(LoncapaResponse):
     to a number (e.g. `4+5/2^2`), and accepts with a tolerance.
     """
 
+    human_name = _('Numerical Input')
     tags = ['numericalresponse']
     hint_tag = 'numericalhint'
     allowed_inputfields = ['textline', 'formulaequationinput']
     required_attributes = ['answer']
     max_inputfields = 1
+    multi_device_support = True
 
     def __init__(self, *args, **kwargs):
         self.correct_answer = ''
         self.tolerance = default_tolerance
+        self.range_tolerance = False
+        self.answer_range = self.inclusion = None
         super(NumericalResponse, self).__init__(*args, **kwargs)
 
     def setup_response(self):
         xml = self.xml
         context = self.context
-        self.correct_answer = contextualize_text(xml.get('answer'), context)
+        answer = xml.get('answer')
 
-        # Find the tolerance
-        tolerance_xml = xml.xpath(
-            '//*[@id=$id]//responseparam[@type="tolerance"]/@default',
-            id=xml.get('id')
-        )
-        if tolerance_xml:  # If it isn't an empty list...
-            self.tolerance = contextualize_text(tolerance_xml[0], context)
+        if answer.startswith(('[', '(')) and answer.endswith((']', ')')):  # range tolerance case
+            self.range_tolerance = True
+            self.inclusion = (
+                True if answer.startswith('[') else False, True if answer.endswith(']') else False
+            )
+            try:
+                self.answer_range = [contextualize_text(x, context) for x in answer[1:-1].split(',')]
+                self.correct_answer = answer[0] + self.answer_range[0] + ', ' + self.answer_range[1] + answer[-1]
+            except Exception:
+                log.debug("Content error--answer '%s' is not a valid range tolerance answer", answer)
+                _ = self.capa_system.i18n.ugettext
+                raise StudentInputError(
+                    _("There was a problem with the staff answer to this problem.")
+                )
+        else:
+            self.correct_answer = contextualize_text(answer, context)
 
-    def get_staff_ans(self):
+            # Find the tolerance
+            tolerance_xml = xml.xpath(
+                '//*[@id=$id]//responseparam[@type="tolerance"]/@default',
+                id=xml.get('id')
+            )
+            if tolerance_xml:  # If it isn't an empty list...
+                self.tolerance = contextualize_text(tolerance_xml[0], context)
+
+    def get_staff_ans(self, answer):
         """
         Given the staff answer as a string, find its float value.
 
         Use `evaluator` for this, but for backward compatability, try the
         built-in method `complex` (which used to be the standard).
         """
-
         try:
-            correct_ans = complex(self.correct_answer)
+            correct_ans = complex(answer)
         except ValueError:
             # When `correct_answer` is not of the form X+Yj, it raises a
             # `ValueError`. Then test if instead it is a math expression.
             # `complex` seems to only generate `ValueErrors`, only catch these.
             try:
-                correct_ans = evaluator({}, {}, self.correct_answer)
+                correct_ans = evaluator({}, {}, answer)
             except Exception:
-                log.debug("Content error--answer '%s' is not a valid number", self.correct_answer)
+                log.debug("Content error--answer '%s' is not a valid number", answer)
                 _ = self.capa_system.i18n.ugettext
                 raise StudentInputError(
                     _("There was a problem with the staff answer to this problem.")
@@ -887,10 +1727,21 @@ class NumericalResponse(LoncapaResponse):
         return correct_ans
 
     def get_score(self, student_answers):
-        """Grade a numeric response"""
-        student_answer = student_answers[self.answer_id]
+        """
+        Grade a numeric response.
+        """
+        if self.answer_id not in student_answers:
+            return CorrectMap(self.answer_id, 'incorrect')
 
-        correct_float = self.get_staff_ans()
+        # Make sure we're using an approved partial credit style.
+        # Currently implemented: 'close' and 'list'
+        if self.has_partial_credit:
+            graders = ['list', 'close']
+            for style in self.credit_type:
+                if style not in graders:
+                    raise LoncapaProblemError('partial_credit attribute should be one of: ' + ','.join(graders))
+
+        student_answer = student_answers[self.answer_id]
 
         _ = self.capa_system.i18n.ugettext
         general_exception = StudentInputError(
@@ -903,7 +1754,9 @@ class NumericalResponse(LoncapaResponse):
             student_float = evaluator({}, {}, student_answer)
         except UndefinedVariable as undef_var:
             raise StudentInputError(
-                _(u"You may not use variables ({bad_variables}) in numerical problems.").format(bad_variables=undef_var.message)
+                _(u"You may not use variables ({bad_variables}) in numerical problems.").format(
+                    bad_variables=undef_var.message,
+                )
             )
         except ValueError as val_err:
             if 'factorial' in val_err.message:
@@ -925,13 +1778,119 @@ class NumericalResponse(LoncapaResponse):
             raise general_exception
         # End `evaluator` block -- we figured out the student's answer!
 
-        correct = compare_with_tolerance(
-            student_float, correct_float, self.tolerance
-        )
-        if correct:
-            return CorrectMap(self.answer_id, 'correct')
+        tree = self.xml
+
+        # What multiple of the tolerance is worth partial credit?
+        has_partial_range = tree.xpath('responseparam[@partial_range]')
+        if has_partial_range:
+            partial_range = float(has_partial_range[0].get('partial_range', default='2'))
         else:
-            return CorrectMap(self.answer_id, 'incorrect')
+            partial_range = 2
+
+        # Take in alternative answers that are worth partial credit.
+        has_partial_answers = tree.xpath('responseparam[@partial_answers]')
+        if has_partial_answers:
+            partial_answers = has_partial_answers[0].get('partial_answers').split(',')
+            for index, word in enumerate(partial_answers):
+                partial_answers[index] = word.strip()
+                partial_answers[index] = self.get_staff_ans(partial_answers[index])
+
+        else:
+            partial_answers = False
+
+        partial_score = 0.5
+        is_correct = 'incorrect'
+
+        if self.range_tolerance:
+            if isinstance(student_float, complex):
+                raise StudentInputError(_(u"You may not use complex numbers in range tolerance problems"))
+            boundaries = []
+            for inclusion, answer in zip(self.inclusion, self.answer_range):
+                boundary = self.get_staff_ans(answer)
+                if boundary.imag != 0:
+                    raise StudentInputError(
+                        # Translators: This is an error message for a math problem. If the instructor provided a
+                        # boundary (end limit) for a variable that is a complex number (a + bi), this message displays.
+                        _("There was a problem with the staff answer to this problem: complex boundary.")
+                    )
+                if isnan(boundary):
+                    raise StudentInputError(
+                        # Translators: This is an error message for a math problem. If the instructor did not
+                        # provide a boundary (end limit) for a variable, this message displays.
+                        _("There was a problem with the staff answer to this problem: empty boundary.")
+                    )
+                boundaries.append(boundary.real)
+                if compare_with_tolerance(
+                        student_float,
+                        boundary,
+                        tolerance=float_info.epsilon,
+                        relative_tolerance=True
+                ):
+                    is_correct = 'correct' if inclusion else 'incorrect'
+                    break
+            else:
+                if boundaries[0] < student_float < boundaries[1]:
+                    is_correct = 'correct'
+                else:
+                    if self.has_partial_credit is False:
+                        pass
+                    elif 'close' in self.credit_type:
+                        # Partial credit: 50% if the student is outside the specified boundaries,
+                        # but within an extended set of boundaries.
+
+                        extended_boundaries = []
+                        boundary_range = boundaries[1] - boundaries[0]
+                        extended_boundaries.append(boundaries[0] - partial_range * boundary_range)
+                        extended_boundaries.append(boundaries[1] + partial_range * boundary_range)
+                        if extended_boundaries[0] < student_float < extended_boundaries[1]:
+                            is_correct = 'partially-correct'
+
+        else:
+            correct_float = self.get_staff_ans(self.correct_answer)
+
+            # Partial credit is available in three cases:
+            #  If the student answer is within expanded tolerance of the actual answer,
+            #  the student gets 50% credit. (Currently set as the default.)
+            #  Set via partial_credit="close" in the numericalresponse tag.
+            #
+            #  If the student answer is within regular tolerance of an alternative answer,
+            #  the student gets 50% credit. (Same default.)
+            #  Set via partial_credit="list"
+            #
+            #  If the student answer is within expanded tolerance of an alternative answer,
+            #  the student gets 25%. (We take the 50% and square it, at the moment.)
+            #  Set via partial_credit="list,close" or "close, list" or the like.
+
+            if str(self.tolerance).endswith('%'):
+                expanded_tolerance = str(partial_range * float(str(self.tolerance)[:-1])) + '%'
+            else:
+                expanded_tolerance = partial_range * float(self.tolerance)
+
+            if compare_with_tolerance(student_float, correct_float, self.tolerance):
+                is_correct = 'correct'
+            elif self.has_partial_credit is False:
+                pass
+            elif 'list' in self.credit_type:
+                for value in partial_answers:
+                    if compare_with_tolerance(student_float, value, self.tolerance):
+                        is_correct = 'partially-correct'
+                        break
+                    elif 'close' in self.credit_type:
+                        if compare_with_tolerance(student_float, correct_float, expanded_tolerance):
+                            is_correct = 'partially-correct'
+                            break
+                        elif compare_with_tolerance(student_float, value, expanded_tolerance):
+                            is_correct = 'partially-correct'
+                            partial_score = partial_score * partial_score
+                            break
+            elif 'close' in self.credit_type:
+                if compare_with_tolerance(student_float, correct_float, expanded_tolerance):
+                    is_correct = 'partially-correct'
+
+        if is_correct == 'partially-correct':
+            return CorrectMap(self.answer_id, is_correct, npoints=partial_score)
+        else:
+            return CorrectMap(self.answer_id, is_correct)
 
     def compare_answer(self, ans1, ans2):
         """
@@ -957,6 +1916,24 @@ class NumericalResponse(LoncapaResponse):
     def get_answers(self):
         return {self.answer_id: self.correct_answer}
 
+    def get_extended_hints(self, student_answers, new_cmap):
+        """
+        Extract numericalresponse extended hint, e.g.
+          <correcthint>Yes, 1+1 IS 2<correcthint>
+        """
+        if self.answer_id in student_answers:
+            if new_cmap.cmap[self.answer_id]['correctness'] == 'correct':  # if the grader liked the student's answer
+                # Note: using self.id here, not the more typical self.answer_id
+                hints = self.xml.xpath('//numericalresponse[@id=$id]/correcthint', id=self.id)
+                if hints:
+                    hint_node = hints[0]
+                    new_cmap[self.answer_id]['msg'] += self.make_hint_div(
+                        hint_node,
+                        True,
+                        [student_answers[self.answer_id]],
+                        self.tags[0]
+                    )
+
 #-----------------------------------------------------------------------------
 
 
@@ -974,8 +1951,8 @@ class StringResponse(LoncapaResponse):
         </stringresponse >
 
         <stringresponse answer="a1" type="ci regexp">
-            <additional_answer>\d5</additional_answer>
-            <additional_answer>a3</additional_answer>
+            <additional_answer>d5</additional_answer>
+            <additional_answer answer="a3"><correcthint>a hint - new format</correcthint></additional_answer>
             <textline size="20"/>
             <hintgroup>
                 <stringhint answer="a0" type="ci" name="ha0" />
@@ -993,12 +1970,14 @@ class StringResponse(LoncapaResponse):
             </hintgroup>
         </stringresponse>
     """
+    human_name = _('Text Input')
     tags = ['stringresponse']
     hint_tag = 'stringhint'
     allowed_inputfields = ['textline']
     required_attributes = ['answer']
     max_inputfields = 1
     correct_answer = []
+    multi_device_support = True
 
     def setup_response_backward(self):
         self.correct_answer = [
@@ -1006,10 +1985,12 @@ class StringResponse(LoncapaResponse):
         ]
 
     def setup_response(self):
-
         self.backward = '_or_' in self.xml.get('answer').lower()
-        self.regexp = 'regexp' in self.xml.get('type').lower().split(' ')
-        self.case_insensitive = 'ci' in self.xml.get('type').lower().split(' ')
+        self.regexp = False
+        self.case_insensitive = False
+        if self.xml.get('type') is not None:
+            self.regexp = 'regexp' in self.xml.get('type').lower().split(' ')
+            self.case_insensitive = 'ci' in self.xml.get('type').lower().split(' ')
 
         # backward compatibility, can be removed in future, it is up to @Lyla Fisher.
         if self.backward:
@@ -1017,23 +1998,122 @@ class StringResponse(LoncapaResponse):
             return
         # end of backward compatibility
 
-        correct_answers = [self.xml.get('answer')] + [el.text for el in self.xml.findall('additional_answer')]
+        # XML compatibility note: in 2015, additional_answer switched to having a 'answer' attribute.
+        # See make_xml_compatible in capa_problem which translates the old format.
+        correct_answers = (
+            [self.xml.get('answer')] +
+            [element.get('answer') for element in self.xml.findall('additional_answer')]
+        )
         self.correct_answer = [contextualize_text(answer, self.context).strip() for answer in correct_answers]
-
-        # remove additional_answer from xml, otherwise they will be displayed
-        for el in self.xml.findall('additional_answer'):
-            self.xml.remove(el)
 
     def get_score(self, student_answers):
         """Grade a string response """
-        student_answer = student_answers[self.answer_id].strip()
-        correct = self.check_string(self.correct_answer, student_answer)
+        if self.answer_id not in student_answers:
+            correct = False
+        else:
+            student_answer = student_answers[self.answer_id].strip()
+            correct = self.check_string(self.correct_answer, student_answer)
         return CorrectMap(self.answer_id, 'correct' if correct else 'incorrect')
 
     def check_string_backward(self, expected, given):
         if self.case_insensitive:
             return given.lower() in [i.lower() for i in expected]
         return given in expected
+
+    def get_extended_hints(self, student_answers, new_cmap):
+        """
+        Find and install extended hints in new_cmap depending on the student answers.
+        StringResponse is probably the most complicated form we have.
+        The forms show below match in the order given, and the first matching one stops the matching.
+        <stringresponse answer="A" type="ci">
+          <correcthint>hint1</correcthint>                         <!-- hint for correct answer -->
+          <additional_answer answer="B">hint2</additional_answer>  <!-- additional_answer with its own hint -->
+          <stringequalhint answer="C">hint3</stringequalhint>      <!-- string matcher/hint for an incorrect answer -->
+          <regexphint answer="FG+">hint4</regexphint>              <!-- regex matcher/hint for an incorrect answer -->
+          <textline size="20"/>
+        </stringresponse>
+        The "ci" and "regexp" options are inherited from the parent stringresponse as appropriate.
+        """
+        if self.answer_id in student_answers:
+            student_answer = student_answers[self.answer_id]
+            # Note the atypical case of using self.id instead of self.answer_id
+            responses = self.xml.xpath('//stringresponse[@id=$id]', id=self.id)
+            if responses:
+                response = responses[0]
+
+                # First call the existing check_string to see if this is a right answer by that test.
+                # It handles the various "ci" "regexp" cases internally.
+                expected = response.get('answer').strip()
+                if self.check_string([expected], student_answer):
+                    hint_node = response.find('./correcthint')
+                    if hint_node is not None:
+                        new_cmap[self.answer_id]['msg'] += self.make_hint_div(
+                            hint_node,
+                            True,
+                            [student_answer],
+                            self.tags[0]
+                        )
+                    return
+
+                # Then look for additional answer with an answer= attribute
+                for node in response.findall('./additional_answer'):
+                    if self.match_hint_node(node, student_answer, self.regexp, self.case_insensitive):
+                        hint_node = node.find('./correcthint')
+                        new_cmap[self.answer_id]['msg'] += self.make_hint_div(
+                            hint_node,
+                            True,
+                            [student_answer],
+                            self.tags[0]
+                        )
+                        return
+
+                # stringequalhint and regexphint represent wrong answers
+                for hint_node in response.findall('./stringequalhint'):
+                    if self.match_hint_node(hint_node, student_answer, False, self.case_insensitive):
+                        new_cmap[self.answer_id]['msg'] += self.make_hint_div(
+                            hint_node,
+                            False,
+                            [student_answer],
+                            self.tags[0]
+                        )
+                        return
+
+                for hint_node in response.findall('./regexphint'):
+                    if self.match_hint_node(hint_node, student_answer, True, self.case_insensitive):
+                        new_cmap[self.answer_id]['msg'] += self.make_hint_div(
+                            hint_node,
+                            False,
+                            [student_answer],
+                            self.tags[0]
+                        )
+                        return
+
+    def match_hint_node(self, node, given, regex_mode, ci_mode):
+        """
+        Given an xml extended hint node such as additional_answer or regexphint,
+        which contain an answer= attribute, returns True if the given student answer is a match.
+        The boolean arguments regex_mode and ci_mode control how the answer stored in
+        the question is treated for the comparison (analogously to check_string).
+        """
+        answer = node.get('answer', '').strip()
+        if not answer:
+            return False
+
+        if regex_mode:
+            flags = 0
+            if ci_mode:
+                flags = re.IGNORECASE
+            try:
+                # We follow the check_string convention/exception, adding ^ and $
+                regex = re.compile('^' + answer + '$', flags=flags | re.UNICODE)
+                return re.search(regex, given)
+            except Exception:  # pylint: disable=broad-except
+                return False
+
+        if ci_mode:
+            return answer.lower() == given.lower()
+        else:
+            return answer == given
 
     def check_string(self, expected, given):
         """
@@ -1054,6 +2134,7 @@ class StringResponse(LoncapaResponse):
         Note: for old code, which supports _or_ separator, we add some  backward compatibility handling.
         Should be removed soon. When to remove it, is up to Lyla Fisher.
         """
+        _ = self.capa_system.i18n.ugettext
         # backward compatibility, should be removed in future.
         if self.backward:
             return self.check_string_backward(expected, given)
@@ -1062,10 +2143,13 @@ class StringResponse(LoncapaResponse):
         if self.regexp:  # regexp match
             flags = re.IGNORECASE if self.case_insensitive else 0
             try:
-                regexp = re.compile('^'+ '|'.join(expected) + '$', flags=flags | re.UNICODE)
+                regexp = re.compile('^' + '|'.join(expected) + '$', flags=flags | re.UNICODE)
                 result = re.search(regexp, given)
             except Exception as err:
-                msg = '[courseware.capa.responsetypes.stringresponse] error: {}'.format(err.message)
+                msg = u'[courseware.capa.responsetypes.stringresponse] {error}: {message}'.format(
+                    error=_('error'),
+                    message=err.message
+                )
                 log.error(msg, exc_info=True)
                 raise ResponseError(msg)
             return bool(result)
@@ -1074,7 +2158,6 @@ class StringResponse(LoncapaResponse):
                 return given.lower() in [i.lower() for i in expected]
             else:
                 return given in expected
-
 
     def check_hint_condition(self, hxml_set, student_answers):
         given = student_answers[self.answer_id].strip()
@@ -1090,7 +2173,11 @@ class StringResponse(LoncapaResponse):
         return hints_to_show
 
     def get_answers(self):
-        return {self.answer_id: ' <b>or</b> '.join(self.correct_answer)}
+        _ = self.capa_system.i18n.ugettext
+        # Translators: Separator used in StringResponse to display multiple answers.
+        # Example: "Answer: Answer_1 or Answer_2 or Answer_3".
+        separator = u' <b>{}</b> '.format(_('or'))
+        return {self.answer_id: separator.join(self.correct_answer)}
 
 #-----------------------------------------------------------------------------
 
@@ -1102,6 +2189,7 @@ class CustomResponse(LoncapaResponse):
     or in a <script>...</script>
     """
 
+    human_name = _('Custom Evaluated Script')
     tags = ['customresponse']
 
     allowed_inputfields = ['textline', 'textbox', 'crystallography',
@@ -1112,12 +2200,15 @@ class CustomResponse(LoncapaResponse):
     code = None
     expect = None
 
+    # Standard amount for partial credit if not otherwise specified:
+    default_pc = 0.5
+
     def setup_response(self):
         xml = self.xml
 
         # if <customresponse> has an "expect" (or "answer") attribute then save
         # that
-        self.expect = xml.get('expect') or xml.get('answer')
+        self.expect = contextualize_text(xml.get('expect') or xml.get('answer'), self.context)
 
         log.debug('answer_ids=%s', self.answer_ids)
 
@@ -1158,6 +2249,7 @@ class CustomResponse(LoncapaResponse):
                             code,
                             globals_dict,
                             python_path=self.context['python_path'],
+                            extra_files=self.context['extra_files'],
                             slug=self.id,
                             random_seed=self.context['seed'],
                             unsafely=self.capa_system.can_execute_unsafe_code(),
@@ -1185,19 +2277,33 @@ class CustomResponse(LoncapaResponse):
         student_answers is a dict with everything from request.POST, but with the first part
         of each key removed (the string before the first "_").
         """
+        _ = self.capa_system.i18n.ugettext
 
         log.debug('%s: student_answers=%s', unicode(self), student_answers)
 
         # ordered list of answer id's
-        idset = sorted(self.answer_ids)
+        # sort the responses on the bases of the problem's position number
+        # which can be found in the last place in the problem id. Then convert
+        # this number into an int, so that we sort on ints instead of strings
+        idset = sorted(self.answer_ids, key=lambda x: int(x.split("_")[-1]))
         try:
             # ordered list of answers
             submission = [student_answers[k] for k in idset]
         except Exception as err:
-            msg = ('[courseware.capa.responsetypes.customresponse] error getting'
-                   ' student answer from %s' % student_answers)
-            msg += '\n idset = %s, error = %s' % (idset, err)
-            log.error(msg)
+            msg = u"[courseware.capa.responsetypes.customresponse] {message}\n idset = {idset}, error = {err}".format(
+                message=_("error getting student answer from {student_answers}").format(
+                    student_answers=student_answers,
+                ),
+                idset=idset,
+                err=err
+            )
+
+            log.error(
+                "[courseware.capa.responsetypes.customresponse] error getting"
+                " student answer from %s"
+                "\n idset = %s, error = %s",
+                student_answers, idset, err
+            )
             raise Exception(msg)
 
         # global variable in context which holds the Presentation MathML from dynamic math input
@@ -1209,7 +2315,7 @@ class CustomResponse(LoncapaResponse):
             # default to no error message on empty answer (to be consistent with other
             # responsetypes) but allow author to still have the old behavior by setting
             # empty_answer_err attribute
-            msg = ('<span class="inline-error">No answer entered!</span>'
+            msg = (u'<span class="inline-error">{0}</span>'.format(_(u'No answer entered!'))
                    if self.xml.get('empty_answer_err') else '')
             return CorrectMap(idset[0], 'incorrect', msg=msg)
 
@@ -1265,11 +2371,22 @@ class CustomResponse(LoncapaResponse):
         correct = self.context['correct']
         messages = self.context['messages']
         overall_message = self.clean_message_html(self.context['overall_message'])
+        grade_decimals = self.context.get('grade_decimals')
+
         correct_map = CorrectMap()
         correct_map.set_overall_message(overall_message)
 
         for k in range(len(idset)):
-            npoints = self.maxpoints[idset[k]] if correct[k] == 'correct' else 0
+            max_points = self.maxpoints[idset[k]]
+            if grade_decimals:
+                npoints = max_points * grade_decimals[k]
+            else:
+                if correct[k] == 'correct':
+                    npoints = max_points
+                elif correct[k] == 'partially-correct':
+                    npoints = max_points * self.default_pc
+                else:
+                    npoints = 0
             correct_map.set(idset[k], correct[k], msg=messages[k],
                             npoints=npoints)
         return correct_map
@@ -1282,24 +2399,26 @@ class CustomResponse(LoncapaResponse):
                     self.code,
                     self.context,
                     cache=self.capa_system.cache,
+                    python_path=self.context['python_path'],
+                    extra_files=self.context['extra_files'],
                     slug=self.id,
                     random_seed=self.context['seed'],
                     unsafely=self.capa_system.can_execute_unsafe_code(),
                 )
-            except Exception as err:
+            except Exception as err:  # pylint: disable=broad-except
                 self._handle_exec_exception(err)
 
         else:
             # self.code is not a string; it's a function we created earlier.
 
             # this is an interface to the Tutor2 check functions
-            fn = self.code
+            tutor_cfn = self.code
             answer_given = submission[0] if (len(idset) == 1) else submission
             kwnames = self.xml.get("cfn_extra_args", "").split()
             kwargs = {n: self.context.get(n) for n in kwnames}
             log.debug(" submission = %s", submission)
             try:
-                ret = fn(self.expect, answer_given, **kwargs)
+                ret = tutor_cfn(self.expect, answer_given, **kwargs)
             except Exception as err:  # pylint: disable=broad-except
                 self._handle_exec_exception(err)
             log.debug(
@@ -1308,11 +2427,30 @@ class CustomResponse(LoncapaResponse):
             )
             if isinstance(ret, dict):
                 # One kind of dictionary the check function can return has the
-                # form {'ok': BOOLEAN, 'msg': STRING}
+                # form {'ok': BOOLEAN or STRING, 'msg': STRING, 'grade_decimal' (optional): FLOAT (between 0.0 and 1.0)}
+                # 'ok' will control the checkmark, while grade_decimal, if present, will scale
+                # the score the student receives on the response.
                 # If there are multiple inputs, they all get marked
                 # to the same correct/incorrect value
                 if 'ok' in ret:
-                    correct = ['correct' if ret['ok'] else 'incorrect'] * len(idset)
+
+                    # Returning any falsy value or the "false" string for "ok" gives incorrect.
+                    # Returning any string that includes "partial" for "ok" gives partial credit.
+                    # Returning any other truthy value for "ok" gives correct
+
+                    ok_val = str(ret['ok']).lower().strip() if bool(ret['ok']) else 'false'
+
+                    if ok_val == 'false':
+                        correct = 'incorrect'
+                    elif 'partial' in ok_val:
+                        correct = 'partially-correct'
+                    else:
+                        correct = 'correct'
+                    correct = [correct] * len(idset)   # All inputs share the same mark.
+
+                    # old version, no partial credit:
+                    # correct = ['correct' if ret['ok'] else 'incorrect'] * len(idset)
+
                     msg = ret.get('msg', None)
                     msg = self.clean_message_html(msg)
 
@@ -1323,28 +2461,77 @@ class CustomResponse(LoncapaResponse):
                     else:
                         self.context['messages'][0] = msg
 
+                    if 'grade_decimal' in ret:
+                        decimal = float(ret['grade_decimal'])
+                    else:
+                        if correct[0] == 'correct':
+                            decimal = 1.0
+                        elif correct[0] == 'partially-correct':
+                            decimal = self.default_pc
+                        else:
+                            decimal = 0.0
+                    grade_decimals = [decimal] * len(idset)
+                    self.context['grade_decimals'] = grade_decimals
+
                 # Another kind of dictionary the check function can return has
                 # the form:
-                # {'overall_message': STRING,
-                #  'input_list': [{ 'ok': BOOLEAN, 'msg': STRING }, ...] }
+                # { 'overall_message': STRING,
+                #   'input_list': [
+                #     {
+                #         'ok': BOOLEAN or STRING,
+                #         'msg': STRING,
+                #         'grade_decimal' (optional): FLOAT (between 0.0 and 1.0)
+                #     },
+                #   ...
+                #   ]
+                # }
+                # 'ok' will control the checkmark, while grade_decimal, if present, will scale
+                # the score the student receives on the response.
                 #
                 # This allows the function to return an 'overall message'
                 # that applies to the entire problem, as well as correct/incorrect
-                # status and messages for individual inputs
+                # status, scaled grades, and messages for individual inputs
                 elif 'input_list' in ret:
                     overall_message = ret.get('overall_message', '')
                     input_list = ret['input_list']
 
                     correct = []
                     messages = []
+                    grade_decimals = []
+
+                    # Returning any falsy value or the "false" string for "ok" gives incorrect.
+                    # Returning any string that includes "partial" for "ok" gives partial credit.
+                    # Returning any other truthy value for "ok" gives correct
+
                     for input_dict in input_list:
-                        correct.append('correct'
-                                       if input_dict['ok'] else 'incorrect')
+                        if str(input_dict['ok']).lower().strip() == "false" or not input_dict['ok']:
+                            correct.append('incorrect')
+                        elif 'partial' in str(input_dict['ok']).lower().strip():
+                            correct.append('partially-correct')
+                        else:
+                            correct.append('correct')
+
+                        # old version, no partial credit
+                        # correct.append('correct'
+                        #                if input_dict['ok'] else 'incorrect')
+
                         msg = (self.clean_message_html(input_dict['msg'])
                                if 'msg' in input_dict else None)
                         messages.append(msg)
+                        if 'grade_decimal' in input_dict:
+                            decimal = input_dict['grade_decimal']
+                        else:
+                            if str(input_dict['ok']).lower().strip() == 'true':
+                                decimal = 1.0
+                            elif 'partial' in str(input_dict['ok']).lower().strip():
+                                decimal = self.default_pc
+                            else:
+                                decimal = 0.0
+                        grade_decimals.append(decimal)
+
                     self.context['messages'] = messages
                     self.context['overall_message'] = overall_message
+                    self.context['grade_decimals'] = grade_decimals
 
                 # Otherwise, we do not recognize the dictionary
                 # Raise an exception
@@ -1356,7 +2543,21 @@ class CustomResponse(LoncapaResponse):
                     )
 
             else:
-                correct = ['correct' if ret else 'incorrect'] * len(idset)
+
+                # Returning any falsy value or the "false" string for "ok" gives incorrect.
+                # Returning any string that includes "partial" for "ok" gives partial credit.
+                # Returning any other truthy value for "ok" gives correct
+
+                if str(ret).lower().strip() == "false" or not bool(ret):
+                    correct = 'incorrect'
+                elif 'partial' in str(ret).lower().strip():
+                    correct = 'partially-correct'
+                else:
+                    correct = 'correct'
+                correct = [correct] * len(idset)
+
+                # old version, no partial credit:
+                # correct = ['correct' if ret else 'incorrect'] * len(idset)
 
             self.context['correct'] = correct
 
@@ -1432,6 +2633,7 @@ class SymbolicResponse(CustomResponse):
     Symbolic math response checking, using symmath library.
     """
 
+    human_name = _('Symbolic Math Input')
     tags = ['symbolicresponse']
     max_inputfields = 1
 
@@ -1458,9 +2660,14 @@ class SymbolicResponse(CustomResponse):
                 debug=self.context.get('debug'),
             )
         except Exception as err:
-            log.error("oops in symbolicresponse (cfn) error %s", err)
+            log.error("oops in SymbolicResponse (cfn) error %s", err)
             log.error(traceback.format_exc())
-            raise Exception("oops in symbolicresponse (cfn) error %s", err)
+            _ = self.capa_system.i18n.ugettext
+            # Translators: 'SymbolicResponse' is a problem type and should not be translated.
+            msg = _(u"An error occurred with SymbolicResponse. The error was: {error_msg}").format(
+                error_msg=err,
+            )
+            raise Exception(msg)
         self.context['messages'][0] = self.clean_message_html(ret['msg'])
         self.context['correct'] = ['correct' if ret['ok'] else 'incorrect'] * len(idset)
 
@@ -1472,7 +2679,7 @@ class SymbolicResponse(CustomResponse):
 ## score:       Points to be assigned (numeric, can be float)
 ## msg:         Message from grader to display to student (string)
 
-ScoreMessage = namedtuple('ScoreMessage', ['valid', 'correct', 'points', 'msg'])  # pylint: disable=invalid-name
+ScoreMessage = namedtuple('ScoreMessage', ['valid', 'correct', 'points', 'msg'])
 
 
 @registry.register
@@ -1495,6 +2702,7 @@ class CodeResponse(LoncapaResponse):
 
     """
 
+    human_name = _('Code Input')
     tags = ['coderesponse']
     allowed_inputfields = ['textbox', 'filesubmission', 'matlabinput']
     max_inputfields = 1
@@ -1535,18 +2743,27 @@ class CodeResponse(LoncapaResponse):
             self.answer (an answer to display to the student in the LMS)
             self.payload
         """
-        # Note that CodeResponse is agnostic to the specific contents of
-        # grader_payload
         grader_payload = codeparam.find('grader_payload')
         grader_payload = grader_payload.text if grader_payload is not None else ''
-        self.payload = {'grader_payload': grader_payload}
+        self.payload = {
+            'grader_payload': grader_payload,
+        }
+
+        # matlab api key can be defined in course settings. if so, add it to the grader payload
+        api_key = getattr(self.capa_system, 'matlab_api_key', None)
+        if api_key and self.xml.find('matlabinput') is not None:
+            self.payload['token'] = api_key
+            self.payload['endpoint_version'] = "2"
+            self.payload['requestor_id'] = self.capa_system.anonymous_student_id
 
         self.initial_display = find_with_default(
             codeparam, 'initial_display', '')
+        _ = self.capa_system.i18n.ugettext
         self.answer = find_with_default(codeparam, 'answer_display',
-                                        'No answer provided.')
+                                        _(u'No answer provided.'))
 
     def get_score(self, student_answers):
+        _ = self.capa_system.i18n.ugettext
         try:
             # Note that submission can be a file
             submission = student_answers[self.answer_id]
@@ -1562,7 +2779,7 @@ class CodeResponse(LoncapaResponse):
         if self.capa_system.xqueue is None:
             cmap = CorrectMap()
             cmap.set(self.answer_id, queuestate=None,
-                     msg='Error checking problem: no external queueing server is configured.')
+                     msg=_(u'Error: No grader has been set up for this problem.'))
             return cmap
 
         # Prepare xqueue request
@@ -1643,6 +2860,13 @@ class CodeResponse(LoncapaResponse):
 
         _ = self.capa_system.i18n.ugettext
 
+        dog_stats_api.increment(xqueue_interface.XQUEUE_METRIC_NAME, tags=[
+            'action:update_score',
+            'correct:{}'.format(correct)
+        ])
+
+        dog_stats_api.histogram(xqueue_interface.XQUEUE_METRIC_NAME + '.update_score.points_earned', points)
+
         if not valid_score_msg:
             # Translators: 'grader' refers to the edX automatic code grader.
             error_msg = _('Invalid grader reply. Please contact the course staff.')
@@ -1715,17 +2939,33 @@ class CodeResponse(LoncapaResponse):
                           " tags: 'correct', 'score', 'msg'")
                 return fail
 
-        # Next, we need to check that the contents of the external grader message
-        #   is safe for the LMS.
+        # Next, we need to check that the contents of the external grader message is safe for the LMS.
         # 1) Make sure that the message is valid XML (proper opening/closing tags)
-        # 2) TODO: Is the message actually HTML?
+        # 2) If it is not valid XML, make sure it is valid HTML.
+        #    Note: html5lib parser will try to repair any broken HTML
+        #    For example: <aaa></bbb> will become <aaa/>.
         msg = score_result['msg']
+
         try:
             etree.fromstring(msg)
         except etree.XMLSyntaxError as _err:
-            log.error("Unable to parse external grader message as valid"
-                      " XML: score_msg['msg']=%s", msg)
-            return fail
+            # If `html` contains attrs with no values, like `controls` in <audio controls src='smth'/>,
+            # XML parser will raise exception, so wee fallback to html5parser,
+            # which will set empty "" values for such attrs.
+            try:
+                parsed = html5lib.parseFragment(msg, treebuilder='lxml', namespaceHTMLElements=False)
+            except ValueError:
+                # the parsed message might contain strings that are not
+                # xml compatible, in which case, throw the error message
+                parsed = False
+
+            if not parsed:
+                log.error(
+                    "Unable to parse external grader message as valid"
+                    " XML: score_msg['msg']=%s",
+                    msg,
+                )
+                return fail
 
         return (True, score_result['correct'], score_result['score'], msg)
 
@@ -1742,6 +2982,7 @@ class ExternalResponse(LoncapaResponse):
 
     """
 
+    human_name = _('External Grader')
     tags = ['externalresponse']
     allowed_inputfields = ['textline', 'textbox']
     awdmap = {
@@ -1829,7 +3070,7 @@ class ExternalResponse(LoncapaResponse):
         cmap = CorrectMap()
         try:
             submission = [student_answers[k] for k in idset]
-        except Exception as err:  # pylint: disable=W0703
+        except Exception as err:
             log.error(
                 'Error %s: cannot get student answer for %s; student_answers=%s',
                 err,
@@ -1844,7 +3085,7 @@ class ExternalResponse(LoncapaResponse):
 
         try:
             rxml = self.do_external_request('get_score', extra_payload)
-        except Exception as err:  # pylint: disable=W0703
+        except Exception as err:  # pylint: disable=broad-except
             log.error('Error %s', err)
             if self.capa_system.DEBUG:
                 cmap.set_dict(dict(zip(sorted(
@@ -1876,7 +3117,7 @@ class ExternalResponse(LoncapaResponse):
         try:
             rxml = self.do_external_request('get_answers', {})
             exans = json.loads(rxml.find('expected').text)
-        except Exception as err:  # pylint: disable=W0703
+        except Exception as err:  # pylint: disable=broad-except
             log.error('Error %s', err)
             if self.capa_system.DEBUG:
                 msg = '<span class="inline-error">%s</span>' % str(
@@ -1884,7 +3125,7 @@ class ExternalResponse(LoncapaResponse):
                 exans = [''] * len(self.answer_ids)
                 exans[0] = msg
 
-        if not (len(exans) == len(self.answer_ids)):
+        if not len(exans) == len(self.answer_ids):
             log.error('Expected %s answers from external server, only got %s!',
                       len(self.answer_ids), len(exans))
             raise Exception('Short response from external server')
@@ -1899,6 +3140,7 @@ class FormulaResponse(LoncapaResponse):
     Checking of symbolic math response using numerical sampling.
     """
 
+    human_name = _('Math Expression Input')
     tags = ['formularesponse']
     hint_tag = 'formulahint'
     allowed_inputfields = ['textline', 'formulaequationinput']
@@ -2073,7 +3315,7 @@ class FormulaResponse(LoncapaResponse):
         converted to float. Used so we can safely use Python contexts.
         """
         inp_d = dict([(k, numpy.complex(inp_d[k]))
-                      for k in inp_d if type(k) == str and
+                      for k in inp_d if isinstance(k, str) and
                       k.isalnum() and
                       isinstance(inp_d[k], numbers.Number)])
         return inp_d
@@ -2086,7 +3328,7 @@ class FormulaResponse(LoncapaResponse):
             name = hxml.get('name')
             correct_answer = contextualize_text(
                 hxml.get('answer'), self.context)
-            # pylint: disable=W0703
+            # pylint: disable=broad-except
             try:
                 correctness = self.check_formula(
                     correct_answer,
@@ -2111,6 +3353,7 @@ class SchematicResponse(LoncapaResponse):
     """
     Circuit schematic response type.
     """
+    human_name = _('Circuit Schematic Builder')
     tags = ['schematicresponse']
     allowed_inputfields = ['schematic']
 
@@ -2129,7 +3372,6 @@ class SchematicResponse(LoncapaResponse):
             self.code = answer.text
 
     def get_score(self, student_answers):
-        #from capa_problem import global_context
         submission = [
             json.loads(student_answers[k]) for k in sorted(self.answer_ids)
         ]
@@ -2139,6 +3381,8 @@ class SchematicResponse(LoncapaResponse):
                 self.code,
                 self.context,
                 cache=self.capa_system.cache,
+                python_path=self.context['python_path'],
+                extra_files=self.context['extra_files'],
                 slug=self.id,
                 random_seed=self.context['seed'],
                 unsafely=self.capa_system.can_execute_unsafe_code(),
@@ -2187,6 +3431,7 @@ class ImageResponse(LoncapaResponse):
         True, if click is inside any region or rectangle. Otherwise False.
     """
 
+    human_name = _('Image Mapped Input')
     tags = ['imageresponse']
     allowed_inputfields = ['imageinput']
 
@@ -2199,6 +3444,7 @@ class ImageResponse(LoncapaResponse):
         self.answer_ids = [ie.get('id') for ie in self.ielements]
 
     def get_score(self, student_answers):
+        _ = self.capa_system.i18n.ugettext
         correct_map = CorrectMap()
         expectedset = self.get_mapped_answers()
         for aid in self.answer_ids:  # loop through IDs of <imageinput>
@@ -2210,8 +3456,12 @@ class ImageResponse(LoncapaResponse):
             # Parse given answer
             acoords = re.match(r'\[([0-9]+),([0-9]+)]', given.strip().replace(' ', ''))
             if not acoords:
-                raise Exception('[capamodule.capa.responsetypes.imageinput] '
-                                'error grading {0} (input={1})'.format(aid, given))
+                msg = _('error grading {image_input_id} (input={user_input})').format(
+                    image_input_id=aid,
+                    user_input=given
+                )
+                raise Exception('[capamodule.capa.responsetypes.imageinput] ' + msg)
+
             (ans_x, ans_y) = [int(x) for x in acoords.groups()]
 
             rectangles, regions = expectedset
@@ -2226,10 +3476,12 @@ class ImageResponse(LoncapaResponse):
                         r'[\(\[]([0-9]+),([0-9]+)[\)\]]-[\(\[]([0-9]+),([0-9]+)[\)\]]',
                         solution_rectangle.strip().replace(' ', ''))
                     if not sr_coords:
-                        msg = 'Error in problem specification! cannot parse rectangle in %s' % (
-                            etree.tostring(self.ielements[aid], pretty_print=True))
-                        raise Exception(
-                            '[capamodule.capa.responsetypes.imageinput] ' + msg)
+                        # Translators: {sr_coords} are the coordinates of a rectangle
+                        msg = _('Error in problem specification! Cannot parse rectangle in {sr_coords}').format(
+                            sr_coords=etree.tostring(self.ielements[aid], pretty_print=True)
+                        )
+                        raise Exception('[capamodule.capa.responsetypes.imageinput] ' + msg)
+
                     (llx, lly, urx, ury) = [int(x) for x in sr_coords.groups()]
 
                     # answer is correct if (x,y) is within the specified
@@ -2240,7 +3492,7 @@ class ImageResponse(LoncapaResponse):
             if correct_map[aid]['correctness'] != 'correct' and regions[aid]:
                 parsed_region = json.loads(regions[aid])
                 if parsed_region:
-                    if type(parsed_region[0][0]) != list:
+                    if not isinstance(parsed_region[0][0], list):
                         # we have [[1,2],[3,4],[5,6]] - single region
                         # instead of [[[1,2],[3,4],[5,6], [[1,2],[3,4],[5,6]]]
                         # or [[[1,2],[3,4],[5,6]]] - multiple regions syntax
@@ -2277,7 +3529,7 @@ class ImageResponse(LoncapaResponse):
         Input:
             None
         Returns:
-            dict (str, (str, str)) - a map of inputs to a tuple of their rectange
+            dict (str, (str, str)) - a map of inputs to a tuple of their rectangle
                 and their regions
         """
         answers = {}
@@ -2298,6 +3550,7 @@ class AnnotationResponse(LoncapaResponse):
     The response contains both a comment (student commentary) and an option (student tag).
     Only the tag is currently graded. Answers may be incorrect, partially correct, or correct.
     """
+    human_name = _('Annotation Input')
     tags = ['annotationresponse']
     allowed_inputfields = ['annotationinput']
     max_inputfields = 1
@@ -2374,11 +3627,13 @@ class AnnotationResponse(LoncapaResponse):
     def _find_options(self, inputfield):
         """Returns an array of dicts where each dict represents an option. """
         elements = inputfield.findall('./options/option')
-        return [{
+        return [
+            {
                 'id': index,
                 'description': option.text,
                 'choice': option.get('choice')
-                } for (index, option) in enumerate(elements)]
+            } for (index, option) in enumerate(elements)
+        ]
 
     def _find_option_with_choice(self, inputfield, choice):
         """Returns the option with the given choice value, otherwise None. """
@@ -2389,7 +3644,7 @@ class AnnotationResponse(LoncapaResponse):
     def _unpack(self, json_value):
         """Unpacks a student response value submitted as JSON."""
         json_d = json.loads(json_value)
-        if type(json_d) != dict:
+        if not isinstance(json_d, dict):
             json_d = {}
 
         comment_value = json_d.get('comment', '')
@@ -2422,12 +3677,14 @@ class ChoiceTextResponse(LoncapaResponse):
     ChoiceResponse.
     """
 
+    human_name = _('Checkboxes With Text Input')
     tags = ['choicetextresponse']
     max_inputfields = 1
-    allowed_inputfields = ['choicetextgroup',
-                           'checkboxtextgroup',
-                           'radiotextgroup'
-                           ]
+    allowed_inputfields = [
+        'choicetextgroup',
+        'checkboxtextgroup',
+        'radiotextgroup',
+    ]
 
     def __init__(self, *args, **kwargs):
         self.correct_inputs = {}
@@ -2449,11 +3706,13 @@ class ChoiceTextResponse(LoncapaResponse):
         and `answer_values` is used for displaying correct answers.
 
         """
+        _ = self.capa_system.i18n.ugettext
         context = self.context
         self.answer_values = {self.answer_id: []}
         self.assign_choice_names()
         correct_xml = self.xml.xpath('//*[@id=$id]//choice[@correct="true"]',
                                      id=self.xml.get('id'))
+
         for node in correct_xml:
             # For each correct choice, set the `parent_name` to the
             # current choice's name
@@ -2471,7 +3730,7 @@ class ChoiceTextResponse(LoncapaResponse):
                     # If the question creator does not specify an answer for a
                     # <numtolerance_input> inside of a correct choice, raise an error
                     raise LoncapaProblemError(
-                        "Answer not provided for numtolerance_input"
+                        _("Answer not provided for {input_type}").format(input_type="numtolerance_input")
                     )
                 # Contextualize the answer to allow script generated answers.
                 answer = contextualize_text(answer, context)
@@ -2530,9 +3789,8 @@ class ChoiceTextResponse(LoncapaResponse):
         </radiotextgroup>
         """
 
-        for index, choice in enumerate(
-            self.xml.xpath('//*[@id=$id]//choice', id=self.xml.get('id'))
-        ):
+        choices = self.xml.xpath('//*[@id=$id]//choice', id=self.xml.get('id'))
+        for index, choice in enumerate(choices):
             # Set the name attribute for <choices>
             # "bc" is appended at the end to indicate that this is a
             # binary choice as opposed to a numtolerance_input, this convention
@@ -2750,20 +4008,23 @@ class ChoiceTextResponse(LoncapaResponse):
 # TEMPORARY: List of all response subclasses
 # FIXME: To be replaced by auto-registration
 
-# pylint: disable=E0604
-__all__ = [CodeResponse,
-           NumericalResponse,
-           FormulaResponse,
-           CustomResponse,
-           SchematicResponse,
-           ExternalResponse,
-           ImageResponse,
-           OptionResponse,
-           SymbolicResponse,
-           StringResponse,
-           ChoiceResponse,
-           MultipleChoiceResponse,
-           TrueFalseResponse,
-           JavascriptResponse,
-           AnnotationResponse,
-           ChoiceTextResponse]
+# pylint: disable=invalid-all-object
+__all__ = [
+    CodeResponse,
+    NumericalResponse,
+    FormulaResponse,
+    CustomResponse,
+    SchematicResponse,
+    ExternalResponse,
+    ImageResponse,
+    OptionResponse,
+    SymbolicResponse,
+    StringResponse,
+    ChoiceResponse,
+    MultipleChoiceResponse,
+    TrueFalseResponse,
+    JavascriptResponse,
+    AnnotationResponse,
+    ChoiceTextResponse,
+]
+# pylint: enable=invalid-all-object

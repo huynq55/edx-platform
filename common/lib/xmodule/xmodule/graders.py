@@ -10,7 +10,7 @@ log = logging.getLogger("edx.courseware")
 
 # This is a tuple for holding scores, either from problems or sections.
 # Section either indicates the name of the problem or the name of the section
-Score = namedtuple("Score", "earned possible graded section")
+Score = namedtuple("Score", "earned possible graded section module_id")
 
 
 def aggregate_scores(scores, section_name="summary"):
@@ -27,15 +27,21 @@ def aggregate_scores(scores, section_name="summary"):
     total_possible = sum(score.possible for score in scores)
 
     #regardless of whether or not it is graded
-    all_total = Score(total_correct,
-                      total_possible,
-                      False,
-                      section_name)
+    all_total = Score(
+        total_correct,
+        total_possible,
+        False,
+        section_name,
+        None
+    )
     #selecting only graded things
-    graded_total = Score(total_correct_graded,
-                         total_possible_graded,
-                         True,
-                         section_name)
+    graded_total = Score(
+        total_correct_graded,
+        total_possible_graded,
+        True,
+        section_name,
+        None
+    )
 
     return all_total, graded_total
 
@@ -183,7 +189,7 @@ class WeightedSubsectionsGrader(CourseGrader):
             subgrade_result = subgrader.grade(grade_sheet, generate_random_scores)
 
             weighted_percent = subgrade_result['percent'] * weight
-            section_detail = u"{0} = {1:.1%} of a possible {2:.0%}".format(category, weighted_percent, weight)
+            section_detail = u"{0} = {1:.2%} of a possible {2:.2%}".format(category, weighted_percent, weight)
 
             total_percent += weighted_percent
             section_breakdown += subgrade_result['section_breakdown']
@@ -304,7 +310,7 @@ class AssignmentFormatGrader(CourseGrader):
                 if index not in dropped_indices:
                     aggregate_score += mark['percent']
 
-            if (len(breakdown) - drop_count > 0):
+            if len(breakdown) - drop_count > 0:
                 aggregate_score /= len(breakdown) - drop_count
 
             return aggregate_score, dropped_indices
@@ -359,8 +365,10 @@ class AssignmentFormatGrader(CourseGrader):
             # if there is only one entry in a section, suppress the existing individual entry and the average,
             # and just display a single entry for the section.  That way it acts automatically like a
             # SingleSectionGrader.
-            total_detail = u"{section_type} = {percent:.0%}".format(percent=total_percent,
-                                                                   section_type=self.section_type)
+            total_detail = u"{section_type} = {percent:.0%}".format(
+                percent=total_percent,
+                section_type=self.section_type,
+            )
             total_label = u"{short_label}".format(short_label=self.short_label)
             breakdown = [{'percent': total_percent, 'label': total_label,
                           'detail': total_detail, 'category': self.category, 'prominent': True}, ]

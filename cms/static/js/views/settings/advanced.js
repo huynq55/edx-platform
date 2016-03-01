@@ -1,9 +1,10 @@
-define(["js/views/validation", "jquery", "underscore", "gettext", "codemirror"],
-    function(ValidatingView, $, _, gettext, CodeMirror) {
+define(["js/views/validation", "jquery", "underscore", "gettext", "codemirror", "js/views/modals/validation_error_modal"],
+    function(ValidatingView, $, _, gettext, CodeMirror, ValidationErrorModal) {
 
 var AdvancedView = ValidatingView.extend({
     error_saving : "error_saving",
     successful_changes: "successful_changes",
+    render_deprecated: false,
 
     // Model class is CMS.Models.Settings.Advanced
     events : {
@@ -29,9 +30,11 @@ var AdvancedView = ValidatingView.extend({
 
         // iterate through model and produce key : value editors for each property in model.get
         var self = this;
-        _.each(_.sortBy(_.keys(this.model.attributes), _.identity),
+        _.each(_.sortBy(_.keys(this.model.attributes), function(key) { return self.model.get(key).display_name; }),
             function(key) {
-                listEle$.append(self.renderTemplate(key, self.model.get(key)));
+                if (self.render_deprecated || !self.model.get(key).deprecated) {
+                    listEle$.append(self.renderTemplate(key, self.model.get(key)));
+                }
             });
 
         var policyValues = listEle$.find('.json');
@@ -47,9 +50,11 @@ var AdvancedView = ValidatingView.extend({
 
         var self = this;
         var oldValue = $(textarea).val();
-        CodeMirror.fromTextArea(textarea, {
-            mode: "application/json", lineNumbers: false, lineWrapping: false,
-            onChange: function(instance, changeobj) {
+        var cm = CodeMirror.fromTextArea(textarea, {
+            mode: "application/json",
+            lineNumbers: false,
+            lineWrapping: false});
+        cm.on('change', function(instance, changeobj) {
                 instance.save();
                 // this event's being called even when there's no change :-(
                 if (instance.getValue() !== oldValue) {
@@ -58,11 +63,11 @@ var AdvancedView = ValidatingView.extend({
                                              _.bind(self.saveView, self),
                                              _.bind(self.revertView, self));
                 }
-            },
-            onFocus : function(mirror) {
+            });
+        cm.on('focus', function(mirror) {
               $(textarea).parent().children('label').addClass("is-focused");
-            },
-            onBlur: function (mirror) {
+            });
+        cm.on('blur', function (mirror) {
                 $(textarea).parent().children('label').removeClass("is-focused");
                 var key = $(mirror.getWrapperElement()).closest('.field-group').children('.key').attr('id');
                 var stringValue = $.trim(mirror.getValue());
@@ -89,10 +94,11 @@ var AdvancedView = ValidatingView.extend({
                     }
                 }
                 if (JSONValue !== undefined) {
-                    self.model.set(key, JSONValue);
+                    var modelVal = self.model.get(key);
+                    modelVal.value = JSONValue;
+                    self.model.set(key, modelVal);
                 }
-            }
-        });
+            });
     },
     saveView : function() {
         // TODO one last verification scan:
@@ -109,7 +115,24 @@ var AdvancedView = ValidatingView.extend({
                     'course': course_location_analytics
                 });
             },
-            silent: true
+            silent: true,
+            error: function(model, response, options) {
+                var json_response, reset_callback, err_modal;
+
+                /* Check that the server came back with a bad request error*/
+                if (response.status === 400) {
+                    json_response = $.parseJSON(response.responseText);
+                    reset_callback = function() {
+                        self.revertView();
+                    };
+
+                    /* initialize and show validation error modal */
+                    err_modal = new ValidationErrorModal();
+                    err_modal.setContent(json_response);
+                    err_modal.setResetCallback(reset_callback);
+                    err_modal.show();
+                }
+            }
         });
     },
     revertView: function() {
@@ -119,9 +142,10 @@ var AdvancedView = ValidatingView.extend({
             reset: true
         });
     },
-    renderTemplate: function (key, value) {
+    renderTemplate: function (key, model) {
         var newKeyId = _.uniqueId('policy_key_'),
-        newEle = this.template({ key : key, value : JSON.stringify(value, null, 4),
+        newEle = this.template({ key: key, display_name : model.display_name, help: model.help,
+            value : JSON.stringify(model.value, null, 4), deprecated: model.deprecated,
             keyUniqueId: newKeyId, valueUniqueId: _.uniqueId('policy_value_')});
 
         this.fieldToSelectorMap[key] = newKeyId;

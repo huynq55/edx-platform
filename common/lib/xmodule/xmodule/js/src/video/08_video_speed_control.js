@@ -1,325 +1,373 @@
 (function (requirejs, require, define) {
-
-// VideoSpeedControl module.
+"use strict";
 define(
 'video/08_video_speed_control.js',
-[],
-function () {
-
-    // VideoSpeedControl() function - what this module "exports".
-    return function (state) {
-        var dfd = $.Deferred();
-
-        if (state.isTouch) {
-            // iOS doesn't support speed change
-            state.el.find('div.speeds').remove();
-            dfd.resolve();
-            return dfd.promise();
+['video/00_iterator.js'],
+function (Iterator) {
+    /**
+     * Video speed control module.
+     * @exports video/08_video_speed_control.js
+     * @constructor
+     * @param {object} state The object containing the state of the video player.
+     * @return {jquery Promise}
+     */
+    var SpeedControl = function (state) {
+        if (!(this instanceof SpeedControl)) {
+            return new SpeedControl(state);
         }
 
-        state.videoSpeedControl = {};
+        _.bindAll(this, 'onSetSpeed', 'onRenderSpeed', 'clickLinkHandler',
+            'keyDownLinkHandler', 'mouseEnterHandler', 'mouseLeaveHandler',
+            'clickMenuHandler', 'keyDownMenuHandler', 'destroy'
+        );
+        this.state = state;
+        this.state.videoSpeedControl = this;
+        this.initialize();
 
-        _initialize(state);
-        dfd.resolve();
-
-        if (state.videoType === 'html5' && !(_checkPlaybackRates())) {
-            console.log(
-                '[Video info]: HTML5 mode - playbackRate is not supported.'
-            );
-
-            _hideSpeedControl(state);
-        }
-
-        return dfd.promise();
+        return $.Deferred().resolve().promise();
     };
 
-    // ***************************************************************
-    // Private functions start here.
-    // ***************************************************************
+    SpeedControl.prototype = {
+        template: [
+            '<div class="speeds menu-container" role="application">',
+                '<button class="control speed-button" aria-label="',
+                    /* jshint maxlen:200 */
+                    gettext('Speed: Press UP to enter the speed menu then use the UP and DOWN arrow keys to navigate the different speeds, then press ENTER to change to the selected speed.'),
+                    '" aria-disabled="false" aria-expanded="false">',
+                    '<span class="icon-fallback-img">',
+                        '<span class="icon fa fa-caret-right" aria-hidden="true"></span>',
+                        '<span class="sr control-text">',
+                            gettext('Speed'),
+                        '</span>',
+                    '</span>',
+                    '<span class="label" aria-hidden="true">',
+                        gettext('Speed'),
+                    '</span>',
+                    '<span class="value"></span>',
+                '</button>',
+              '<ol class="video-speeds menu"></ol>',
+            '</div>'
+        ].join(''),
 
-    function _initialize(state) {
-        _makeFunctionsPublic(state);
-        _renderElements(state);
-        _bindHandlers(state);
-    }
+        destroy: function () {
+            this.el.off({
+                'mouseenter': this.mouseEnterHandler,
+                'mouseleave': this.mouseLeaveHandler,
+                'click': this.clickMenuHandler,
+                'keydown': this.keyDownMenuHandler
+            });
 
-    // function _makeFunctionsPublic(state)
-    //
-    //     Functions which will be accessible via 'state' object. When called,
-    //     these functions will get the 'state' object as a context.
-    function _makeFunctionsPublic(state) {
-        var methodsDict = {
-            changeVideoSpeed: changeVideoSpeed,
-            reRender: reRender,
-            setSpeed: setSpeed
-        };
+            this.state.el.off({
+                'speed:set': this.onSetSpeed,
+                'speed:render': this.onRenderSpeed
+            });
+            this.closeMenu(true);
+            this.speedsContainer.remove();
+            this.el.remove();
+            delete this.state.videoSpeedControl;
+        },
 
-        state.bindTo(methodsDict, state.videoSpeedControl, state);
-    }
+        /** Initializes the module. */
+        initialize: function () {
+            var state = this.state;
 
-    // function _renderElements(state)
-    //
-    //     Create any necessary DOM elements, attach them, and set their
-    //     initial configuration. Also make the created DOM elements available
-    //     via the 'state' object. Much easier to work this way - you don't
-    //     have to do repeated jQuery element selects.
-    function _renderElements(state) {
-        state.videoSpeedControl.speeds = state.speeds;
-
-        state.videoSpeedControl.el = state.el.find('div.speeds');
-
-        state.videoSpeedControl.videoSpeedsEl = state.videoSpeedControl.el
-            .find('.video_speeds');
-
-        state.videoControl.secondaryControlsEl.prepend(
-            state.videoSpeedControl.el
-        );
-
-        $.each(state.videoSpeedControl.speeds, function (index, speed) {
-            var link = '<a class="speed_link" href="#">' + speed + 'x</a>';
-
-            state.videoSpeedControl.videoSpeedsEl
-                .prepend(
-                    $('<li data-speed="' + speed + '">' + link + '</li>')
+            if (!this.isPlaybackRatesSupported(state)) {
+                console.log(
+                    '[Video info]: playbackRate is not supported.'
                 );
-        });
 
-        state.videoSpeedControl.setSpeed(state.speed);
-    }
+                return false;
+            }
+            this.el = $(this.template);
+            this.speedsContainer = this.el.find('.video-speeds');
+            this.speedButton = this.el.find('.speed-button');
+            this.render(state.speeds, state.speed);
+            this.setSpeed(state.speed, true, true);
+            this.bindHandlers();
 
-    /**
-     * @desc Check if playbackRate supports by browser.
-     *
-     * @type {function}
-     * @access private
-     *
-     * @param {object} state The object containg the state of the video player.
-     *     All other modules, their parameters, public variables, etc. are
-     *     available via this object.
-     *
-     * @this {object} The global window object.
-     *
-     * @returns {Boolean}
-     *       true: Browser support playbackRate functionality.
-     *       false: Browser doesn't support playbackRate functionality.
-     */
-    function _checkPlaybackRates() {
-        var video = document.createElement('video');
+            return true;
+        },
 
-        // If browser supports, 1.0 should be returned by playbackRate
-        // property. In this case, function return True. Otherwise, False will
-        // be returned.
-        return Boolean(video.playbackRate);
-    }
-
-    // Hide speed control.
-    function _hideSpeedControl(state) {
-        state.el.find('div.speeds').hide();
-    }
-
-    /**
-     * @desc Bind any necessary function callbacks to DOM events (click,
-     *     mousemove, etc.).
-     *
-     * @type {function}
-     * @access private
-     *
-     * @param {object} state The object containg the state of the video player.
-     *     All other modules, their parameters, public variables, etc. are
-     *     available via this object.
-     *
-     * @this {object} The global window object.
-     *
-     * @returns {undefined}
-     */
-    function _bindHandlers(state) {
-        var speedLinks;
-
-        state.videoSpeedControl.videoSpeedsEl.find('a')
-            .on('click', state.videoSpeedControl.changeVideoSpeed);
-
-        if (state.isTouch) {
-            state.videoSpeedControl.el.on('click', function (event) {
-                // So that you can't highlight this control via a drag
-                // operation, we disable the default browser actions on a
-                // click event.
-                event.preventDefault();
-
-                state.videoSpeedControl.el.toggleClass('open');
-            });
-        } else {
-            state.videoSpeedControl.el
-                .on('mouseenter', function () {
-                    state.videoSpeedControl.el.addClass('open');
-                })
-                .on('mouseleave', function () {
-                    state.videoSpeedControl.el.removeClass('open');
-                })
-                .on('click', function (event) {
-                    // So that you can't highlight this control via a drag
-                    // operation, we disable the default browser actions on a
-                    // click event.
-                    event.preventDefault();
-
-                    state.videoSpeedControl.el.removeClass('open');
+        /**
+         * Creates any necessary DOM elements, attach them, and set their,
+         * initial configuration.
+         * @param {array} speeds List of speeds available for the player.
+         */
+        render: function (speeds) {
+            var speedsContainer = this.speedsContainer,
+                reversedSpeeds = speeds.concat().reverse(),
+                speedsList = $.map(reversedSpeeds, function (speed) {
+                    return [
+                        '<li data-speed="', speed, '">',
+                            '<button class="control speed-option" tabindex="-1">',
+                                speed, 'x',
+                            '</button>',
+                        '</li>'
+                    ].join('');
                 });
 
-            // ******************************
-            // The tabbing will cycle through the elements in the following
-            // order:
-            // 1. Play control
-            // 2. Speed control
-            // 3. Fastest speed called firstSpeed
-            // 4. Intermediary speed called otherSpeed
-            // 5. Slowest speed called lastSpeed
-            // 6. Volume control
-            // This field will keep track of where the focus is coming from.
-            state.previousFocus = '';
+            speedsContainer.html(speedsList.join(''));
+            this.speedLinks = new Iterator(speedsContainer.find('.speed-option'));
+            this.state.el.find('.secondary-controls').prepend(this.el);
+        },
 
-            // ******************************
-            // Attach 'focus', and 'blur' events to the speed control which
-            // either brings up the speed dialog with individual speed entries,
-            // or closes it.
-            state.videoSpeedControl.el.children('a')
-                .on('focus', function () {
-                    // If the focus is coming from the first speed entry
-                    // (tabbing backwards) or last speed entry (tabbing forward)
-                    // hide the speed entries dialog.
-                    if (state.previousFocus === 'firstSpeed' ||
-                        state.previousFocus === 'lastSpeed') {
-                         state.videoSpeedControl.el.removeClass('open');
-                    }
-                })
-                .on('blur', function () {
-                    // When the focus leaves this element, the speed entries
-                    // dialog will be shown.
-
-                    // If we are tabbing forward (previous focus is play
-                    // control), we open the dialog and set focus on the first
-                    // speed entry.
-                    if (state.previousFocus === 'playPause') {
-                        state.videoSpeedControl.el.addClass('open');
-                        state.videoSpeedControl.videoSpeedsEl
-                        .find('a.speed_link:first')
-                        .focus();
-                    }
-
-                    // If we are tabbing backwards (previous focus is volume
-                    // control), we open the dialog and set focus on the
-                    // last speed entry.
-                    if (state.previousFocus === 'volume') {
-                        state.videoSpeedControl.el.addClass('open');
-                        state.videoSpeedControl.videoSpeedsEl
-                        .find('a.speed_link:last')
-                        .focus();
-                    }
-
-                });
-
-            // ******************************
-            // Attach 'blur' event to elements which represent individual speed
-            // entries and use it to track the origin of the focus.
-            speedLinks = state.videoSpeedControl.videoSpeedsEl
-                .find('a.speed_link');
-
-            speedLinks.first().on('blur', function () {
-                // The previous focus is a speed entry (we are tabbing
-                // backwards), the dialog will close, set focus on the speed
-                // control and track the focus on first speed.
-                if (state.previousFocus === 'otherSpeed') {
-                    state.previousFocus = 'firstSpeed';
-                    state.videoSpeedControl.el.children('a').focus();
-                }
+        /**
+         * Bind any necessary function callbacks to DOM events (click,
+         * mousemove, etc.).
+         */
+        bindHandlers: function () {
+            // Attach various events handlers to the speed menu button.
+            this.el.on({
+                'mouseenter': this.mouseEnterHandler,
+                'mouseleave': this.mouseLeaveHandler,
+                'click': this.openMenu,
+                'keydown': this.keyDownMenuHandler
             });
 
-            // Track the focus on intermediary speeds.
-            speedLinks
-                .filter(function (index) {
-                    return index === 1 || index === 2;
-                })
-                .on('blur', function () {
-                    state.previousFocus = 'otherSpeed';
-                });
+            // Attach click and keydown event handlers to the individual speed
+            // entries.
+            this.speedsContainer.on({
+                click: this.clickLinkHandler,
+                keydown: this.keyDownLinkHandler
+            }, '.speed-option');
 
-            speedLinks.last().on('blur', function () {
-                // The previous focus is a speed entry (we are tabbing forward),
-                // the dialog will close, set focus on the speed control and
-                // track the focus on last speed.
-                if (state.previousFocus === 'otherSpeed') {
-                    state.previousFocus = 'lastSpeed';
-                    state.videoSpeedControl.el.children('a').focus();
-                }
+            this.state.el.on({
+                'speed:set': this.onSetSpeed,
+                'speed:render': this.onRenderSpeed
             });
+            this.state.el.on('destroy', this.destroy);
+        },
 
-        }
-    }
+        onSetSpeed: function (event, speed) {
+            this.setSpeed(speed, true);
+        },
 
-    // ***************************************************************
-    // Public functions start here.
-    // These are available via the 'state' object. Their context ('this'
-    // keyword) is the 'state' object. The magic private function that makes
-    // them available and sets up their context is makeFunctionsPublic().
-    // ***************************************************************
+        onRenderSpeed: function (event, speeds, currentSpeed) {
+            this.render(speeds, currentSpeed);
+        },
 
-    function setSpeed(speed) {
-        this.videoSpeedControl.videoSpeedsEl.find('li').removeClass('active');
-        this.videoSpeedControl.videoSpeedsEl
-            .find("li[data-speed='" + speed + "']")
-            .addClass('active');
-        this.videoSpeedControl.el.find('p.active').html('' + speed + 'x');
-    }
+        /**
+         * Check if playbackRate supports by browser. If browser supports, 1.0
+         * should be returned by playbackRate property. In this case, function
+         * return True. Otherwise, False will be returned.
+         * iOS doesn't support speed change.
+         * @param {object} state The object containing the state of the video
+         * player.
+         * @return {boolean}
+         *   true: Browser support playbackRate functionality.
+         *   false: Browser doesn't support playbackRate functionality.
+         */
+        isPlaybackRatesSupported: function (state) {
+            var isHtml5 = state.videoType === 'html5',
+                isTouch = state.isTouch,
+                video = document.createElement('video');
 
-    function changeVideoSpeed(event) {
-        var parentEl = $(event.target).parent();
+            return !isTouch || (isHtml5 && !Boolean(video.playbackRate));
+        },
 
-        event.preventDefault();
-
-        if (!parentEl.hasClass('active')) {
-            this.videoSpeedControl.currentSpeed = parentEl.data('speed');
-
-            this.videoSpeedControl.setSpeed(
-                // To meet the API expected format.
-                parseFloat(this.videoSpeedControl.currentSpeed)
-                    .toFixed(2)
-                    .replace(/\.00$/, '.0')
-            );
-
-            this.trigger(
-                'videoPlayer.onSpeedChange',
-                this.videoSpeedControl.currentSpeed
-            );
-        }
-        // When a speed entry has been selected, we want the speed control to
-        // regain focus.
-        parentEl.parent().siblings('a').focus();
-    }
-
-    function reRender(params) {
-        var _this = this;
-
-        this.videoSpeedControl.videoSpeedsEl.empty();
-        this.videoSpeedControl.videoSpeedsEl.find('li').removeClass('active');
-        this.videoSpeedControl.speeds = params.newSpeeds;
-
-        $.each(this.videoSpeedControl.speeds, function (index, speed) {
-            var link, listItem;
-
-            link = '<a class="speed_link" href="#">' + speed + 'x</a>';
-
-            listItem = $('<li data-speed="' + speed + '">' + link + '</li>');
-
-            if (speed === params.currentSpeed) {
-                listItem.addClass('active');
+        /**
+         * Opens speed menu.
+         * @param {boolean} [bindEvent] Click event will be attached on window.
+         */
+        openMenu: function (bindEvent) {
+            // When speed entries have focus, the menu stays open on
+            // mouseleave. A clickHandler is added to the window
+            // element to have clicks close the menu when they happen
+            // outside of it.
+            if (bindEvent) {
+                $(window).on('click.speedMenu', this.clickMenuHandler);
             }
 
-            _this.videoSpeedControl.videoSpeedsEl.prepend(listItem);
-        });
+            this.el.addClass('is-opened');
+            this.speedButton
+                .attr('tabindex', -1)
+                .attr('aria-expanded', 'true');
+        },
 
-        // Re-attach all events with their appropriate callbacks to the
-        // newly generated elements.
-        _bindHandlers(this);
-    }
+        /**
+         * Closes speed menu.
+         * @param {boolean} [unBindEvent] Click event will be detached from window.
+         */
+        closeMenu: function (unBindEvent) {
+            // Remove the previously added clickHandler from window element.
+            if (unBindEvent) {
+                $(window).off('click.speedMenu');
+            }
 
+            this.el.removeClass('is-opened');
+            this.speedButton
+                .attr('tabindex', 0)
+                .attr('aria-expanded', 'false');
+        },
+
+        /**
+         * Sets new current speed for the speed control and triggers `speedchange`
+         * event if needed.
+         * @param {string|number} speed Speed to be set.
+         * @param {boolean} [silent] Sets the new speed without triggering
+         * `speedchange` event.
+         * @param {boolean} [forceUpdate] Updates the speed even if it's
+         * not differs from current speed.
+         */
+        setSpeed: function (speed, silent, forceUpdate) {
+            if (speed !== this.currentSpeed || forceUpdate) {
+                this.speedsContainer
+                    .find('li')
+                    .removeClass('is-active')
+                    .siblings("li[data-speed='" + speed + "']")
+                    .addClass('is-active');
+
+                this.speedButton.find('.value').html(speed + 'x');
+                this.currentSpeed = speed;
+
+                if (!silent) {
+                    this.el.trigger('speedchange', [speed, this.state.speed]);
+                }
+            }
+        },
+
+        /**
+         * Click event handler for the menu.
+         * @param {jquery Event} event
+         */
+        clickMenuHandler: function () {
+            this.closeMenu();
+
+            return false;
+        },
+
+        /**
+         * Click event handler for speed links.
+         * @param {jquery Event} event
+         */
+        clickLinkHandler: function (event) {
+            var speed = $(event.currentTarget).parent().data('speed');
+
+            this.closeMenu();
+            this.state.videoCommands.execute('speed', speed);
+
+            return false;
+        },
+
+        /**
+         * Mouseenter event handler for the menu.
+         * @param {jquery Event} event
+         */
+        mouseEnterHandler: function () {
+            this.openMenu();
+
+            return false;
+        },
+
+        /**
+         * Mouseleave event handler for the menu.
+         * @param {jquery Event} event
+         */
+        mouseLeaveHandler: function () {
+            // Only close the menu is no speed entry has focus.
+            if (!this.speedLinks.list.is(':focus')) {
+                this.closeMenu();
+            }
+                    
+            return false;
+        },
+
+        /**
+         * Keydown event handler for the menu.
+         * @param {jquery Event} event
+         */
+        keyDownMenuHandler: function (event) {
+            var KEY = $.ui.keyCode,
+                keyCode = event.keyCode;
+
+            switch(keyCode) {
+                // Open menu and focus on last element of list above it.
+                case KEY.ENTER:
+                case KEY.SPACE:
+                case KEY.UP:
+                    this.openMenu(true);
+                    this.speedLinks.last().focus();
+                    break;
+                // Close menu.
+                case KEY.ESCAPE:
+                    this.closeMenu(true);
+                    break;
+            }
+            // We do not stop propagation and default behavior on a TAB
+            // keypress.
+            return event.keyCode === KEY.TAB;
+        },
+
+        /**
+         * Keydown event handler for speed links.
+         * @param {jquery Event} event
+         */
+        keyDownLinkHandler: function (event) {
+            // ALT key is used to change (alternate) the function of
+            // other pressed keys. In this, do nothing.
+            if (event.altKey) {
+                return true;
+            }
+
+            var KEY = $.ui.keyCode,
+                self = this,
+                parent = $(event.currentTarget).parent(),
+                index = parent.index(),
+                speed = parent.data('speed');
+
+            switch (event.keyCode) {
+                // Close menu.
+                case KEY.TAB:
+                    // Closes menu after 25ms delay to change `tabindex` after
+                    // finishing default behavior.
+                    setTimeout(function () {
+                        self.closeMenu(true);
+                    }, 25);
+
+                    return true;
+                // Close menu and give focus to speed control.
+                case KEY.ESCAPE:
+                    this.closeMenu(true);
+                    this.speedButton.focus();
+
+                    return false;
+                // Scroll up menu, wrapping at the top. Keep menu open.
+                case KEY.UP:
+                    // Shift + Arrows keyboard shortcut might be used by
+                    // screen readers. In this, do nothing.
+                    if (event.shiftKey) {
+                        return true;
+                    }
+
+                    this.speedLinks.prev(index).focus();
+                    return false;
+                // Scroll down  menu, wrapping at the bottom. Keep menu
+                // open.
+                case KEY.DOWN:
+                    // Shift + Arrows keyboard shortcut might be used by
+                    // screen readers. In this, do nothing.
+                    if (event.shiftKey) {
+                        return true;
+                    }
+
+                    this.speedLinks.next(index).focus();
+                    return false;
+                // Close menu, give focus to speed control and change
+                // speed.
+                case KEY.ENTER:
+                case KEY.SPACE:
+                    this.closeMenu(true);
+                    this.speedButton.focus();
+                    this.setSpeed(this.state.speedToString(speed));
+
+                    return false;
+            }
+
+            return true;
+        }
+    };
+
+    return SpeedControl;
 });
 
 }(RequireJS.requirejs, RequireJS.require, RequireJS.define));

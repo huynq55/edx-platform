@@ -34,12 +34,11 @@ Conveniently, you can install Node via `apt-get`, then use npm:
 Compiling
 ---------
 
-The dev server will automatically compile coffeescript files that have changed.
-Simply start the server using:
-    
-    $ rake runserver
+CoffeeScript is compiled when you update assets using the command:
+
+    $ paver update_assets
 
 Testing
 -------
 
-We use Jasmine to unit-test the JavaScript files.  See `docs/internal/testing.md` for details.
+We use Jasmine to unit-test the JavaScript files.  See `docs/en_us/internal/testing.rst` for details.

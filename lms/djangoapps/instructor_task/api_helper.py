@@ -1,13 +1,24 @@
+"""
+Helper lib for instructor_tasks API.
+
+Includes methods to check args for rescoring task, encoding student input,
+and task submission logic, including handling the Celery backend.
+"""
 import hashlib
 import json
 import logging
+
+from django.utils.translation import ugettext as _
+from util.db import outer_atomic
 
 from celery.result import AsyncResult
 from celery.states import READY_STATES, SUCCESS, FAILURE, REVOKED
 
 from courseware.module_render import get_xqueue_callback_url_prefix
+from courseware.courses import get_problems_in_section
 
 from xmodule.modulestore.django import modulestore
+from opaque_keys.edx.keys import UsageKey
 from instructor_task.models import InstructorTask, PROGRESS
 
 
@@ -21,11 +32,13 @@ class AlreadyRunningError(Exception):
 
 def _task_is_running(course_id, task_type, task_key):
     """Checks if a particular task is already running"""
-    runningTasks = InstructorTask.objects.filter(course_id=course_id, task_type=task_type, task_key=task_key)
+    running_tasks = InstructorTask.objects.filter(
+        course_id=course_id, task_type=task_type, task_key=task_key
+    )
     # exclude states that are "ready" (i.e. not "running", e.g. failure, success, revoked):
     for state in READY_STATES:
-        runningTasks = runningTasks.exclude(task_state=state)
-    return len(runningTasks) > 0
+        running_tasks = running_tasks.exclude(task_state=state)
+    return len(running_tasks) > 0
 
 
 def _reserve_task(course_id, task_type, task_key, task_input, requester):
@@ -35,13 +48,6 @@ def _reserve_task(course_id, task_type, task_key, task_input, requester):
     Throws AlreadyRunningError if the task is already in progress.
     Includes the creation of an arbitrary value for task_id, to be
     submitted with the task call to celery.
-
-    The InstructorTask.create method makes sure the InstructorTask entry is committed.
-    When called from any view that is wrapped by TransactionMiddleware,
-    and thus in a "commit-on-success" transaction, an autocommit buried within here
-    will cause any pending transaction to be committed by a successful
-    save here.  Any future database operations will take place in a
-    separate transaction.
 
     Note that there is a chance of a race condition here, when two users
     try to run the same task at almost exactly the same time.  One user
@@ -82,7 +88,7 @@ def _get_xmodule_instance_args(request, task_id):
     """
     request_info = {'username': request.user.username,
                     'ip': request.META['REMOTE_ADDR'],
-                    'agent': request.META.get('HTTP_USER_AGENT', ''),
+                    'agent': request.META.get('HTTP_USER_AGENT', '').decode('latin1'),
                     'host': request.META['SERVER_NAME'],
                     }
 
@@ -229,34 +235,53 @@ def get_status_from_instructor_task(instructor_task):
     return status
 
 
-def check_arguments_for_rescoring(course_id, problem_url):
+def check_arguments_for_rescoring(usage_key):
     """
     Do simple checks on the descriptor to confirm that it supports rescoring.
 
-    Confirms first that the problem_url is defined (since that's currently typed
+    Confirms first that the usage_key is defined (since that's currently typed
     in).  An ItemNotFoundException is raised if the corresponding module
     descriptor doesn't exist.  NotImplementedError is raised if the
     corresponding module doesn't support rescoring calls.
     """
-    descriptor = modulestore().get_instance(course_id, problem_url)
+    descriptor = modulestore().get_item(usage_key)
     if not hasattr(descriptor, 'module_class') or not hasattr(descriptor.module_class, 'rescore_problem'):
         msg = "Specified module does not support rescoring."
         raise NotImplementedError(msg)
 
 
-def encode_problem_and_student_input(problem_url, student=None):
+def check_entrance_exam_problems_for_rescoring(exam_key):  # pylint: disable=invalid-name
     """
-    Encode optional problem_url and optional student into task_key and task_input values.
+    Grabs all problem descriptors in exam and checks each descriptor to
+    confirm that it supports re-scoring.
 
-    `problem_url` is full URL of the problem.
-    `student` is the user object of the student
+    An ItemNotFoundException is raised if the corresponding module
+    descriptor doesn't exist for exam_key. NotImplementedError is raised if
+    any of the problem in entrance exam doesn't support re-scoring calls.
     """
+    problems = get_problems_in_section(exam_key).values()
+    if any(not hasattr(problem, 'module_class') or not hasattr(problem.module_class, 'rescore_problem')
+           for problem in problems):
+        msg = _("Not all problems in entrance exam support re-scoring.")
+        raise NotImplementedError(msg)
+
+
+def encode_problem_and_student_input(usage_key, student=None):  # pylint: disable=invalid-name
+    """
+    Encode optional usage_key and optional student into task_key and task_input values.
+
+    Args:
+        usage_key (Location): The usage_key identifying the problem.
+        student (User): the student affected
+    """
+
+    assert isinstance(usage_key, UsageKey)
     if student is not None:
-        task_input = {'problem_url': problem_url, 'student': student.username}
-        task_key_stub = "{student}_{problem}".format(student=student.id, problem=problem_url)
+        task_input = {'problem_url': usage_key.to_deprecated_string(), 'student': student.username}
+        task_key_stub = "{student}_{problem}".format(student=student.id, problem=usage_key.to_deprecated_string())
     else:
-        task_input = {'problem_url': problem_url}
-        task_key_stub = "_{problem}".format(problem=problem_url)
+        task_input = {'problem_url': usage_key.to_deprecated_string()}
+        task_key_stub = "_{problem}".format(problem=usage_key.to_deprecated_string())
 
     # create the key value by using MD5 hash:
     task_key = hashlib.md5(task_key_stub).hexdigest()
@@ -264,32 +289,50 @@ def encode_problem_and_student_input(problem_url, student=None):
     return task_input, task_key
 
 
-def submit_task(request, task_type, task_class, course_id, task_input, task_key):
+def encode_entrance_exam_and_student_input(usage_key, student=None):  # pylint: disable=invalid-name
+    """
+    Encode usage_key and optional student into task_key and task_input values.
+
+    Args:
+        usage_key (Location): The usage_key identifying the entrance exam.
+        student (User): the student affected
+    """
+    assert isinstance(usage_key, UsageKey)
+    if student is not None:
+        task_input = {'entrance_exam_url': unicode(usage_key), 'student': student.username}
+        task_key_stub = "{student}_{entranceexam}".format(student=student.id, entranceexam=unicode(usage_key))
+    else:
+        task_input = {'entrance_exam_url': unicode(usage_key)}
+        task_key_stub = "_{entranceexam}".format(entranceexam=unicode(usage_key))
+
+    # create the key value by using MD5 hash:
+    task_key = hashlib.md5(task_key_stub).hexdigest()
+
+    return task_input, task_key
+
+
+def submit_task(request, task_type, task_class, course_key, task_input, task_key):
     """
     Helper method to submit a task.
 
-    Reserves the requested task, based on the `course_id`, `task_type`, and `task_key`,
+    Reserves the requested task, based on the `course_key`, `task_type`, and `task_key`,
     checking to see if the task is already running.  The `task_input` is also passed so that
     it can be stored in the resulting InstructorTask entry.  Arguments are extracted from
     the `request` provided by the originating server request.  Then the task is submitted to run
     asynchronously, using the specified `task_class` and using the task_id constructed for it.
 
+    Cannot be inside an atomic block.
+
     `AlreadyRunningError` is raised if the task is already running.
-
-    The _reserve_task method makes sure the InstructorTask entry is committed.
-    When called from any view that is wrapped by TransactionMiddleware,
-    and thus in a "commit-on-success" transaction, an autocommit buried within here
-    will cause any pending transaction to be committed by a successful
-    save here.  Any future database operations will take place in a
-    separate transaction.
-
     """
-    # check to see if task is already running, and reserve it otherwise:
-    instructor_task = _reserve_task(course_id, task_type, task_key, task_input, request.user)
+    with outer_atomic():
+        # check to see if task is already running, and reserve it otherwise:
+        instructor_task = _reserve_task(course_key, task_type, task_key, task_input, request.user)
 
-    # submit task:
+    # make sure all data has been committed before handing off task to celery.
+
     task_id = instructor_task.task_id
-    task_args = [instructor_task.id, _get_xmodule_instance_args(request, task_id)]  # pylint: disable=E1101
+    task_args = [instructor_task.id, _get_xmodule_instance_args(request, task_id)]
     task_class.apply_async(task_args, task_id=task_id)
 
     return instructor_task

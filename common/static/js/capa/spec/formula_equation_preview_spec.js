@@ -62,7 +62,17 @@ describe("Formula Equation Preview", function () {
         window.MathJax = {Hub: {}};
         MathJax.Hub.getAllJax = jasmine.createSpy('MathJax.Hub.getAllJax')
             .andReturn([this.jax]);
-        MathJax.Hub.Queue = jasmine.createSpy('MathJax.Hub.Queue');
+        MathJax.Hub.Queue = function (callback) {
+            if (typeof (callback) == 'function') {
+                callback();
+            }
+        }
+        spyOn(MathJax.Hub, 'Queue').andCallThrough()
+        MathJax.Hub.Startup = jasmine.createSpy('MathJax.Hub.Startup');
+        MathJax.Hub.Startup.signal = jasmine.createSpy('MathJax.Hub.Startup.signal');
+        MathJax.Hub.Startup.signal.Interest = function (callback) {
+            callback('End');
+        }
     });
 
     it('(the test) is able to swap out the behavior of $', function () {
@@ -129,7 +139,7 @@ describe("Formula Equation Preview", function () {
             // Either it makes a request or jumps straight into displaying ''.
             waitsFor(function () {
                 // (Short circuit if `inputAjax` is indeed called)
-                return Problem.inputAjax.wasCalled || 
+                return Problem.inputAjax.wasCalled ||  // jshint ignore:line
                     MathJax.Hub.Queue.wasCalled;
             }, "AJAX never called on user input", 1000);
 
@@ -225,8 +235,7 @@ describe("Formula Equation Preview", function () {
 
                 // Refresh the MathJax.
                 expect(MathJax.Hub.Queue).toHaveBeenCalledWith(
-                    ['Text', this.jax, 'THE_FORMULA'],
-                    ['Reprocess', this.jax]
+                    ['Text', this.jax, 'THE_FORMULA']
                 );
             });
         });
@@ -245,7 +254,7 @@ describe("Formula Equation Preview", function () {
 
                 // Cannot find MathJax.
                 MathJax.Hub.getAllJax.andReturn([]);
-                spyOn(console, 'warn');
+                spyOn(console, 'log');
 
                 callback({
                     preview: 'THE_FORMULA',
@@ -253,11 +262,11 @@ describe("Formula Equation Preview", function () {
                 });
 
                 // Tests.
-                expect(console.warn).toHaveBeenCalled();
+                expect(console.log).toHaveBeenCalled();
 
                 // We should look in the preview div for the MathJax.
                 var previewElement = $("#input_THE_ID_preview")[0];
-                expect(previewElement.firstChild.data).toEqual("\\[THE_FORMULA\\]");
+                expect(previewElement.firstChild.data).toEqual("\\(THE_FORMULA\\)");
 
                 // Refresh the MathJax.
                 expect(MathJax.Hub.Queue).toHaveBeenCalledWith(
@@ -292,8 +301,7 @@ describe("Formula Equation Preview", function () {
             runs(function () {
                 // Refresh the MathJax.
                 expect(MathJax.Hub.Queue).toHaveBeenCalledWith(
-                    ['Text', this.jax, '\\text{OOPSIE}'],
-                    ['Reprocess', this.jax]
+                    ['Text', this.jax, '\\text{OOPSIE}']
                 );
                 expect($img.css('visibility')).toEqual('hidden');
             });
@@ -339,17 +347,15 @@ describe("Formula Equation Preview", function () {
 
             this.callbacks[0](this.responses[0]);
             expect(MathJax.Hub.Queue).toHaveBeenCalledWith(
-                ['Text', this.jax, 'THE_FORMULA_0'],
-                ['Reprocess', this.jax]
+                ['Text', this.jax, 'THE_FORMULA_0']
             );
             expect($img.css('visibility')).toEqual('visible');
 
             this.callbacks[1](this.responses[1]);
             expect(MathJax.Hub.Queue).toHaveBeenCalledWith(
-                ['Text', this.jax, 'THE_FORMULA_1'],
-                ['Reprocess', this.jax]
+                ['Text', this.jax, 'THE_FORMULA_1']
             );
-            expect($img.css('visibility')).toEqual('hidden')
+            expect($img.css('visibility')).toEqual('hidden');
         });
 
         it("doesn't display outdated information", function () {
@@ -360,15 +366,14 @@ describe("Formula Equation Preview", function () {
             // Switch the order (1 returns before 0)
             this.callbacks[1](this.responses[1]);
             expect(MathJax.Hub.Queue).toHaveBeenCalledWith(
-                ['Text', this.jax, 'THE_FORMULA_1'],
-                ['Reprocess', this.jax]
+                ['Text', this.jax, 'THE_FORMULA_1']
             );
-            expect($img.css('visibility')).toEqual('hidden')
+            expect($img.css('visibility')).toEqual('hidden');
 
             MathJax.Hub.Queue.reset();
             this.callbacks[0](this.responses[0]);
             expect(MathJax.Hub.Queue).not.toHaveBeenCalled();
-            expect($img.css('visibility')).toEqual('hidden')
+            expect($img.css('visibility')).toEqual('hidden');
         });
 
         it("doesn't show an error if the responses are close together",
@@ -382,8 +387,7 @@ describe("Formula Equation Preview", function () {
 
                this.callbacks[1](this.responses[1]);
                expect(MathJax.Hub.Queue).toHaveBeenCalledWith(
-                   ['Text', this.jax, 'THE_FORMULA_1'],
-                   ['Reprocess', this.jax]
+                   ['Text', this.jax, 'THE_FORMULA_1']
                );
 
                // Make sure that it doesn't indeed show up later

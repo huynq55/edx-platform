@@ -1,15 +1,15 @@
-#pylint: disable=C0111
+# pylint: disable=missing-docstring
 
 from lettuce import world, step
-from xmodule.modulestore import Location
-from contentstore.utils import get_modulestore
 from selenium.webdriver.common.keys import Keys
+from xmodule.modulestore.django import modulestore
 
 VIDEO_BUTTONS = {
     'CC': '.hide-subtitles',
     'volume': '.volume',
     'play': '.video_control.play',
     'pause': '.video_control.pause',
+    'handout': '.video-handout.video-download-button a',
 }
 
 SELECTORS = {
@@ -21,9 +21,20 @@ SELECTORS = {
 DELAY = 0.5
 
 
+@step('youtube stub server (.*) YouTube API')
+def configure_youtube_api(_step, action):
+    action = action.strip()
+    if action == 'proxies':
+        world.youtube.config['youtube_api_blocked'] = False
+    elif action == 'blocks':
+        world.youtube.config['youtube_api_blocked'] = True
+    else:
+        raise ValueError('Parameter `action` should be one of "proxies" or "blocks".')
+
+
 @step('I have created a Video component$')
 def i_created_a_video_component(step):
-    world.create_course_with_unit()
+    step.given('I am in Studio editing a new unit')
     world.create_component_instance(
         step=step,
         category='video',
@@ -35,11 +46,13 @@ def i_created_a_video_component(step):
     world.wait_for_present('.is-initialized')
     world.wait(DELAY)
     world.wait_for_invisible(SELECTORS['spinner'])
+    if not world.youtube.config.get('youtube_api_blocked'):
+        world.wait_for_visible(SELECTORS['controls'])
 
 
 @step('I have created a Video component with subtitles$')
 def i_created_a_video_with_subs(_step):
-    _step.given('I have created a Video component with subtitles "OEoXaMPEzfM"')
+    _step.given('I have created a Video component with subtitles "3_yD_cEKoCk"')
 
 
 @step('I have created a Video component with subtitles "([^"]*)"$')
@@ -56,6 +69,13 @@ def i_created_a_video_with_subs_with_name(_step, sub_id):
     world.visit(video_url)
 
     world.wait_for_xmodule()
+
+    # update .sub filed with proper subs name (which mimics real Studio/XML behavior)
+    # this is needed only for that videos which are created in acceptance tests.
+    _step.given('I edit the component')
+    world.wait_for_ajax_complete()
+    _step.given('I save changes')
+
     world.disable_jquery_animations()
 
     world.wait_for_present('.is-initialized')
@@ -70,7 +90,11 @@ def i_have_uploaded_subtitles(_step, sub_id):
 
 @step('when I view the (.*) it does not have autoplay enabled$')
 def does_not_autoplay(_step, video_type):
-    assert world.css_find('.%s' % video_type)[0]['data-autoplay'] == 'False'
+    world.wait(DELAY)
+    world.wait_for_ajax_complete()
+    actual = world.css_find('.%s' % video_type)[0]['data-autoplay']
+    expected = [u'False', u'false', False]
+    assert actual in expected
     assert world.css_has_class('.video_control', 'play')
 
 
@@ -114,10 +138,10 @@ def xml_only_video(step):
     # Wait for the new unit to be created and to load the page
     world.wait(1)
 
-    location = world.scenario_dict['COURSE'].location
-    store = get_modulestore(location)
+    course = world.scenario_dict['COURSE']
+    store = modulestore()
 
-    parent_location = store.get_items(Location(category='vertical', revision='draft'))[0].location
+    parent_location = store.get_items(course.id, qualifiers={'category': 'vertical'})[0].location
 
     youtube_id = 'ABCDEFG'
     world.scenario_dict['YOUTUBE_ID'] = youtube_id
@@ -128,7 +152,9 @@ def xml_only_video(step):
     world.ItemFactory.create(
         parent_location=parent_location,
         category='video',
-        data='<video youtube="1.00:%s"></video>' % youtube_id
+        data='<video youtube="1.00:%s"></video>' % youtube_id,
+        modulestore=store,
+        user_id=world.scenario_dict["USER"].id
     )
 
 
@@ -143,7 +169,7 @@ def set_captions_visibility_state(_step, captions_state):
     SELECTOR = '.closed .subtitles'
     world.wait_for_visible('.hide-subtitles')
     if captions_state == 'closed':
-        if not world.is_css_present(SELECTOR):
+        if world.is_css_not_present(SELECTOR):
             world.css_find('.hide-subtitles').click()
     else:
         if world.is_css_present(SELECTOR):
@@ -170,11 +196,15 @@ def find_caption_line_by_data_index(index):
 
 @step('I focus on caption line with data-index "([^"]*)"$')
 def focus_on_caption_line(_step, index):
+    world.wait_for_present('.video.is-captions-rendered')
+    world.wait_for(lambda _: world.css_text('.subtitles'), timeout=30)
     find_caption_line_by_data_index(int(index.strip()))._element.send_keys(Keys.TAB)
 
 
 @step('I press "enter" button on caption line with data-index "([^"]*)"$')
 def click_on_the_caption(_step, index):
+    world.wait_for_present('.video.is-captions-rendered')
+    world.wait_for(lambda _: world.css_text('.subtitles'), timeout=30)
     find_caption_line_by_data_index(int(index.strip()))._element.send_keys(Keys.ENTER)
 
 
@@ -187,8 +217,21 @@ def caption_line_has_class(_step, index, className):
 @step('I see a range on slider$')
 def see_a_range_slider_with_proper_range(_step):
     world.wait_for_visible(VIDEO_BUTTONS['pause'])
-
     assert world.css_visible(".slider-range")
+
+
+@step('I (.*) see video button "([^"]*)"$')
+def do_not_see_or_not_button_video(_step, action, button_type):
+    world.wait(DELAY)
+    world.wait_for_ajax_complete()
+    action = action.strip()
+    button = button_type.strip()
+    if action == 'do not':
+        assert not world.is_css_present(VIDEO_BUTTONS[button])
+    elif action == 'can':
+        assert world.css_visible(VIDEO_BUTTONS[button])
+    else:
+        raise ValueError('Parameter `action` should be one of "do not" or "can".')
 
 
 @step('I click video button "([^"]*)"$')
@@ -198,3 +241,17 @@ def click_button_video(_step, button_type):
     button = button_type.strip()
     world.css_click(VIDEO_BUTTONS[button])
 
+
+@step('I seek video to "([^"]*)" seconds$')
+def seek_video_to_n_seconds(_step, seconds):
+    time = float(seconds.strip())
+    jsCode = "$('.video').data('video-player-state').videoPlayer.onSlideSeek({{time: {0:f}}})".format(time)
+    world.browser.execute_script(jsCode)
+
+
+@step('I see video starts playing from "([^"]*)" position$')
+def start_playing_video_from_n_seconds(_step, position):
+    world.wait_for(
+        func=lambda _: world.css_html('.vidtime')[:4] == position.strip(),
+        timeout=5
+    )

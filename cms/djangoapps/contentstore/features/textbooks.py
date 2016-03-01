@@ -1,5 +1,4 @@
-#pylint: disable=C0111
-#pylint: disable=W0621
+# pylint: disable=missing-docstring
 
 from lettuce import world, step
 from django.conf import settings
@@ -27,7 +26,7 @@ def assert_create_new_textbook_msg(_step):
 
 @step(u'I upload the textbook "([^"]*)"$')
 def upload_textbook(_step, file_name):
-    upload_file(file_name)
+    upload_file(file_name, sub_path="uploads/")
 
 
 @step(u'I click (on )?the New Textbook button')

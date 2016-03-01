@@ -1,16 +1,3 @@
-$ ->
-  if !window.$$contents
-    window.$$contents = {}
-  $.fn.extend
-    loading: (takeFocus) ->
-      @$_loading = $("<div class='loading-animation' tabindex='0'><span class='sr'>" + gettext("Loading content") + "</span></div>")
-      $(this).after(@$_loading)
-      if takeFocus
-        DiscussionUtil.makeFocusTrap(@$_loading)
-        @$_loading.focus()
-    loaded: ->
-      @$_loading.remove()
-
 class @DiscussionUtil
 
   @wmdEditors: {}
@@ -18,23 +5,30 @@ class @DiscussionUtil
   @getTemplate: (id) ->
     $("script##{id}").html()
 
+  @setUser: (user) ->
+    @user = user
+
+  @getUser: () ->
+    @user
+
   @loadRoles: (roles)->
     @roleIds = roles
 
-  @loadFlagModerator: (what)->
-    @isFlagModerator = ((what=="True") or (what == 1))
-
   @loadRolesFromContainer: ->
     @loadRoles($("#discussion-container").data("roles"))
-    @loadFlagModerator($("#discussion-container").data("flag-moderator"))
 
   @isStaff: (user_id) ->
+    user_id ?= @user?.id
     staff = _.union(@roleIds['Moderator'], @roleIds['Administrator'])
     _.include(staff, parseInt(user_id))
 
   @isTA: (user_id) ->
+    user_id ?= @user?.id
     ta = _.union(@roleIds['Community TA'])
     _.include(ta, parseInt(user_id))
+
+  @isPrivilegedUser: (user_id) ->
+    @isStaff(user_id) || @isTA(user_id)
 
   @bulkUpdateContentInfo: (infos) ->
     for id, info of infos
@@ -51,7 +45,6 @@ class @DiscussionUtil
       follow_discussion       : "/courses/#{$$course_id}/discussion/#{param}/follow"
       unfollow_discussion     : "/courses/#{$$course_id}/discussion/#{param}/unfollow"
       create_thread           : "/courses/#{$$course_id}/discussion/#{param}/threads/create"
-      search_similar_threads  : "/courses/#{$$course_id}/discussion/#{param}/threads/search_similar"
       update_thread           : "/courses/#{$$course_id}/discussion/threads/#{param}/update"
       create_comment          : "/courses/#{$$course_id}/discussion/threads/#{param}/reply"
       delete_thread           : "/courses/#{$$course_id}/discussion/threads/#{param}/delete"
@@ -74,6 +67,7 @@ class @DiscussionUtil
       downvote_comment        : "/courses/#{$$course_id}/discussion/comments/#{param}/downvote"
       undo_vote_for_comment   : "/courses/#{$$course_id}/discussion/comments/#{param}/unvote"
       upload                  : "/courses/#{$$course_id}/discussion/upload"
+      users                   : "/courses/#{$$course_id}/discussion/users"
       search                  : "/courses/#{$$course_id}/discussion/forum/search"
       retrieve_discussion     : "/courses/#{$$course_id}/discussion/forum/#{param}/inline"
       retrieve_single_thread  : "/courses/#{$$course_id}/discussion/forum/#{param}/threads/#{param1}"
@@ -88,6 +82,10 @@ class @DiscussionUtil
       "notifications_status" : "/notification_prefs/status/"
     }[name]
 
+  @ignoreEnterKey: (event) =>
+    if event.which == 13
+      event.preventDefault()
+
   @activateOnSpace: (event, func) ->
     if event.which == 32
       event.preventDefault()
@@ -100,12 +98,22 @@ class @DiscussionUtil
           event.preventDefault()
     )
 
+  @showLoadingIndicator: (element, takeFocus) ->
+    @$_loading = $("<div class='loading-animation' tabindex='0'><span class='sr'>" + gettext("Loading content") + "</span></div>")
+    element.after(@$_loading)
+    if takeFocus
+      @makeFocusTrap(@$_loading)
+      @$_loading.focus()
+
+  @hideLoadingIndicator: () ->
+    @$_loading.remove()
+
   @discussionAlert: (header, body) ->
     if $("#discussion-alert").length == 0
       alertDiv = $("<div class='modal' role='alertdialog' id='discussion-alert' aria-describedby='discussion-alert-message'/>").css("display", "none")
       alertDiv.html(
         "<div class='inner-wrapper discussion-alert-wrapper'>" +
-        "  <button class='close-modal dismiss' aria-hidden='true'>&#10005;</button>" +
+        "  <button class='close-modal dismiss' aria-hidden='true'><i class='icon fa fa-times'></i></button>" +
         "  <header><h2/><hr/></header>" +
         "  <p id='discussion-alert-message'/>" +
         "  <hr/>" +
@@ -123,32 +131,43 @@ class @DiscussionUtil
 
   @safeAjax: (params) ->
     $elem = params.$elem
+
     if $elem and $elem.attr("disabled")
-      return
+      deferred = $.Deferred()
+      deferred.reject()
+      return deferred.promise()
+
     params["url"] = URI(params["url"]).addSearch ajax: 1
-    params["beforeSend"] = ->
+    params["beforeSend"] = =>
       if $elem
         $elem.attr("disabled", "disabled")
       if params["$loading"]
         if params["loadingCallback"]?
           params["loadingCallback"].apply(params["$loading"])
         else
-          params["$loading"].loading(params["takeFocus"])
+          @showLoadingIndicator($(params["$loading"]), params["takeFocus"])
     if !params["error"]
       params["error"] = =>
         @discussionAlert(
           gettext("Sorry"),
           gettext("We had some trouble processing your request. Please ensure you have copied any unsaved work and then reload the page.")
         )
-    request = $.ajax(params).always ->
+    request = $.ajax(params).always =>
       if $elem
         $elem.removeAttr("disabled")
       if params["$loading"]
         if params["loadedCallback"]?
           params["loadedCallback"].apply(params["$loading"])
         else
-          params["$loading"].loaded()
+          @hideLoadingIndicator()
     return request
+
+  @updateWithUndo: (model, updates, safeAjaxParams, errorMsg) ->
+    if errorMsg
+      safeAjaxParams.error = => @discussionAlert(gettext("Sorry"), errorMsg)
+    undo = _.pick(model.attributes, _.keys(updates))
+    model.set(updates)
+    @safeAjax(safeAjaxParams).fail(() -> model.set(undo))
 
   @bindLocalEvents: ($local, eventsHandler) ->
     for eventSelector, handler of eventsHandler
@@ -157,11 +176,20 @@ class @DiscussionUtil
 
   @formErrorHandler: (errorsField) ->
     (xhr, textStatus, error) ->
-      response = JSON.parse(xhr.responseText)
-      if response.errors? and response.errors.length > 0
-        errorsField.empty()
-        for error in response.errors
-          errorsField.append($("<li>").addClass("new-post-form-error").html(error)).show()
+      makeErrorElem = (message) ->
+        $("<li>").addClass("post-error").html(message)
+      errorsField.empty().show()
+      if xhr.status == 400
+        response = JSON.parse(xhr.responseText)
+        if response.errors? and response.errors.length > 0
+          for error in response.errors
+            errorsField.append(makeErrorElem(error))
+      else
+        errorsField.append(
+          makeErrorElem(
+            gettext("We had some trouble processing your request. Please try again.")
+          )
+        )
 
   @clearFormErrors: (errorsField) ->
     errorsField.empty()
@@ -291,3 +319,28 @@ class @DiscussionUtil
         minLength++
       return text.substr(0, minLength) + gettext('…')
 
+  @abbreviateHTML: (html, minLength) ->
+    # Abbreviates the html to at least minLength characters, stopping at word boundaries
+    truncated_text = jQuery.truncate(html, {length: minLength, noBreaks: true, ellipsis: gettext('…')})
+    $result = $("<div>" + truncated_text + "</div>")
+    imagesToReplace = $result.find("img:not(:first)")
+    if imagesToReplace.length > 0
+        $result.append("<p><em>Some images in this post have been omitted</em></p>")
+    imagesToReplace.replaceWith("<em>image omitted</em>")
+    $result.html()
+
+  @getPaginationParams: (curPage, numPages, pageUrlFunc) =>
+    delta = 2
+    minPage = Math.max(curPage - delta, 1)
+    maxPage = Math.min(curPage + delta, numPages)
+    pageInfo = (pageNum) -> {number: pageNum, url: pageUrlFunc(pageNum)}
+    params =
+      page: curPage
+      lowPages: _.range(minPage, curPage).map(pageInfo)
+      highPages: _.range(curPage+1, maxPage+1).map(pageInfo)
+      previous: if curPage > 1 then pageInfo(curPage - 1) else null
+      next: if curPage < numPages then pageInfo(curPage + 1) else null
+      leftdots: minPage > 2
+      rightdots: maxPage < numPages-1
+      first: if minPage > 1 then pageInfo(1) else null
+      last: if maxPage < numPages then pageInfo(numPages) else null

@@ -1,6 +1,6 @@
 (function (undefined) {
     describe('Video', function () {
-        var oldOTBD;
+        var oldOTBD, state;
 
         beforeEach(function () {
             jasmine.stubRequests();
@@ -8,6 +8,8 @@
 
         afterEach(function () {
             $('source').remove();
+            window.VideoState = {};
+            window.VideoState.id = {};
         });
 
         describe('constructor', function () {
@@ -15,11 +17,12 @@
                 beforeEach(function () {
                     loadFixtures('video.html');
                     $.cookie.andReturn('0.50');
+                    this.state = jasmine.initializePlayerYouTube('video_html5.html');
                 });
 
                 describe('by default', function () {
-                    beforeEach(function () {
-                        this.state = new window.Video('#example');
+                    afterEach(function () {
+                        this.state.videoPlayer.destroy();
                     });
 
                     it('check videoType', function () {
@@ -52,19 +55,16 @@
                 var state;
 
                 beforeEach(function () {
-                    loadFixtures('video_html5.html');
                     $.cookie.andReturn('0.75');
+                    state = jasmine.initializePlayer('video_html5.html');
+                });
+
+                afterEach(function () {
+                    state.videoPlayer.destroy();
+                    state = undefined;
                 });
 
                 describe('by default', function () {
-                    beforeEach(function () {
-                        state = new window.Video('#example');
-                    });
-
-                    afterEach(function () {
-                        state = undefined;
-                    });
-
                     it('check videoType', function () {
                         expect(state.videoType).toEqual('html5');
                     });
@@ -73,79 +73,8 @@
                         expect(state.el).toBe('#video_id');
                     });
 
-                    it('parse the videos if subtitles exist', function () {
-                        var sub = 'Z5KLxerq05Y';
-
-                        expect(state.videos).toEqual({
-                            '0.75': sub,
-                            '1.0': sub,
-                            '1.25': sub,
-                            '1.5': sub
-                        });
-                    });
-
-                    it(
-                        'parse the videos if subtitles do not exist',
-                        function ()
-                    {
-                        var sub = '';
-
-                        $('#example').find('.video').data('sub', '');
-                        state = new window.Video('#example');
-
-                        expect(state.videos).toEqual({
-                            '0.75': sub,
-                            '1.0': sub,
-                            '1.25': sub,
-                            '1.5': sub
-                        });
-                    });
-
-                    it('parse Html5 sources', function () {
-                        var html5Sources = {
-                                mp4: null,
-                                webm: null,
-                                ogg: null
-                            }, v = document.createElement('video');
-
-                        if (
-                            !!(
-                                v.canPlayType &&
-                                v.canPlayType(
-                                    'video/webm; codecs="vp8, vorbis"'
-                                ).replace(/no/, '')
-                            )
-                        ) {
-                            html5Sources['webm'] =
-                                'xmodule/include/fixtures/test.webm';
-                        }
-
-                        if (
-                            !!(
-                                v.canPlayType &&
-                                v.canPlayType(
-                                    'video/mp4; codecs="avc1.42E01E, ' +
-                                    'mp4a.40.2"'
-                                ).replace(/no/, '')
-                            )
-                        ) {
-                            html5Sources['mp4'] =
-                                'xmodule/include/fixtures/test.mp4';
-                        }
-
-                        if (
-                            !!(
-                                v.canPlayType &&
-                                v.canPlayType(
-                                    'video/ogg; codecs="theora"'
-                                ).replace(/no/, '')
-                            )
-                        ) {
-                            html5Sources['ogg'] =
-                                'xmodule/include/fixtures/test.ogv';
-                        }
-
-                        expect(state.html5Sources).toEqual(html5Sources);
+                    it('doesn\'t have `videos` dictionary', function () {
+                        expect(state.videos).toBeUndefined();
                     });
 
                     it('parse available video speeds', function () {
@@ -164,14 +93,6 @@
                 // the stand alone HTML5 player object is already loaded, so no
                 // further testing in that case is required.
                 describe('HTML5 API is available', function () {
-                    beforeEach(function () {
-                        state = new Video('#example');
-                    });
-
-                    afterEach(function () {
-                        state = null;
-                    });
-
                     it('create the Video Player', function () {
                         expect(state.videoPlayer.player).not.toBeUndefined();
                     });
@@ -179,27 +100,31 @@
             });
         });
 
-        describe('youtubeId', function () {
+        describe('YouTube API is not loaded', function () {
             beforeEach(function () {
-                loadFixtures('video.html');
-                $.cookie.andReturn('1.0');
-                state = new Video('#example');
+                window.YT = undefined;
+                state = jasmine.initializePlayerYouTube();
+            })
+
+            afterEach(function () {
+                state.videoPlayer.destroy();
             });
 
-            describe('with speed', function () {
-                it('return the video id for given speed', function () {
-                    expect(state.youtubeId('0.50'))
-                        .toEqual('7tqY6eQzVhE');
-                    expect(state.youtubeId('1.0'))
-                        .toEqual('cogebirgzzM');
-                    expect(state.youtubeId('1.50'))
-                        .toEqual('abcdefghijkl');
-                });
-            });
+            it('callback, to be called after YouTube API loads, exists and is called', function () {
+                waitsFor(function () {
+                    return state.youtubeApiAvailable === true;
+                }, 'YouTube API is loaded', 3000);
 
-            describe('without speed', function () {
-                it('return the video id for current speed', function () {
-                    expect(state.youtubeId()).toEqual('abcdefghijkl');
+                window.YT = jasmine.YT;
+
+                // Call the callback that must be called when YouTube API is
+                // loaded. By specification.
+                window.onYouTubeIframeAPIReady();
+
+                runs(function () {
+                    // If YouTube API is not loaded, then the code will should create
+                    // a global callback that will be called by API once it is loaded.
+                    expect(window.onYouTubeIframeAPIReady).not.toBeUndefined();
                 });
             });
         });
@@ -233,9 +158,8 @@
                 }
             ];
 
-            beforeEach(function () {
-                loadFixtures('video.html');
-
+            afterEach(function () {
+                state.videoPlayer.destroy();
             });
 
             $.each(miniTestSuite, function (index, test) {
@@ -246,13 +170,10 @@
 
             function itFabrique(itDescription, data, expectData) {
                 it(itDescription, function () {
-                    $('#example').find('.video')
-                        .data({
-                            'start': data.start,
-                            'end': data.end
-                        });
-
-                    state = new Video('#example');
+                    state = jasmine.initializePlayer('video.html', {
+                        'start': data.start,
+                        'end': data.end
+                    });
 
                     expect(state.config.startTime).toBe(expectData.start);
                     expect(state.config.endTime).toBe(expectData.end);
@@ -310,105 +231,6 @@
                 //
                 //     this.youtubeXhr = this.getVideoMetadata();
                 expect(numAjaxCalls).toBe(1);
-            });
-        });
-
-        describe('setSpeed', function () {
-
-            describe('YT', function () {
-                beforeEach(function () {
-                    loadFixtures('video.html');
-                    state = new Video('#example');
-                });
-
-                it('check mapping', function () {
-                    var map = {
-                        '0.75': '0.50',
-                        '1.25': '1.50'
-                    };
-
-                    $.each(map, function(key, expected) {
-                        state.setSpeed(key, true);
-                        expect(state.speed).toBe(expected);
-                    });
-                });
-            });
-            describe('HTML5', function () {
-                beforeEach(function () {
-                    loadFixtures('video_html5.html');
-                    state = new Video('#example');
-                });
-
-                describe('when new speed is available', function () {
-                    beforeEach(function () {
-                        state.setSpeed('0.75', true);
-                    });
-
-                    it('set new speed', function () {
-                        expect(state.speed).toEqual('0.75');
-                    });
-
-                    it('save setting for new speed', function () {
-
-                        expect(state.storage.getItem('general_speed')).toBe('0.75');
-                        expect(state.storage.getItem('video_speed_' + state.id)).toBe('0.75');
-                    });
-                });
-
-                describe('when new speed is not available', function () {
-                    beforeEach(function () {
-                        state.setSpeed('1.75');
-                    });
-
-                    it('set speed to 1.0x', function () {
-                        expect(state.speed).toEqual('1.0');
-                    });
-                });
-
-                it('check mapping', function () {
-                    var map = {
-                        '0.25': '0.75',
-                        '0.50': '0.75',
-                        '2.0': '1.50'
-                    };
-
-                    $.each(map, function(key, expected) {
-                        state.setSpeed(key, true);
-                        expect(state.speed).toBe(expected);
-                    });
-                });
-            });
-        });
-
-        describe('getDuration', function () {
-            beforeEach(function () {
-                loadFixtures('video.html');
-                state = new Video('#example');
-            });
-
-            it('return duration for current video', function () {
-                expect(state.getDuration()).toEqual(400);
-            });
-        });
-
-        describe('log', function () {
-            beforeEach(function () {
-                loadFixtures('video_html5.html');
-                state = new Video('#example');
-                spyOn(Logger, 'log');
-                state.videoPlayer.log('someEvent', {
-                    currentTime: 25,
-                    speed: '1.0'
-                });
-            });
-
-            it('call the logger with valid extra parameters', function () {
-                expect(Logger.log).toHaveBeenCalledWith('someEvent', {
-                    id: 'id',
-                    code: 'html5',
-                    currentTime: 25,
-                    speed: '1.0'
-                });
             });
         });
     });

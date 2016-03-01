@@ -1,62 +1,37 @@
-<%! from django.utils.translation import ugettext as _ %>
-
-<%! from django.core.urlresolvers import reverse %>
-<%! from time import strftime %>
 <%inherit file="main.html" />
 <%namespace name='static' file='static_content.html'/>
-
-<%! from microsite_configuration.middleware import MicrositeConfiguration %>
-
-<%
-  homepage_overlay_html = MicrositeConfiguration.get_microsite_configuration_value('homepage_overlay_html')
-
-  show_homepage_promo_video = MicrositeConfiguration.get_microsite_configuration_value('show_homepage_promo_video', True)
-  homepage_promo_video_youtube_id = MicrositeConfiguration.get_microsite_configuration_value('homepage_promo_video_youtube_id', "XNaiOGxWeto")
-  
-  show_partners = MicrositeConfiguration.get_microsite_configuration_value('show_partners', True)
-
+<%!
+from django.utils.translation import ugettext as _
+from django.core.urlresolvers import reverse
 %>
 
 <section class="home">
   <header>
     <div class="outer-wrapper">
       <div class="title">
-        <hgroup>
+        <div class="heading-group">
           % if homepage_overlay_html:
             ${homepage_overlay_html}
           % else:
-            % if self.stanford_theme_enabled():
-              <h1>${_("Free courses from <strong>{university_name}</strong>").format(university_name="Stanford")}</h1>
-            % else:
-              <h1>${_("The Future of Online Education")}</h1>
-            % endif
-            <h2>${_("For anyone, anywhere, anytime")}</h2>
+              ## Translators: 'Open edX' is a brand, please keep this untranslated. See http://openedx.org for more information.
+              <h1>${_("Welcome to Open edX!")}</h1>
+              ## Translators: 'Open edX' is a brand, please keep this untranslated. See http://openedx.org for more information.
+              <p>${_("It works! This is the default homepage for this Open edX instance.")}</p>
           % endif
-        </hgroup>
+        </div>
+        % if settings.FEATURES.get('ENABLE_COURSE_DISCOVERY'):
+          <div class="course-search">
+            <form method="get" action="/courses">
+              <label><span class="sr">${_("Search for a course")}</span>
+                <input class="search-input" name="search_query" type="text" placeholder="${_("Search for a course")}"></input>
+              </label>
+              <button class="search-button" type="submit">
+                <i class="icon fa fa-search" aria-hidden="true"></i><span class="sr">${_("Search")}</span>
+              </button>
+            </form>
+          </div>
+        % endif
 
-        ## Disable social buttons for non-edX sites
-        % if not self.theme_enabled():
-          <section class="actions">
-            <div class="main-cta">
-              <a href="#signup-modal" id="signup_action" class="find-courses" rel="leanModal">${_("Sign Up")}</a>
-            </div>
-
-            <div class="secondary-actions">
-              <div class="social-sharing">
-                <div class="sharing-message">${_("Stay up to date with all {platform_name} has to offer!").format(platform_name=settings.PLATFORM_NAME)}</div>
-                <a href="https://twitter.com/edXOnline" class="share">
-                  <img src="${static.url('images/social/twitter-sharing.png')}">
-                </a>
-                <a href="http://www.facebook.com/EdxOnline" class="share">
-                  <img src="${static.url('images/social/facebook-sharing.png')}">
-                </a>
-                <a href="https://plus.google.com/108235383044095082735/posts" class="share">
-                  <img src="${static.url('images/social/google-plus-sharing.png')}">
-                </a>
-              </div>
-            </div>
-          </section>
-          % endif
       </div>
 
       % if show_homepage_promo_video:
@@ -67,145 +42,19 @@
         </a>
       % endif
     </div>
+
   </header>
-  <section class="container">
-    <section class="highlighted-courses">
-      ## Disable university partner logos and sites for non-edX sites
-      % if not self.theme_enabled() and show_partners:
-        <h2>${_('Explore free courses from {span_start}{platform_name}{span_end} universities').format(platform_name="edX", span_start='<span class="edx">', span_end='</span>')}</h2>
+  <%include file="${courses_list}" />
 
-        <section class="university-partners university-partners2x6">
-          <ol class="partners">
-            <li class="partner mit">
-              <a href="#">
-                <img src="${static.url('images/university/mit/mit.png')}" />
-                <div class="name">
-                  <span>MITx</span>
-                </div>
-              </a>
-            </li>
-            <li class="partner">
-              <a href="#">
-                <img src="${static.url('images/university/harvard/harvard.png')}" />
-                <div class="name">
-                  <span>HarvardX</span>
-                </div>
-              </a>
-            </li>
-            <li class="partner">
-              <a href="#">
-                <img src="${static.url('images/university/berkeley/berkeley.png')}" />
-                <div class="name">
-                  <span>BerkeleyX</span>
-                </div>
-              </a>
-            </li>
-            <li class="partner">
-              <a href="#">
-                <img src="${static.url('images/university/ut/ut-rollover_350x150.png')}" />
-                <div class="name">
-                  <span>UTx</span>
-                </div>
-              </a>
-            </li>
-            <li class="partner">
-              <a href="#">
-                <img src="${static.url('images/university/mcgill/mcgill.png')}" />
-                <div class="name">
-                  <span>McGillX</span>
-                </div>
-              </a>
-            </li>
-            <li class="partner">
-              <a href="#">
-                <img src="${static.url('images/university/anu/anu.png')}" />
-                <div class="name">
-                  <span>ANUx</span>
-                </div>
-              </a>
-            </li>
-          </ol>
+</section>
 
-          <hr />
-
-          <ol class="partners">
-            <li class="partner">
-              <a href="#">
-                <img src="${static.url('images/university/wellesley/wellesley-rollover_350x150.png')}" />
-                <div class="name">
-                  <span>WellesleyX</span>
-                </div>
-              </a>
-            </li>
-            <li class="partner">
-              <a href="#">
-                <img src="${static.url('images/university/georgetown/georgetown-rollover_350x150.png')}" />
-                <div class="name">
-                  <span>GeorgetownX</span>
-                </div>
-              </a>
-            </li>
-            <li class="partner">
-              <a href="#">
-                <img src="${static.url('images/university/toronto/toronto.png')}" />
-                <div class="name">
-                  <span>University of TorontoX</span>
-                </div>
-              </a>
-            </li>
-            <li class="partner">
-              <a href="#">
-                <img src="${static.url('images/university/epfl/epfl.png')}" />
-                <div class="name">
-                  <span>EPFLx</span>
-                </div>
-              </a>
-            </li>
-            <li class="partner">
-              <a href="#">
-                <img src="${static.url('images/university/delft/delft.png')}" />
-                <div class="name">
-                  <span>DelftX</span>
-                </div>
-              </a>
-            </li>
-            <li class="partner">
-              <a href="#">
-                <img src="${static.url('images/university/rice/rice.png')}" />
-                <div class="name">
-                  <span>RiceX</span>
-                </div>
-              </a>
-            </li>
-          </ol>
-        </section>
-      % endif
-
-      % if settings.FEATURES.get('COURSES_ARE_BROWSABLE'):
-        <section class="courses">
-            <ul class="courses-listing">
-            %for course in courses:
-              <li class="courses-listing-item">
-                <%include file="course.html" args="course=course" />
-              </li>
-            %endfor
-            </ul>
-        </section>
-      % endif
-    </section>
+% if show_homepage_promo_video:
+  <section id="video-modal" class="modal home-page-video-modal video-modal">
+    <div class="inner-wrapper">
+      <iframe title="YouTube Video" width="640" height="360" src="//www.youtube.com/embed/${homepage_promo_video_youtube_id}?showinfo=0" frameborder="0" allowfullscreen></iframe>
+    </div>
   </section>
-</section>
-
-<section id="video-modal" class="modal home-page-video-modal video-modal">
-  <div class="inner-wrapper">
-    <%
-      youtube_video_id = homepage_promo_video_youtube_id
-      if self.stanford_theme_enabled():
-        youtube_video_id = "2gmreZObCY4"
-    %>
-    <iframe width="640" height="360" src="//www.youtube.com/embed/${youtube_video_id}?showinfo=0" frameborder="0" allowfullscreen></iframe>
-  </div>
-</section>
+% endif
 
 <%block name="js_extra">
    <script type="text/javascript">

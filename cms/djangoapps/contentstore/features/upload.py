@@ -1,5 +1,5 @@
-#pylint: disable=C0111
-#pylint: disable=W0621
+# pylint: disable=missing-docstring
+# pylint: disable=redefined-outer-name
 
 from lettuce import world, step
 from lettuce.django import django_url
@@ -10,7 +10,7 @@ import random
 import os
 from django.contrib.auth.models import User
 from student.models import CourseEnrollment
-from nose.tools import assert_equal, assert_not_equal  # pylint: disable=E0611
+from nose.tools import assert_equal, assert_not_equal
 
 TEST_ROOT = settings.COMMON_TEST_DATA_ROOT
 ASSET_NAMES_CSS = 'td.name-col > span.title > a.filename'
@@ -25,9 +25,11 @@ def go_to_uploads(_step):
 
 
 @step(u'I upload the( test)? file "([^"]*)"$')
-def upload_file(_step, is_test_file, file_name):
-    upload_css = 'a.upload-button'
-    world.css_click(upload_css)
+def upload_file(_step, is_test_file, file_name, button_text=None):
+    if button_text:
+        world.click_link(button_text)
+    else:
+        world.click_link('Upload New File')
 
     if not is_test_file:
         _write_test_file(file_name, "test file")
@@ -38,6 +40,11 @@ def upload_file(_step, is_test_file, file_name):
     world.browser.attach_file('file', os.path.abspath(path))
     close_css = 'a.close-button'
     world.css_click(close_css)
+
+
+@step(u'I upload the file "([^"]*)" by clicking "([^"]*)"')
+def upload_file_on_button_press(_step, file_name, button_text=None):
+    upload_file(_step, '', file_name, button_text)
 
 
 @step(u'I upload the files "([^"]*)"$')
@@ -67,7 +74,7 @@ def check_not_there(_step, file_name):
     # the only file that was uploaded, our success criteria
     # will be that there are no files.
     # In the future we can refactor if necessary.
-    assert(world.is_css_not_present(ASSET_NAMES_CSS))
+    assert world.is_css_not_present(ASSET_NAMES_CSS)
 
 
 @step(u'I should see the file "([^"]*)" was uploaded$')
@@ -147,7 +154,7 @@ def user_foo_is_enrolled_in_the_course(step, name):
     world.create_user(name, 'test')
     user = User.objects.get(username=name)
 
-    course_id = world.scenario_dict['COURSE'].location.course_id
+    course_id = world.scenario_dict['COURSE'].id
     CourseEnrollment.enroll(user, course_id)
 
 
@@ -178,7 +185,13 @@ def open_course_with_locked(step, lock_state):
 
 @step(u'Then the asset is (viewable|protected)$')
 def view_asset(_step, status):
-    url = django_url('/c4x/MITx/999/asset/asset.html')
+    asset_loc = world.scenario_dict['COURSE'].id.make_asset_key(asset_type='asset', path='asset.html')
+    svr_loc = django_url()
+    asset_url = unicode(asset_loc)
+    divider = '/'
+    if asset_url[0] == '/':
+        divider = ''
+    url = '{}{}{}'.format(svr_loc, divider, asset_url)
     if status == 'viewable':
         expected_text = 'test file'
     else:

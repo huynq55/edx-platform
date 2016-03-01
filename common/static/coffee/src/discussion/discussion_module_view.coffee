@@ -7,15 +7,14 @@ if Backbone?
       "click .new-post-btn": "toggleNewPost"
       "keydown .new-post-btn":
         (event) -> DiscussionUtil.activateOnSpace(event, @toggleNewPost)
-      "click .new-post-cancel": "hideNewPost"
       "click .discussion-paginator a": "navigateToPage"
 
-    paginationTemplate: -> DiscussionUtil.getTemplate("_pagination")
     page_re: /\?discussion_page=(\d+)/
-    initialize: ->
+    initialize: (options) ->
       @toggleDiscussionBtn = @$(".discussion-show")
       # Set the page if it was set in the URL. This is used to allow deep linking to pages
       match = @page_re.exec(window.location.href)
+      @context = options.context or "course"  # allowed values are "course" or "standalone"
       if match
         @page = parseInt(match[1])
       else
@@ -30,15 +29,14 @@ if Backbone?
       if @showed
         @newPostForm.slideDown(300)
       else
-        @newPostForm.show()
+        @newPostForm.show().focus()
       @toggleDiscussionBtn.addClass('shown')
       @toggleDiscussionBtn.find('.button-text').html(gettext("Hide Discussion"))
       @$("section.discussion").slideDown()
       @showed = true
 
-    hideNewPost: (event) ->
-      event.preventDefault()
-      @newPostForm.slideUp(300)
+    hideNewPost: =>
+     @newPostForm.slideUp(300)
 
     hideDiscussion: =>
       @$("section.discussion").slideUp()
@@ -83,68 +81,81 @@ if Backbone?
 
     renderDiscussion: ($elem, response, textStatus, discussionId) =>
       $elem.focus()
-      window.user = new DiscussionUser(response.user_info)
+      user = new DiscussionUser(response.user_info)
+      window.user = user
+      DiscussionUtil.setUser(user)
       Content.loadContentInfos(response.annotated_content_info)
       DiscussionUtil.loadRoles(response.roles)
-      allow_anonymous = response.allow_anonymous
-      allow_anonymous_to_peers = response.allow_anonymous_to_peers
-      cohorts = response.cohorts
-      # $elem.html("Hide Discussion")
+
+      @course_settings = new DiscussionCourseSettings(response.course_settings)
       @discussion = new Discussion()
       @discussion.reset(response.discussion_data, {silent: false})
 
-      #use same discussion template but different thread templated
-      #determined in the coffeescript based on whether or not there's a
-      #group id
-      
-      if response.is_cohorted and response.is_moderator
-        source = "script#_inline_discussion_cohorted"
-      else
-        source = "script#_inline_discussion"
-      
-      $discussion = $(Mustache.render $(source).html(), {'threads':response.discussion_data, 'discussionId': discussionId, 'allow_anonymous_to_peers': allow_anonymous_to_peers, 'allow_anonymous': allow_anonymous, 'cohorts':cohorts})
+      $discussion = _.template($("#inline-discussion-template").html())(
+        'threads': response.discussion_data,
+        'discussionId': discussionId
+      )
       if @$('section.discussion').length
         @$('section.discussion').replaceWith($discussion)
       else
         @$el.append($discussion)
-      @newPostForm = $('.new-post-article')
-      @threadviews = @discussion.map (thread) ->
-        new DiscussionThreadInlineView el: @$("article#thread_#{thread.id}"), model: thread
+
+      @newPostForm = this.$el.find('.new-post-article')
+      @threadviews = @discussion.map (thread) =>
+        view = new DiscussionThreadView(
+          el: @$("article#thread_#{thread.id}"),
+          model: thread,
+          mode: "inline",
+          context: @context,
+          course_settings: @course_settings,
+          topicId: discussionId
+        )
+        thread.on "thread:thread_type_updated", ->
+          view.rerender()
+          view.expand()
+        return view
       _.each @threadviews, (dtv) -> dtv.render()
       DiscussionUtil.bulkUpdateContentInfo(window.$$annotated_content_info)
-      @newPostView = new NewPostInlineView el: @$('.new-post-article'), collection: @discussion
+      @newPostView = new NewPostView(
+        el: @newPostForm,
+        collection: @discussion,
+        course_settings: @course_settings,
+        topicId: discussionId,
+        is_commentable_cohorted: response.is_commentable_cohorted
+      )
+      @newPostView.render()
+      @listenTo( @newPostView, 'newPost:cancel', @hideNewPost )
       @discussion.on "add", @addThread
+
       @retrieved = true
       @showed = true
-      @renderPagination(2, response.num_pages)
+      @renderPagination(response.num_pages)
+
       if @isWaitingOnNewPost
-        @newPostForm.show()
+        @newPostForm.show().focus()
 
     addThread: (thread, collection, options) =>
       # TODO: When doing pagination, this will need to repaginate. Perhaps just reload page 1?
       article = $("<article class='discussion-thread' id='thread_#{thread.id}'></article>")
       @$('section.discussion > .threads').prepend(article)
-      threadView = new DiscussionThreadInlineView el: article, model: thread
+
+      threadView = new DiscussionThreadView(
+        el: article,
+        model: thread,
+        mode: "inline",
+        context: @context,
+        course_settings: @course_settings,
+        topicId: @$el.data("discussion-id")
+      )
       threadView.render()
       @threadviews.unshift threadView
 
-    renderPagination: (delta, numPages) =>
-      minPage = Math.max(@page - delta, 1)
-      maxPage = Math.min(@page + delta, numPages)
+    renderPagination: (numPages) =>
       pageUrl = (number) ->
         "?discussion_page=#{number}"
-      params =
-        page: @page
-        lowPages: _.range(minPage, @page).map (n) -> {number: n, url: pageUrl(n)}
-        highPages: _.range(@page+1, maxPage+1).map (n) -> {number: n, url: pageUrl(n)}
-        previous: if @page-1 >= 1 then {url: pageUrl(@page-1), number: @page-1} else false
-        next: if @page+1 <= numPages then {url: pageUrl(@page+1), number: @page+1} else false
-        leftdots: minPage > 2
-        rightdots: maxPage < numPages-1
-        first: if minPage > 1 then {url: pageUrl(1)} else false
-        last: if maxPage < numPages then {number: numPages, url: pageUrl(numPages)} else false
-      thing = Mustache.render @paginationTemplate(), params
-      @$('section.pagination').html(thing)
+      params = DiscussionUtil.getPaginationParams(@page, numPages, pageUrl)
+      pagination = _.template($("#pagination-template").html())(params)
+      @$('section.discussion-pagination').html(pagination)
 
     navigateToPage: (event) =>
       event.preventDefault()

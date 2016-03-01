@@ -1,13 +1,16 @@
-## -*- coding: utf-8 -*-
-<%! from django.utils.translation import ugettext as _ %>
+## coding=utf-8
 <%namespace name='static' file='static_content.html'/>
-
+<%!
+from openedx.core.djangolib.markup import ugettext as _
+from openedx.core.djangolib.js_utils import (
+    dump_js_escaped_json, js_escaped_string
+)
+%>
+<%page expression_filter="h"/>
 <!doctype html>
-<!--[if IE 7]><html class="ie7 lte9 lte8 lte7"><![endif]-->
-<!--[if IE 8]><html class="ie8 lte9 lte8"><![endif]-->
-<!--[if IE 9]><html class="ie9 lte9"><![endif]-->
-<!--[if gt IE 9]><!--><html><!--<![endif]-->
-  <head>
+<!--[if lte IE 9]><html class="ie9 lte9" lang="${LANGUAGE_CODE}"><![endif]-->
+<!--[if !IE]><<!--><html lang="${LANGUAGE_CODE}"><!--<![endif]-->
+  <head dir="${static.dir_rtl()}">
     <meta charset="utf-8">
     <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1">
     <title>
@@ -15,270 +18,93 @@
         % if context_course:
         <% ctx_loc = context_course.location %>
         ${context_course.display_name_with_default} |
+        % elif context_library:
+        ${context_library.display_name_with_default} |
         % endif
-        edX Studio
+        ${settings.STUDIO_NAME}
     </title>
 
+    <%
+      jsi18n_path = "js/i18n/{language}/djangojs.js".format(language=LANGUAGE_CODE)
+    %>
+
+    <script type="text/javascript" src="${static.url(jsi18n_path)}"></script>
     <meta name="viewport" content="width=device-width,initial-scale=1">
     <meta name="path_prefix" content="${EDX_ROOT_URL}">
 
     <%static:css group='style-vendor'/>
-    <%static:css group='style-app'/>
-    <%static:css group='style-app-extend1'/>
-    <%static:css group='style-xmodule'/>
+    <%static:css group='style-vendor-tinymce-content'/>
+    <%static:css group='style-vendor-tinymce-skin'/>
+    <%static:css group='style-main'/>
 
     <%include file="widgets/segment-io.html" />
 
     <%block name="header_extras"></%block>
   </head>
 
-  <body class="<%block name='bodyclass'></%block> hide-wip">
-    <a class="nav-skip" href="#content">${_("Skip to this view's content")}</a>
+  <body class="${static.dir_rtl()} <%block name='bodyclass'></%block> lang_${LANGUAGE_CODE}">
+    <%block name="view_notes"></%block>
+
+    <a class="nav-skip" href="#content">${_("Skip to main content")}</a>
 
     <script type="text/javascript">
-    window.baseUrl = "${settings.STATIC_URL}";
-    var require = {
-        baseUrl: baseUrl,
-        waitSeconds: 60,
-        paths: {
-            "domReady": "js/vendor/domReady",
-            "gettext": "/i18n",
-            "mustache": "js/vendor/mustache",
-            "codemirror": "js/vendor/codemirror-compressed",
-            "codemirror/stex": "js/vendor/CodeMirror/stex",
-            "jquery": "js/vendor/jquery.min",
-            "jquery.ui": "js/vendor/jquery-ui.min",
-            "jquery.form": "js/vendor/jquery.form",
-            "jquery.markitup": "js/vendor/markitup/jquery.markitup",
-            "jquery.leanModal": "js/vendor/jquery.leanModal.min",
-            "jquery.ajaxQueue": "js/vendor/jquery.ajaxQueue",
-            "jquery.smoothScroll": "js/vendor/jquery.smooth-scroll.min",
-            "jquery.timepicker": "js/vendor/timepicker/jquery.timepicker",
-            "jquery.cookie": "js/vendor/jquery.cookie",
-            "jquery.qtip": "js/vendor/jquery.qtip.min",
-            "jquery.scrollTo": "js/vendor/jquery.scrollTo-1.4.2-min",
-            "jquery.flot": "js/vendor/flot/jquery.flot.min",
-            "jquery.fileupload": "js/vendor/jQuery-File-Upload/js/jquery.fileupload",
-            "jquery.iframe-transport": "js/vendor/jQuery-File-Upload/js/jquery.iframe-transport",
-            "jquery.inputnumber": "js/vendor/html5-input-polyfills/number-polyfill",
-            "jquery.immediateDescendents": "coffee/src/jquery.immediateDescendents",
-            "datepair": "js/vendor/timepicker/datepair",
-            "date": "js/vendor/date",
-            "tzAbbr": "js/vendor/tzAbbr",
-            "underscore": "js/vendor/underscore-min",
-            "underscore.string": "js/vendor/underscore.string.min",
-            "backbone": "js/vendor/backbone-min",
-            "backbone.associations": "js/vendor/backbone-associations-min",
-            "backbone.paginator": "js/vendor/backbone.paginator.min",
-            "tinymce": "js/vendor/tiny_mce/tiny_mce",
-            "jquery.tinymce": "js/vendor/tiny_mce/jquery.tinymce",
-            "xmodule": "/xmodule/xmodule",
-            "xblock": "coffee/src/xblock",
-            "utility": "js/src/utility",
-            "accessibility": "js/src/accessibility_tools",
-            "draggabilly": "js/vendor/draggabilly.pkgd",
-            "URI": "js/vendor/URI.min",
-
-            // externally hosted files
-            "tender": "//edxedge.tenderapp.com/tender_widget",
-            "mathjax": "//edx-static.s3.amazonaws.com/mathjax-MathJax-727332c/MathJax.js?config=TeX-MML-AM_HTMLorMML-full&delayStartupUntil=configured",
-            "youtube": [
-                // youtube URL does not end in ".js". We add "?noext" to the path so
-                // that require.js adds the ".js" to the query component of the URL,
-                // and leaves the path component intact.
-                "//www.youtube.com/player_api?noext",
-                // if youtube fails to load, fallback on a local file
-                // so that require doesn't fall over
-                "js/src/youtube_fallback"
-            ]
-        },
-        shim: {
-            "gettext": {
-                exports: "gettext"
-            },
-            "date": {
-                exports: "Date"
-            },
-            "jquery.ui": {
-                deps: ["jquery"],
-                exports: "jQuery.ui"
-            },
-            "jquery.form": {
-                deps: ["jquery"],
-                exports: "jQuery.fn.ajaxForm"
-            },
-            "jquery.markitup": {
-                deps: ["jquery"],
-                exports: "jQuery.fn.markitup"
-            },
-            "jquery.leanmodal": {
-                deps: ["jquery"],
-                exports: "jQuery.fn.leanModal"
-            },
-            "jquery.ajaxQueue": {
-                deps: ["jquery"],
-                exports: "jQuery.fn.ajaxQueue"
-            },
-            "jquery.smoothScroll": {
-                deps: ["jquery"],
-                exports: "jQuery.fn.smoothScroll"
-            },
-            "jquery.cookie": {
-                deps: ["jquery"],
-                exports: "jQuery.fn.cookie"
-            },
-            "jquery.qtip": {
-                deps: ["jquery"],
-                exports: "jQuery.fn.qtip"
-            },
-            "jquery.scrollTo": {
-                deps: ["jquery"],
-                exports: "jQuery.fn.scrollTo",
-            },
-            "jquery.flot": {
-                deps: ["jquery"],
-                exports: "jQuery.fn.plot"
-            },
-            "jquery.fileupload": {
-                deps: ["jquery.iframe-transport"],
-                exports: "jQuery.fn.fileupload"
-            },
-            "jquery.inputnumber": {
-                deps: ["jquery"],
-                exports: "jQuery.fn.inputNumber"
-            },
-            "jquery.tinymce": {
-                deps: ["jquery", "tinymce"],
-                exports: "jQuery.fn.tinymce"
-            },
-            "datepair": {
-                deps: ["jquery.ui", "jquery.timepicker"]
-            },
-            "underscore": {
-                exports: "_"
-            },
-            "backbone": {
-                deps: ["underscore", "jquery"],
-                exports: "Backbone"
-            },
-            "backbone.associations": {
-                deps: ["backbone"],
-                exports: "Backbone.Associations"
-            },
-            "backbone.paginator": {
-                deps: ["backbone"],
-                exports: "Backbone.Paginator"
-            },
-            "youtube": {
-                exports: "YT"
-            },
-            "codemirror": {
-                exports: "CodeMirror"
-            },
-            "codemirror/stex": {
-                deps: ["codemirror"]
-            },
-            "tinymce": {
-                exports: "tinymce"
-            },
-            "mathjax": {
-                exports: "MathJax",
-                init: function() {
-                  MathJax.Hub.Config({
-                    tex2jax: {
-                      inlineMath: [
-                        ["\\(","\\)"],
-                        ['[mathjaxinline]','[/mathjaxinline]']
-                      ],
-                      displayMath: [
-                        ["\\[","\\]"],
-                        ['[mathjax]','[/mathjax]']
-                      ]
-                    }
-                  });
-                  MathJax.Hub.Configured();
-                }
-            },
-            "URI": {
-                exports: "URI"
-            },
-            "xblock/core": {
-                exports: "XBlock",
-                deps: ["jquery", "jquery.immediateDescendents"]
-            },
-            "xblock/runtime.v1": {
-                exports: "XBlock",
-                deps: ["xblock/core"]
-            },
-
-            "coffee/src/main": {
-                deps: ["coffee/src/ajax_prefix"]
-            },
-            "coffee/src/logger": {
-                exports: "Logger",
-                deps: ["coffee/src/ajax_prefix"]
-            }
-        },
-        // load jquery and gettext automatically
-        deps: ["jquery", "gettext"],
-        callback: function() {
-            // load other scripts on every page, after jquery loads
-            require(["js/base", "coffee/src/main", "coffee/src/logger", "datepair", "accessibility"]);
-            // we need "datepair" because it dynamically modifies the page
-            // when it is loaded -- yuck!
-        }
-    };
+      window.baseUrl = "${settings.STATIC_URL | n, js_escaped_string}";
+      var require = {baseUrl: window.baseUrl};
     </script>
     <script type="text/javascript" src="${static.url("js/vendor/require.js")}"></script>
-
-    ## js templates
-    <script id="system-feedback-tpl" type="text/template">
-      <%static:include path="js/system-feedback.underscore" />
-    </script>
-
-
-    % if context_course:
-      <script type="text/javascript">
-  require(['js/models/course'], function(Course) {
-    window.course = new Course({
-      id: "${context_course.id}",
-      name: "${context_course.display_name_with_default | h}",
-      url_name: "${context_course.location.name | h}",
-      org: "${context_course.location.org | h}",
-      num: "${context_course.location.course | h}",
-      revision: "${context_course.location.revision | h}"
-    });
-  });
-      </script>
-    % endif
+    <script type="text/javascript" src="${static.url("cms/js/require-config.js")}"></script>
 
     <!-- view -->
-    <div class="wrapper wrapper-view">
-      <%include file="widgets/header.html" />
+    <div class="wrapper wrapper-view" dir="${static.dir_rtl()}">
+        <% online_help_token = self.online_help_token() if hasattr(self, 'online_help_token') else None %>
+        <%include file="widgets/header.html" args="online_help_token=online_help_token" />
 
-      <div id="page-alert"></div>
+      <div id="page-alert">
+      <%block name="page_alert"></%block>
+      </div>
 
-      <div id="content">
+      <div id="content" tabindex="-1">
       <%block name="content"></%block>
       </div>
 
       % if user.is_authenticated():
-      <script type="text/javascript">
-        require(['js/sock']);
-      </script>
-      <%include file="widgets/sock.html" />
+        <%include file="widgets/sock.html" args="online_help_token=online_help_token" />
       % endif
-
       <%include file="widgets/footer.html" />
-      <%include file="widgets/tender.html" />
 
       <div id="page-notification"></div>
     </div>
 
     <div id="page-prompt"></div>
+
+    <%block name="modal_placeholder"></%block>
+
     <%block name="jsextra"></%block>
+    <script type="text/javascript">
+      require(['common/js/common_libraries'], function () {
+          require(['js/factories/base'], function () {
+              require(['js/models/course'], function(Course) {
+                  % if context_course:
+                      window.course = new Course({
+                          id: "${context_course.id | n, js_escaped_string}",
+                          name: "${context_course.display_name_with_default | n, js_escaped_string}",
+                          url_name: "${context_course.location.name | n, js_escaped_string}",
+                          org: "${context_course.location.org | n, js_escaped_string}",
+                          num: "${context_course.location.course | n, js_escaped_string}",
+                          display_course_number: "${context_course.display_coursenumber | n, js_escaped_string}",
+                          revision: "${context_course.location.revision | n, js_escaped_string}",
+                          self_paced: ${context_course.self_paced | n, dump_js_escaped_json}
+                      });
+                  % endif
+                  % if user.is_authenticated():
+                      require(['js/sock']);
+                  % endif
+                  <%block name='requirejs'></%block>
+              });
+          });
+      });
+    </script>
+    <%include file="widgets/segment-io-footer.html" />
     <div class="modal-cover"></div>
   </body>
-
-  <%include file="widgets/qualaroo.html" />
 </html>

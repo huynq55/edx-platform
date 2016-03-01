@@ -160,32 +160,43 @@ var CohortManager = (function ($) {
                 log_error(response.msg || 
                           "There was an error loading users for " + cohort.title);
             }
+            op_results.empty();
             detail.show();
         }
             
 
         function added_users(response) {
-            function adder(note, color) {
-                return function(item) {
-                    var li = $('<li></li>')
-                    if (typeof item === "object" && item.username) {
-                        li.text(note + ' ' + item.name + ', ' + item.username + ', ' + item.email);
-                    } else if (typeof item === "object" && item.msg) {
-                        li.text(note + ' ' + item.username_or_email + ', ' + item.msg);
-                    } else {
-                        // string
-                        li.text(note + ' ' + item);
-                    }
-                    li.css('color', color);
-                    op_results.append(li);
-                }
-            }
             op_results.empty();
             if (response && response.success) {
-                response.added.forEach(adder("Added", "green"));
-                response.present.forEach(adder("Already present:", "black"));
-                response.conflict.forEach(adder("In another cohort:", "purple"));
-                response.unknown.forEach(adder("Unknown user:", "red"));
+                function add_to_list(text, color) {
+                    op_results.append($("<li/>").text(text).css("color", color));
+                }
+                response.added.forEach(
+                    function(item) {
+                        add_to_list(
+                            "Added: " + item.name + ", " + item.username + ", " + item.email,
+                            "green"
+                        );
+                    }
+                );
+                response.changed.forEach(
+                    function(item) {
+                        add_to_list(
+                            "Moved from cohort " + item.previous_cohort + ": " + item.name + ", " + item.username + ", " + item.email,
+                            "purple"
+                        )
+                    }
+                );
+                response.present.forEach(
+                    function(item) {
+                        add_to_list("Already present: " + item, "black");
+                    }
+                );
+                response.unknown.forEach(
+                    function(item) {
+                        add_to_list("Unknown user: " + item, "red")
+                    }
+                );
                 users_area.val('')
             } else {
                 log_error(response.msg || "There was an error adding users");
@@ -209,7 +220,7 @@ var CohortManager = (function ($) {
                 });
             } else if (state == state_detail) {
                 detail_header.text("Members of " + cohort_title);
-                $.ajax(detail_url).done(show_users).fail(function() {
+                $.ajax(detail_url, {data: {page: 1}}).done(show_users).fail(function() {
                     log_error("Error trying to load users in cohort");
                 });
             }

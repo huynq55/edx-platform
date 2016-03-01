@@ -10,46 +10,36 @@ sessions. Assumes structure:
 
 # We intentionally define lots of variables that aren't used, and
 # want to import all variables from base settings files
-# pylint: disable=W0401, W0614
+# pylint: disable=wildcard-import, unused-wildcard-import
 
 from .common import *
-from logsettings import get_logger_config
 
 DEBUG = True
-USE_I18N = True
-# For displaying the dummy text, we need to provide a language mapping.
-LANGUAGES = (
-    ('eo', 'Esperanto'),
-)
 TEMPLATE_DEBUG = True
 
+HTTPS = 'off'
 FEATURES['DISABLE_START_DATES'] = False
 FEATURES['ENABLE_SQL_TRACKING_LOGS'] = True
-FEATURES['SUBDOMAIN_COURSE_LISTINGS'] = False  # Enable to test subdomains--otherwise, want all courses to show up
-FEATURES['SUBDOMAIN_BRANDING'] = True
-FEATURES['FORCE_UNIVERSITY_DOMAIN'] = None		# show all university courses if in dev (ie don't use HTTP_HOST)
 FEATURES['ENABLE_MANUAL_GIT_RELOAD'] = True
-FEATURES['ENABLE_PSYCHOMETRICS'] = False    # real-time psychometrics (eg item response theory analysis in instructor dashboard)
-FEATURES['ENABLE_INSTRUCTOR_ANALYTICS'] = True
 FEATURES['ENABLE_SERVICE_STATUS'] = True
 FEATURES['ENABLE_INSTRUCTOR_EMAIL'] = True     # Enable email for all Studio courses
 FEATURES['REQUIRE_COURSE_EMAIL_AUTH'] = False  # Give all courses email (don't require django-admin perms)
 FEATURES['ENABLE_HINTER_INSTRUCTOR_VIEW'] = True
-FEATURES['ENABLE_INSTRUCTOR_BETA_DASHBOARD'] = True
-FEATURES['MULTIPLE_ENROLLMENT_ROLES'] = True
 FEATURES['ENABLE_SHOPPING_CART'] = True
 FEATURES['AUTOMATIC_VERIFY_STUDENT_IDENTITY_FOR_TESTING'] = True
 FEATURES['ENABLE_S3_GRADE_DOWNLOADS'] = True
+FEATURES['ENABLE_PAYMENT_FAKE'] = True
+
 
 FEEDBACK_SUBMISSION_EMAIL = "dummy@example.com"
 
 WIKI_ENABLED = True
 
-LOGGING = get_logger_config(ENV_ROOT / "log",
-                            logging_env="dev",
-                            local_loglevel="DEBUG",
-                            dev_env=True,
-                            debug=True)
+DJFS = {
+    'type': 'osfs',
+    'directory_root': 'lms/static/djpyfs',
+    'url_root': '/static/djpyfs'
+}
 
 # If there is a database called 'read_replica', you can use the use_read_replica_if_available
 # function in util/query.py, which is useful for very large database reads
@@ -57,6 +47,12 @@ DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.sqlite3',
         'NAME': ENV_ROOT / "db" / "edx.db",
+        'ATOMIC_REQUESTS': True,
+    },
+    'student_module_history': {
+        'ENGINE': 'django.db.backends.sqlite3',
+        'NAME': ENV_ROOT / "db" / "student_module_history.db",
+        'ATOMIC_REQUESTS': True,
     }
 }
 
@@ -91,6 +87,10 @@ CACHES = {
         'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
         'LOCATION': 'edx_location_mem_cache',
     },
+    'course_structure_cache': {
+        'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
+        'LOCATION': 'edx_course_structure_mem_cache',
+    },
 }
 
 
@@ -123,16 +123,6 @@ COURSE_LISTINGS = {
     'harvard': ['HarvardX/CS50x/2012H'],
     'mit': ['MITx/3.091/MIT_2012_Fall'],
     'sjsu': ['MITx/6.002x-EE98/2012_Fall_SJSU'],
-}
-
-
-SUBDOMAIN_BRANDING = {
-    'sjsu': 'MITx',
-    'mit': 'MITx',
-    'berkeley': 'BerkeleyX',
-    'harvard': 'HarvardX',
-    'openedx': 'openedx',
-    'edge': 'edge',
 }
 
 # List of `university` landing pages to display, even though they may not
@@ -169,21 +159,9 @@ if os.path.isdir(DATA_DIR):
 
 EDX_PLATFORM_VERSION_STRING = os.popen('cd %s; git describe' % REPO_ROOT).read().strip()
 
-############################ Open ended grading config  #####################
-
-OPEN_ENDED_GRADING_INTERFACE = {
-    'url' : 'http://127.0.0.1:3033/',
-    'username' : 'lms',
-    'password' : 'abcd',
-    'staff_grading' : 'staff_grading',
-    'peer_grading' : 'peer_grading',
-    'grading_controller' : 'grading_controller'
-}
-
 ############################## LMS Migration ##################################
 FEATURES['ENABLE_LMS_MIGRATION'] = True
-FEATURES['ACCESS_REQUIRE_STAFF_FOR_COURSE'] = False   # require that user be in the staff_* group to be able to enroll
-FEATURES['USE_XQA_SERVER'] = 'http://xqa:server@content-qa.edX.mit.edu/xqa'
+FEATURES['XQA_SERVER'] = 'http://xqa:server@content-qa.edX.mit.edu/xqa'
 
 INSTALLED_APPS += ('lms_migration',)
 
@@ -195,9 +173,6 @@ FEATURES['AUTH_USE_OPENID'] = True
 FEATURES['AUTH_USE_OPENID_PROVIDER'] = True
 FEATURES['BYPASS_ACTIVATION_EMAIL_FOR_EXTAUTH'] = True
 
-INSTALLED_APPS += ('external_auth',)
-INSTALLED_APPS += ('django_openid_auth',)
-
 OPENID_CREATE_USERS = False
 OPENID_UPDATE_DETAILS_FROM_SREG = True
 OPENID_SSO_SERVER_URL = 'https://www.google.com/accounts/o8/id'  # TODO: accept more endpoints
@@ -205,9 +180,16 @@ OPENID_USE_AS_ADMIN_LOGIN = False
 
 OPENID_PROVIDER_TRUSTED_ROOTS = ['*']
 
+############################## OAUTH2 Provider ################################
+FEATURES['ENABLE_OAUTH2_PROVIDER'] = True
+
 ######################## MIT Certificates SSL Auth ############################
 
-FEATURES['AUTH_USE_MIT_CERTIFICATES'] = False
+FEATURES['AUTH_USE_CERTIFICATES'] = False
+
+########################### External REST APIs #################################
+FEATURES['ENABLE_MOBILE_REST_API'] = True
+FEATURES['ENABLE_VIDEO_ABSTRACTION_LAYER_API'] = True
 
 ################################# CELERY ######################################
 
@@ -216,31 +198,24 @@ CELERY_ALWAYS_EAGER = True
 
 ################################ DEBUG TOOLBAR ################################
 
-INSTALLED_APPS += ('debug_toolbar',)
-MIDDLEWARE_CLASSES += ('django_comment_client.utils.QueryCountDebugMiddleware',
-                       'debug_toolbar.middleware.DebugToolbarMiddleware',)
+INSTALLED_APPS += ('debug_toolbar', 'djpyfs',)
+MIDDLEWARE_CLASSES += (
+    'django_comment_client.utils.QueryCountDebugMiddleware',
+    'debug_toolbar.middleware.DebugToolbarMiddleware',
+)
 INTERNAL_IPS = ('127.0.0.1',)
 
 DEBUG_TOOLBAR_PANELS = (
-   'debug_toolbar.panels.version.VersionDebugPanel',
-   'debug_toolbar.panels.timer.TimerDebugPanel',
-   'debug_toolbar.panels.settings_vars.SettingsVarsDebugPanel',
-   'debug_toolbar.panels.headers.HeaderDebugPanel',
-   'debug_toolbar.panels.request_vars.RequestVarsDebugPanel',
-   'debug_toolbar.panels.sql.SQLDebugPanel',
-   'debug_toolbar.panels.signals.SignalDebugPanel',
-   'debug_toolbar.panels.logger.LoggingPanel',
-
-#  Enabling the profiler has a weird bug as of django-debug-toolbar==0.9.4 and
-#  Django=1.3.1/1.4 where requests to views get duplicated (your method gets
-#  hit twice). So you can uncomment when you need to diagnose performance
-#  problems, but you shouldn't leave it on.
-#  'debug_toolbar.panels.profiling.ProfilingDebugPanel',
+    'debug_toolbar.panels.versions.VersionsPanel',
+    'debug_toolbar.panels.timer.TimerPanel',
+    'debug_toolbar.panels.settings.SettingsPanel',
+    'debug_toolbar.panels.headers.HeadersPanel',
+    'debug_toolbar.panels.request.RequestPanel',
+    'debug_toolbar.panels.sql.SQLPanel',
+    'debug_toolbar.panels.signals.SignalsPanel',
+    'debug_toolbar.panels.logging.LoggingPanel',
+    'debug_toolbar.panels.profiling.ProfilingPanel',
 )
-
-DEBUG_TOOLBAR_CONFIG = {
-    'INTERCEPT_REDIRECTS': False
-}
 
 #################### FILE UPLOADS (for discussion forums) #####################
 
@@ -259,38 +234,45 @@ FEATURES['RESTRICT_ENROLL_BY_REG_METHOD'] = True
 
 ########################### PIPELINE #################################
 
-PIPELINE_SASS_ARGUMENTS = '--debug-info --require {proj_dir}/static/sass/bourbon/lib/bourbon.rb'.format(proj_dir=PROJECT_ROOT)
+PIPELINE_SASS_ARGUMENTS = '--debug-info'
 
 ########################## ANALYTICS TESTING ########################
 
 ANALYTICS_SERVER_URL = "http://127.0.0.1:9000/"
 ANALYTICS_API_KEY = ""
 
-##### segment-io  ######
+##### Segment  ######
 
-# If there's an environment variable set, grab it and turn on Segment.io
-SEGMENT_IO_LMS_KEY = os.environ.get('SEGMENT_IO_LMS_KEY')
-if SEGMENT_IO_LMS_KEY:
-    FEATURES['SEGMENT_IO_LMS'] = True
+# If there's an environment variable set, grab it
+LMS_SEGMENT_KEY = os.environ.get('SEGMENT_KEY')
 
-###################### Payment ##############################3
+###################### Payment ######################
 
 CC_PROCESSOR['CyberSource']['SHARED_SECRET'] = os.environ.get('CYBERSOURCE_SHARED_SECRET', '')
 CC_PROCESSOR['CyberSource']['MERCHANT_ID'] = os.environ.get('CYBERSOURCE_MERCHANT_ID', '')
 CC_PROCESSOR['CyberSource']['SERIAL_NUMBER'] = os.environ.get('CYBERSOURCE_SERIAL_NUMBER', '')
-CC_PROCESSOR['CyberSource']['PURCHASE_ENDPOINT'] = os.environ.get('CYBERSOURCE_PURCHASE_ENDPOINT', '')
+CC_PROCESSOR['CyberSource']['PURCHASE_ENDPOINT'] = '/shoppingcart/payment_fake/'
 
+CC_PROCESSOR['CyberSource2']['SECRET_KEY'] = os.environ.get('CYBERSOURCE_SECRET_KEY', '')
+CC_PROCESSOR['CyberSource2']['ACCESS_KEY'] = os.environ.get('CYBERSOURCE_ACCESS_KEY', '')
+CC_PROCESSOR['CyberSource2']['PROFILE_ID'] = os.environ.get('CYBERSOURCE_PROFILE_ID', '')
+CC_PROCESSOR['CyberSource2']['PURCHASE_ENDPOINT'] = '/shoppingcart/payment_fake/'
 
-########################## USER API ########################
+########################## USER API ##########################
 EDX_API_KEY = None
-
 
 ####################### Shoppingcart ###########################
 FEATURES['ENABLE_SHOPPING_CART'] = True
 
+### This enables the Metrics tab for the Instructor dashboard ###########
+FEATURES['CLASS_DASHBOARD'] = True
+
+### This settings is for the course registration code length ############
+REGISTRATION_CODE_LENGTH = 8
+
 #####################################################################
 # Lastly, see if the developer has any local overrides.
 try:
-    from .private import *      # pylint: disable=F0401
+    from .private import *      # pylint: disable=import-error
 except ImportError:
     pass

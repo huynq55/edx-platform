@@ -94,6 +94,70 @@ function () {
             return this.logs;
         };
 
+        Player.prototype.showErrorMessage = function () {
+            this.el
+                .find('.video-player div')
+                    .addClass('hidden')
+                .end()
+                .find('.video-player .video-error')
+                    .removeClass('hidden')
+                .end()
+                    .addClass('is-initialized')
+                .find('.spinner')
+                    .attr({
+                        'aria-hidden': 'true',
+                        'tabindex': -1
+                    });
+        };
+
+        Player.prototype.onError = function (event) {
+            if ($.isFunction(this.config.events.onError)) {
+                this.config.events.onError();
+            }
+        };
+
+        Player.prototype.destroy = function () {
+            this.video.removeEventListener('loadedmetadata', this.onLoadedMetadata, false);
+            this.video.removeEventListener('play', this.onPlay, false);
+            this.video.removeEventListener('playing', this.onPlaying, false);
+            this.video.removeEventListener('pause', this.onPause, false);
+            this.video.removeEventListener('ended', this.onEnded, false);
+            this.el
+                .find('.video-player div').removeClass('hidden')
+                .end()
+                .find('.video-player .video-error').addClass('hidden')
+                .end().removeClass('is-initialized')
+                .find('.spinner').attr({'aria-hidden': 'false'});
+            this.videoEl.remove();
+        };
+
+        Player.prototype.onLoadedMetadata = function () {
+            this.playerState = HTML5Video.PlayerState.PAUSED;
+            if ($.isFunction(this.config.events.onReady)) {
+                this.config.events.onReady(null);
+            }
+        };
+
+        Player.prototype.onPlay = function () {
+            this.playerState = HTML5Video.PlayerState.BUFFERING;
+            this.callStateChangeCallback();
+        };
+
+        Player.prototype.onPlaying = function () {
+            this.playerState = HTML5Video.PlayerState.PLAYING;
+            this.callStateChangeCallback();
+        };
+
+        Player.prototype.onPause = function () {
+            this.playerState = HTML5Video.PlayerState.PAUSED;
+            this.callStateChangeCallback();
+        };
+
+        Player.prototype.onEnded = function () {
+            this.playerState = HTML5Video.PlayerState.ENDED;
+            this.callStateChangeCallback();
+        };
+
         return Player;
 
         /*
@@ -113,7 +177,7 @@ function () {
          *
          *     config = {
          *
-         *        videoSources: {},   // An object with properties being video
+         *        videoSources: [],   // An array with properties being video
          *                            // sources. The property name is the
          *                            // video format of the source. Supported
          *                            // video formats are: 'mp4', 'webm', and
@@ -134,8 +198,9 @@ function () {
          */
         function Player(el, config) {
             var isTouch = onTouchBasedDevice() || '',
-                sourceStr, _this, errorMessage;
+                sourceList, _this, errorMessage, lastSource;
 
+            _.bindAll(this, 'onLoadedMetadata', 'onPlay', 'onPlaying', 'onPause', 'onEnded');
             this.logs = [];
             // Initially we assume that el is a DOM element. If jQuery selector
             // fails to select something, we assume that el is an ID of a DOM
@@ -148,8 +213,7 @@ function () {
                 this.el = $('#' + el);
 
                 if (this.el.length === 0) {
-                    errorMessage = 'VideoPlayer: Element corresponding to ' +
-                        'the given selector does not found.';
+                    errorMessage = gettext('VideoPlayer: Element corresponding to the given selector was not found.');
                     if (window.console && console.log) {
                         console.log(errorMessage);
                     } else {
@@ -168,60 +232,51 @@ function () {
 
             // We should have at least one video source. Otherwise there is no
             // point to continue.
-            if (!config.videoSources) {
+            if (!config.videoSources && !config.videoSources.length) {
                 return;
             }
 
-            // From the start, all sources are empty. We will populate this
-            // object below.
-            sourceStr = {
-                mp4: ' ',
-                webm: ' ',
-                ogg: ' '
-            };
 
             // Will be used in inner functions to point to the current object.
             _this = this;
 
             // Create HTML markup for individual sources of the HTML5 <video>
             // element.
-            $.each(sourceStr, function (videoType, videoSource) {
-                if (
-                    (_this.config.videoSources[videoType]) &&
-                    (_this.config.videoSources[videoType].length)
-                ) {
-                    sourceStr[videoType] =
-                        '<source ' +
-                            'src="' + _this.config.videoSources[videoType] +
-                            // Following hack allows to open the same video twice
-                            // https://code.google.com/p/chromium/issues/detail?id=31014
-                            '?' + (new Date()).getTime() +
-                            '" ' + 'type="video/' + videoType + '" ' +
-                        '/> ';
-                }
+            sourceList = $.map(config.videoSources, function (source) {
+               return [
+                    '<source ',
+                        'src="', source,
+            // Following hack allows to open the same video twice
+            // https://code.google.com/p/chromium/issues/detail?id=31014
+            // Check whether the url already has a '?' inside, and if so,
+            // use '&' instead of '?' to prevent breaking the url's integrity.
+                        (source.indexOf('?') === -1 ? '?' : '&'),
+                        (new Date()).getTime(), '" />'
+                ].join('');
             });
 
-            // We should have at least one video source. Otherwise there is no
-            // point to continue.
-            if (
-                sourceStr.mp4 === ' ' &&
-                sourceStr.webm === ' ' &&
-                sourceStr.ogg === ' '
-            ) {
-                return;
-            }
 
             // Create HTML markup for the <video> element, populating it with
             // sources from previous step. Because of problems with creating
             // video element via jquery (http://bugs.jquery.com/ticket/9174) we
             // create it using native JS.
             this.video = document.createElement('video');
-            this.video.innerHTML = _.values(sourceStr).join('');
+
+            errorMessage = [
+                gettext('This browser cannot play .mp4, .ogg, or .webm files.'),
+                gettext('Try using a different browser, such as Google Chrome.')
+            ].join('');
+            this.video.innerHTML = sourceList.join('') + errorMessage;
 
             // Get the jQuery object, and set the player state to UNSTARTED.
             // The player state is used by other parts of the VideoPlayer to
             // determine what the video is currently doing.
             this.videoEl = $(this.video);
+
+            lastSource = this.videoEl.find('source').last();
+            lastSource.on('error', this.showErrorMessage.bind(this));
+            lastSource.on('error', this.onError.bind(this));
+            this.videoEl.on('error', this.onError.bind(this));
 
             if (/iP(hone|od)/i.test(isTouch[0])) {
                 this.videoEl.prop('controls', true);
@@ -235,13 +290,11 @@ function () {
                 var PlayerState = HTML5Video.PlayerState;
 
                 if (_this.playerState === PlayerState.PLAYING) {
-                    _this.pauseVideo();
                     _this.playerState = PlayerState.PAUSED;
-                    _this.callStateChangeCallback();
+                    _this.pauseVideo();
                 } else {
-                    _this.playVideo();
                     _this.playerState = PlayerState.PLAYING;
-                    _this.callStateChangeCallback();
+                    _this.playVideo();
                 }
             });
 
@@ -252,12 +305,22 @@ function () {
                 'durationchange', 'volumechange'
             ];
 
+            this.debug = false;
             $.each(events, function(index, eventName) {
                 _this.video.addEventListener(eventName, function () {
                     _this.logs.push({
                         'event name': eventName,
                         'state': _this.playerState
                     });
+
+                    if (_this.debug) {
+                        console.log(
+                            'event name:', eventName,
+                            'state:', _this.playerState,
+                            'readyState:', _this.video.readyState,
+                            'networkState:', _this.video.networkState
+                        );
+                    }
 
                     el.trigger('html5:' + eventName, arguments);
                 });
@@ -266,34 +329,11 @@ function () {
             // When the <video> tag has been processed by the browser, and it
             // is ready for playback, notify other parts of the VideoPlayer,
             // and initially pause the video.
-            this.video.addEventListener('loadedmetadata', function () {
-                _this.playerState = HTML5Video.PlayerState.PAUSED;
-                if ($.isFunction(_this.config.events.onReady)) {
-                    _this.config.events.onReady(null);
-                }
-            }, false);
-
-            // Register the 'play' event.
-            this.video.addEventListener('play', function () {
-                _this.playerState = HTML5Video.PlayerState.PLAYING;
-                _this.callStateChangeCallback();
-            }, false);
-
-            this.video.addEventListener('playing', function () {
-                _this.playerState = HTML5Video.PlayerState.PLAYING;
-            }, false);
-
-            // Register the 'pause' event.
-            this.video.addEventListener('pause', function () {
-                _this.playerState = HTML5Video.PlayerState.PAUSED;
-                _this.callStateChangeCallback();
-            }, false);
-
-            // Register the 'ended' event.
-            this.video.addEventListener('ended', function () {
-                _this.playerState = HTML5Video.PlayerState.ENDED;
-                _this.callStateChangeCallback();
-            }, false);
+            this.video.addEventListener('loadedmetadata', this.onLoadedMetadata, false);
+            this.video.addEventListener('play', this.onPlay, false);
+            this.video.addEventListener('playing', this.onPlaying, false);
+            this.video.addEventListener('pause', this.onPause, false);
+            this.video.addEventListener('ended', this.onEnded, false);
 
             // Place the <video> element on the page.
             this.videoEl.appendTo(this.el.find('.video-player div'));

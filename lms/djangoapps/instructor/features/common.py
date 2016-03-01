@@ -2,15 +2,26 @@
 Define common steps for instructor dashboard acceptance tests.
 """
 
-# pylint: disable=C0111
-# pylint: disable=W0621
+# pylint: disable=missing-docstring
+# pylint: disable=redefined-outer-name
 
 from __future__ import absolute_import
 
 from lettuce import world, step
-from nose.tools import assert_in  # pylint: disable=E0611
+from mock import patch
+from nose.tools import assert_in
 
 from courseware.tests.factories import StaffFactory, InstructorFactory
+
+
+@step(u'Given I am "([^"]*)" for a very large course')
+def make_staff_or_instructor_for_large_course(step, role):
+    make_large_course(step, role)
+
+
+@patch.dict('courseware.access.settings.FEATURES', {"MAX_ENROLLMENT_INSTR_BUTTONS": 0})
+def make_large_course(step, role):
+    i_am_staff_or_instructor(step, role)
 
 
 @step(u'Given I am "([^"]*)" for a course')
@@ -31,13 +42,13 @@ def i_am_staff_or_instructor(step, role):  # pylint: disable=unused-argument
         display_name='Test Course'
     )
 
-    world.course_id = 'edx/999/Test_Course'
+    world.course_key = course.id
     world.role = 'instructor'
     # Log in as the an instructor or staff for the course
     if role == 'instructor':
         # Make & register an instructor for the course
-        world.instructor = InstructorFactory(course=course.location)
-        world.enroll_user(world.instructor, world.course_id)
+        world.instructor = InstructorFactory(course_key=world.course_key)
+        world.enroll_user(world.instructor, world.course_key)
 
         world.log_in(
             username=world.instructor.username,
@@ -49,8 +60,8 @@ def i_am_staff_or_instructor(step, role):  # pylint: disable=unused-argument
     else:
         world.role = 'staff'
         # Make & register a staff member
-        world.staff = StaffFactory(course=course.location)
-        world.enroll_user(world.staff, world.course_id)
+        world.staff = StaffFactory(course_key=world.course_key)
+        world.enroll_user(world.staff, world.course_key)
 
         world.log_in(
             username=world.staff.username,
@@ -63,9 +74,8 @@ def i_am_staff_or_instructor(step, role):  # pylint: disable=unused-argument
 def go_to_section(section_name):
     # section name should be one of
     # course_info, membership, student_admin, data_download, analytics, send_email
-    world.visit('/courses/edx/999/Test_Course')
-    world.css_click('a[href="/courses/edx/999/Test_Course/instructor"]')
-    world.css_click('div.beta-button-wrapper>a')
+    world.visit(u'/courses/{}'.format(world.course_key))
+    world.css_click(u'a[href="/courses/{}/instructor"]'.format(world.course_key))
     world.css_click('a[data-section="{0}"]'.format(section_name))
 
 
@@ -80,10 +90,12 @@ def click_a_button(step, button):  # pylint: disable=unused-argument
         world.css_click('input[name="calculate-grades-csv"]')
 
         # Expect to see a message that grade report is being generated
-        expected_msg = "Your grade report is being generated! You can view the status of the generation task in the 'Pending Instructor Tasks' section."
-        world.wait_for_visible('#grade-request-response')
+        expected_msg = "The grade report is being created." \
+                       " To view the status of the report, see" \
+                       " Pending Instructor Tasks below."
+        world.wait_for_visible('#report-request-response')
         assert_in(
-            expected_msg, world.css_text('#grade-request-response'),
+            expected_msg, world.css_text('#report-request-response'),
             msg="Could not find grade report generation success message."
         )
 
@@ -99,5 +111,25 @@ def click_a_button(step, button):  # pylint: disable=unused-argument
 
         world.css_click('input[name="list-profiles"]')
 
+    elif button == "Download profile information as a CSV":
+        # Go to the data download section of the instructor dash
+        go_to_section("data_download")
+
+        world.css_click('input[name="list-profiles-csv"]')
+
     else:
         raise ValueError("Unrecognized button option " + button)
+
+
+@step(u'I visit the "([^"]*)" tab')
+def click_a_button(step, tab_name):  # pylint: disable=unused-argument
+    # course_info, membership, student_admin, data_download, analytics, send_email
+    tab_name_dict = {
+        'Course Info': 'course_info',
+        'Membership': 'membership',
+        'Student Admin': 'student_admin',
+        'Data Download': 'data_download',
+        'Analytics': 'analytics',
+        'Email': 'send_email',
+    }
+    go_to_section(tab_name_dict[tab_name])

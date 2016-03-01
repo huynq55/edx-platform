@@ -7,16 +7,20 @@ from django.conf import settings
 
 from student.tests.factories import UserFactory
 
-from mock import patch
+from mock import patch, Mock
+from nose.plugins.attrib import attr
 
 from bulk_email.models import CourseEmail, SEND_TO_STAFF, CourseEmailTemplate, CourseAuthorization
+from opaque_keys.edx.locations import SlashSeparatedCourseKey
 
 
+@attr('shard_1')
+@patch('bulk_email.models.html_to_text', Mock(return_value='Mocking CourseEmail.text_message', autospec=True))
 class CourseEmailTest(TestCase):
     """Test the CourseEmail model."""
 
     def test_creation(self):
-        course_id = 'abc/123/doremi'
+        course_id = SlashSeparatedCourseKey('abc', '123', 'doremi')
         sender = UserFactory.create()
         to_option = SEND_TO_STAFF
         subject = "dummy subject"
@@ -28,8 +32,27 @@ class CourseEmailTest(TestCase):
         self.assertEquals(email.html_message, html_message)
         self.assertEquals(email.sender, sender)
 
+    def test_creation_with_optional_attributes(self):
+        course_id = SlashSeparatedCourseKey('abc', '123', 'doremi')
+        sender = UserFactory.create()
+        to_option = SEND_TO_STAFF
+        subject = "dummy subject"
+        html_message = "<html>dummy message</html>"
+        template_name = "branded_template"
+        from_addr = "branded@branding.com"
+        email = CourseEmail.create(
+            course_id, sender, to_option, subject, html_message, template_name=template_name, from_addr=from_addr
+        )
+        self.assertEquals(email.course_id, course_id)
+        self.assertEquals(email.to_option, SEND_TO_STAFF)
+        self.assertEquals(email.subject, subject)
+        self.assertEquals(email.html_message, html_message)
+        self.assertEquals(email.sender, sender)
+        self.assertEquals(email.template_name, template_name)
+        self.assertEquals(email.from_addr, from_addr)
+
     def test_bad_to_option(self):
-        course_id = 'abc/123/doremi'
+        course_id = SlashSeparatedCourseKey('abc', '123', 'doremi')
         sender = UserFactory.create()
         to_option = "fake"
         subject = "dummy subject"
@@ -38,6 +61,7 @@ class CourseEmailTest(TestCase):
             CourseEmail.create(course_id, sender, to_option, subject, html_message)
 
 
+@attr('shard_1')
 class NoCourseEmailTemplateTest(TestCase):
     """Test the CourseEmailTemplate model without loading the template data."""
 
@@ -46,10 +70,13 @@ class NoCourseEmailTemplateTest(TestCase):
             CourseEmailTemplate.get_template()
 
 
+@attr('shard_1')
 class CourseEmailTemplateTest(TestCase):
     """Test the CourseEmailTemplate model."""
 
     def setUp(self):
+        super(CourseEmailTemplateTest, self).setUp()
+
         # load initial content (since we don't run migrations as part of tests):
         call_command("loaddata", "course_email_template.json")
 
@@ -58,7 +85,7 @@ class CourseEmailTemplateTest(TestCase):
         context = {
             'course_title': "Bogus Course Title",
             'course_url': "/location/of/course/url",
-            'account_settings_url': "/location/of/account/settings/url",
+            'email_settings_url': "/location/of/email/settings/url",
             'platform_name': 'edX',
             'email': 'your-email@test.com',
         }
@@ -71,9 +98,18 @@ class CourseEmailTemplateTest(TestCase):
         return context
 
     def test_get_template(self):
+        # Get the default template, which has name=None
         template = CourseEmailTemplate.get_template()
         self.assertIsNotNone(template.html_template)
         self.assertIsNotNone(template.plain_template)
+
+    def test_get_branded_template(self):
+        # Get a branded (non default) template and make sure we get what we expect
+        template = CourseEmailTemplate.get_template(name="branded.template")
+        self.assertIsNotNone(template.html_template)
+        self.assertIsNotNone(template.plain_template)
+        self.assertIn(u"THIS IS A BRANDED HTML TEMPLATE", template.html_template)
+        self.assertIn(u"THIS IS A BRANDED TEXT TEMPLATE", template.plain_template)
 
     def test_render_html_without_context(self):
         template = CourseEmailTemplate.get_template()
@@ -104,12 +140,13 @@ class CourseEmailTemplateTest(TestCase):
         template.render_plaintext("My new plain text.", context)
 
 
+@attr('shard_1')
 class CourseAuthorizationTest(TestCase):
     """Test the CourseAuthorization model."""
 
     @patch.dict(settings.FEATURES, {'REQUIRE_COURSE_EMAIL_AUTH': True})
     def test_creation_auth_on(self):
-        course_id = 'abc/123/doremi'
+        course_id = SlashSeparatedCourseKey('abc', '123', 'doremi')
         # Test that course is not authorized by default
         self.assertFalse(CourseAuthorization.instructor_email_enabled(course_id))
 
@@ -135,7 +172,7 @@ class CourseAuthorizationTest(TestCase):
 
     @patch.dict(settings.FEATURES, {'REQUIRE_COURSE_EMAIL_AUTH': False})
     def test_creation_auth_off(self):
-        course_id = 'blahx/blah101/ehhhhhhh'
+        course_id = SlashSeparatedCourseKey('blahx', 'blah101', 'ehhhhhhh')
         # Test that course is authorized by default, since auth is turned off
         self.assertTrue(CourseAuthorization.instructor_email_enabled(course_id))
 

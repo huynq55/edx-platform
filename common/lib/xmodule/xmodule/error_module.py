@@ -1,5 +1,5 @@
 """
-Modules that get shown to the users when an error has occured while
+Modules that get shown to the users when an error has occurred while
 loading or rendering other modules
 """
 
@@ -11,9 +11,9 @@ import sys
 from lxml import etree
 from xmodule.x_module import XModule, XModuleDescriptor
 from xmodule.errortracker import exc_info_to_str
-from xmodule.modulestore import Location
 from xblock.fields import String, Scope, ScopeIds
 from xblock.field_data import DictFieldData
+from xmodule.modulestore import EdxJSONEncoder
 
 
 log = logging.getLogger(__name__)
@@ -80,8 +80,23 @@ class ErrorDescriptor(ErrorFields, XModuleDescriptor):
         return u''
 
     @classmethod
-    def _construct(cls, system, contents, error_msg, location):
-        location = Location(location)
+    def _construct(cls, system, contents, error_msg, location, for_parent=None):
+        """
+        Build a new ErrorDescriptor. using ``system``.
+
+        Arguments:
+            system (:class:`DescriptorSystem`): The :class:`DescriptorSystem` used
+                to construct the XBlock that had an error.
+            contents (unicode): An encoding of the content of the xblock that had an error.
+            error_msg (unicode): A message describing the error.
+            location (:class:`UsageKey`): The usage key of the XBlock that had an error.
+            for_parent (:class:`XBlock`): Optional. The parent of this error block.
+        """
+
+        if error_msg is None:
+            # this string is not marked for translation because we don't have
+            # access to the user context, and this will only be seen by staff
+            error_msg = 'Error not available'
 
         if location.category == 'error':
             location = location.replace(
@@ -95,9 +110,8 @@ class ErrorDescriptor(ErrorFields, XModuleDescriptor):
 
         # real metadata stays in the content, but add a display name
         field_data = DictFieldData({
-            'error_msg': str(error_msg),
+            'error_msg': unicode(error_msg),
             'contents': contents,
-            'display_name': 'Error: ' + location.url(),
             'location': location,
             'category': 'error'
         })
@@ -105,8 +119,9 @@ class ErrorDescriptor(ErrorFields, XModuleDescriptor):
             cls,
             # The error module doesn't use scoped data, and thus doesn't need
             # real scope keys
-            ScopeIds('error', None, location, location),
+            ScopeIds(None, 'error', location, location),
             field_data,
+            for_parent=for_parent,
         )
 
     def get_context(self):
@@ -117,25 +132,31 @@ class ErrorDescriptor(ErrorFields, XModuleDescriptor):
 
     @classmethod
     def from_json(cls, json_data, system, location, error_msg='Error not available'):
+        try:
+            json_string = json.dumps(json_data, skipkeys=False, indent=4, cls=EdxJSONEncoder)
+        except:  # pylint: disable=bare-except
+            json_string = repr(json_data)
+
         return cls._construct(
             system,
-            json.dumps(json_data, skipkeys=False, indent=4),
+            json_string,
             error_msg,
             location=location
         )
 
     @classmethod
-    def from_descriptor(cls, descriptor, error_msg='Error not available'):
+    def from_descriptor(cls, descriptor, error_msg=None):
         return cls._construct(
             descriptor.runtime,
             str(descriptor),
             error_msg,
             location=descriptor.location,
+            for_parent=descriptor.get_parent() if descriptor.has_cached_parent else None
         )
 
     @classmethod
-    def from_xml(cls, xml_data, system, id_generator,
-                 error_msg='Error not available'):
+    def from_xml(cls, xml_data, system, id_generator,  # pylint: disable=arguments-differ
+                 error_msg=None):
         '''Create an instance of this descriptor from the supplied data.
 
         Does not require that xml_data be parseable--just stores it and exports
@@ -154,7 +175,7 @@ class ErrorDescriptor(ErrorFields, XModuleDescriptor):
                 if error_node is not None:
                     error_msg = error_node.text
                 else:
-                    error_msg = 'Error not available'
+                    error_msg = None
 
         except etree.XMLSyntaxError:
             # Save the error to display later--overrides other problems

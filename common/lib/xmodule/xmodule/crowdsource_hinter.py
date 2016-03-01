@@ -13,7 +13,7 @@ from pkg_resources import resource_string
 
 from lxml import etree
 
-from xmodule.x_module import XModule
+from xmodule.x_module import XModule, STUDENT_VIEW
 from xmodule.raw_module import RawDescriptor
 from xblock.fields import Scope, String, Integer, Boolean, Dict, List
 
@@ -113,7 +113,7 @@ class CrowdsourceHinterModule(CrowdsourceHinterFields, XModule):
 
         try:
             child = self.get_display_items()[0]
-            out = child.render('student_view').content
+            out = child.render(STUDENT_VIEW).content
             # The event listener uses the ajax url to find the child.
             child_id = child.id
         except IndexError:
@@ -400,6 +400,5 @@ class CrowdsourceHinterDescriptor(CrowdsourceHinterFields, RawDescriptor):
     def definition_to_xml(self, resource_fs):
         xml_object = etree.Element('crowdsource_hinter')
         for child in self.get_children():
-            xml_object.append(
-                etree.fromstring(child.export_to_xml(resource_fs)))
+            self.runtime.add_block_as_child_node(child, xml_object)
         return xml_object

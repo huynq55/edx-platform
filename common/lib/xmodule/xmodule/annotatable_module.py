@@ -10,11 +10,16 @@ import textwrap
 
 log = logging.getLogger(__name__)
 
+# Make '_' a no-op so we can scrape strings. Using lambda instead of
+#  `django.utils.translation.ugettext_noop` because Django cannot be imported in this file
+_ = lambda text: text
+
 
 class AnnotatableFields(object):
-    data = String(help="XML data for the annotation", scope=Scope.content,
-        default=textwrap.dedent(
-        """\
+    data = String(
+        help=_("XML data for the annotation"),
+        scope=Scope.content,
+        default=textwrap.dedent("""
         <annotatable>
             <instructions>
                 <p>Enter your (optional) instructions for the exercise in HTML format.</p>
@@ -30,21 +35,27 @@ class AnnotatableFields(object):
             <p>Lorem ipsum dolor sit amet, consectetur adipiscing elit. <annotation title="My title" body="My comment" highlight="yellow" problem="0">Ut sodales laoreet est, egestas gravida felis egestas nec.</annotation> Aenean at volutpat erat. Cras commodo viverra nibh in aliquam.</p>
             <p>Nulla facilisi. <annotation body="Basic annotation example." problem="1">Pellentesque id vestibulum libero.</annotation> Suspendisse potenti. Morbi scelerisque nisi vitae felis dictum mattis. Nam sit amet magna elit. Nullam volutpat cursus est, sit amet sagittis odio vulputate et. Curabitur euismod, orci in vulputate imperdiet, augue lorem tempor purus, id aliquet augue turpis a est. Aenean a sagittis libero. Praesent fringilla pretium magna, non condimentum risus elementum nec. Pellentesque faucibus elementum pharetra. Pellentesque vitae metus eros.</p>
         </annotatable>
-        """))
+        """)
+    )
     display_name = String(
-        display_name="Display Name",
-        help="Display name for this module",
+        display_name=_("Display Name"),
+        help=_("Display name for this module"),
         scope=Scope.settings,
-        default='Annotation',
+        default=_('Annotation'),
     )
 
 
 class AnnotatableModule(AnnotatableFields, XModule):
-    js = {'coffee': [resource_string(__name__, 'js/src/javascript_loader.coffee'),
-                     resource_string(__name__, 'js/src/collapsible.coffee'),
-                     resource_string(__name__, 'js/src/html/display.coffee'),
-                     resource_string(__name__, 'js/src/annotatable/display.coffee')],
-          'js': []}
+    js = {
+        'coffee': [
+            resource_string(__name__, 'js/src/javascript_loader.coffee'),
+            resource_string(__name__, 'js/src/html/display.coffee'),
+            resource_string(__name__, 'js/src/annotatable/display.coffee'),
+        ],
+        'js': [
+            resource_string(__name__, 'js/src/collapsible.js'),
+        ]
+    }
     js_module_name = "Annotatable"
     css = {'scss': [resource_string(__name__, 'css/annotatable/display.scss')]}
     icon_class = 'annotatable'
@@ -139,7 +150,7 @@ class AnnotatableModule(AnnotatableFields, XModule):
     def get_html(self):
         """ Renders parameters to template. """
         context = {
-            'display_name': self.display_name_with_default,
+            'display_name': self.display_name_with_default_escaped,
             'element_id': self.element_id,
             'instructions_html': self.instructions,
             'content_html': self._render_content()

@@ -1,42 +1,46 @@
 # disable missing docstring
-#pylint: disable=C0111
+# pylint: disable=missing-docstring
 
 from lettuce import world
-from nose.tools import assert_equal, assert_in  # pylint: disable=E0611
+from nose.tools import assert_equal, assert_in
 from terrain.steps import reload_the_page
 from common import type_in_codemirror
+from selenium.webdriver.common.keys import Keys
 
 
 @world.absorb
-def create_component_instance(step, category, component_type=None, is_advanced=False):
+def create_component_instance(step, category, component_type=None, is_advanced=False, advanced_component=None):
     """
     Create a new component in a Unit.
 
     Parameters
     ----------
-    category: component type (discussion, html, problem, video)
+    category: component type (discussion, html, problem, video, advanced)
     component_type: for components with multiple templates, the link text in the menu
     is_advanced: for problems, is the desired component under the advanced menu?
+    advanced_component: for advanced components, the related value of policy key 'advanced_modules'
     """
-    assert_in(category, ['problem', 'html', 'video', 'discussion'])
+    assert_in(category, ['advanced', 'problem', 'html', 'video', 'discussion'])
 
     component_button_css = 'span.large-{}-icon'.format(category.lower())
     if category == 'problem':
-        module_css = 'section.xmodule_CapaModule'
+        module_css = 'div.xmodule_CapaModule'
+    elif category == 'advanced':
+        module_css = 'div.xmodule_{}Module'.format(advanced_component.title())
     else:
-        module_css = 'section.xmodule_{}Module'.format(category.title())
+        module_css = 'div.xmodule_{}Module'.format(category.title())
 
     # Count how many of that module is on the page. Later we will
     # assert that one more was added.
     # We need to use world.browser.find_by_css instead of world.css_find
     # because it's ok if there are currently zero of them.
-    module_count_before =  len(world.browser.find_by_css(module_css))
+    module_count_before = len(world.browser.find_by_css(module_css))
 
     # Disable the jquery animation for the transition to the menus.
     world.disable_jquery_animations()
     world.css_click(component_button_css)
 
-    if category in ('problem', 'html'):
+    if category in ('problem', 'html', 'advanced'):
         world.wait_for_invisible(component_button_css)
         click_component_from_menu(category, component_type, is_advanced)
 
@@ -63,20 +67,20 @@ def _click_advanced():
     world.wait_for_visible(tab2_css)
 
 
-def _find_matching_link(category, component_type):
+def _find_matching_button(category, component_type):
     """
-    Find the link with the specified text. There should be one and only one.
+    Find the button with the specified text. There should be one and only one.
     """
 
-    # The tab shows links for the given category
-    links = world.css_find('div.new-component-{} a'.format(category))
+    # The tab shows buttons for the given category
+    buttons = world.css_find('div.new-component-{} button'.format(category))
 
-    # Find the link whose text matches what you're looking for
-    matched_links = [link for link in links if link.text == component_type]
+    # Find the button whose text matches what you're looking for
+    matched_buttons = [btn for btn in buttons if btn.text == component_type]
 
     # There should be one and only one
-    assert_equal(len(matched_links), 1)
-    return matched_links[0]
+    assert_equal(len(matched_buttons), 1)
+    return matched_buttons[0]
 
 
 def click_component_from_menu(category, component_type, is_advanced):
@@ -89,12 +93,14 @@ def click_component_from_menu(category, component_type, is_advanced):
     """
     if is_advanced:
         # Sometimes this click does not work if you go too fast.
-        world.retry_on_exception(_click_advanced,
-            ignored_exceptions=AssertionError)
+        world.retry_on_exception(
+            _click_advanced,
+            ignored_exceptions=AssertionError,
+        )
 
     # Retry this in case the list is empty because you tried too fast.
     link = world.retry_on_exception(
-        lambda: _find_matching_link(category, component_type),
+        lambda: _find_matching_button(category, component_type),
         ignored_exceptions=AssertionError
     )
 
@@ -104,15 +110,37 @@ def click_component_from_menu(category, component_type, is_advanced):
 
 @world.absorb
 def edit_component_and_select_settings():
-    world.wait_for(lambda _driver: world.css_visible('a.edit-button'))
-    world.css_click('a.edit-button')
-    world.css_click('#settings-mode a')
+    world.edit_component()
+    world.ensure_settings_visible()
 
 
 @world.absorb
-def edit_component():
+def ensure_settings_visible():
+    # Select the 'settings' tab if there is one (it isn't displayed if it is the only option)
+    settings_button = world.browser.find_by_css('.settings-button')
+    if len(settings_button) > 0:
+        world.css_click('.settings-button')
+
+
+@world.absorb
+def edit_component(index=0):
+    # Verify that the "loading" indication has been hidden.
+    world.wait_for_loading()
+    # Verify that the "edit" button is present.
     world.wait_for(lambda _driver: world.css_visible('a.edit-button'))
-    world.css_click('a.edit-button')
+    world.css_click('a.edit-button', index)
+    world.wait_for_ajax_complete()
+
+
+@world.absorb
+def select_editor_tab(tab_name):
+    editor_tabs = world.browser.find_by_css('.editor-tabs a')
+    expected_tab_text = tab_name.strip().upper()
+    matching_tabs = [tab for tab in editor_tabs if tab.text.upper() == expected_tab_text]
+    assert len(matching_tabs) == 1
+    tab = matching_tabs[0]
+    tab.click()
+    world.wait_for_ajax_complete()
 
 
 def enter_xml_in_advanced_problem(step, text):
@@ -122,7 +150,7 @@ def enter_xml_in_advanced_problem(step, text):
     """
     world.edit_component()
     type_in_codemirror(0, text)
-    world.save_component(step)
+    world.save_component()
 
 
 @world.absorb
@@ -144,7 +172,7 @@ def verify_setting_entry(setting, display_name, value, explicitly_set):
 
     # Check if the web object is a list type
     # If so, we use a slightly different mechanism for determining its value
-    if setting.has_class('metadata-list-enum'):
+    if setting.has_class('metadata-list-enum') or setting.has_class('metadata-dict') or setting.has_class('metadata-video-translations'):
         list_value = ', '.join(ele.value for ele in setting.find_by_css('.list-settings-item'))
         assert_equal(value, list_value)
     elif setting.has_class('metadata-videolist-enum'):
@@ -172,14 +200,14 @@ def verify_all_setting_entries(expected_entries):
 
 
 @world.absorb
-def save_component(step):
-    world.css_click("a.save-button")
+def save_component():
+    world.css_click("a.action-save")
     world.wait_for_ajax_complete()
 
 
 @world.absorb
 def save_component_and_reopen(step):
-    save_component(step)
+    save_component()
     # We have a known issue that modifications are still shown within the edit window after cancel (though)
     # they are not persisted. Refresh the browser to make sure the changes WERE persisted after Save.
     reload_the_page(step)
@@ -188,7 +216,7 @@ def save_component_and_reopen(step):
 
 @world.absorb
 def cancel_component(step):
-    world.css_click("a.cancel-button")
+    world.css_click("a.action-cancel")
     # We have a known issue that modifications are still shown within the edit window after cancel (though)
     # they are not persisted. Refresh the browser to make sure the changes were not persisted.
     reload_the_page(step)
@@ -213,9 +241,24 @@ def get_setting_entry(label):
 @world.absorb
 def get_setting_entry_index(label):
     def get_index():
-        settings = world.css_find('.wrapper-comp-setting')
+        settings = world.css_find('.metadata_edit .wrapper-comp-setting')
         for index, setting in enumerate(settings):
             if setting.find_by_css('.setting-label')[0].value == label:
                 return index
         return None
     return world.retry_on_exception(get_index)
+
+
+@world.absorb
+def set_field_value(index, value):
+    """
+    Set the field to the specified value.
+
+    Note: we cannot use css_fill here because the value is not set
+    until after you move away from that field.
+    Instead we will find the element, set its value, then hit the Tab key
+    to get to the next field.
+    """
+    elem = world.css_find('.metadata_edit div.wrapper-comp-setting input.setting-input')[index]
+    elem.value = value
+    elem.type(Keys.TAB)

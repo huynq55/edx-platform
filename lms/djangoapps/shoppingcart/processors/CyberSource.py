@@ -1,7 +1,23 @@
-### Implementation of support for the Cybersource Credit card processor
-### The name of this file should be used as the key of the dict in the CC_PROCESSOR setting
-### Implementes interface as specified by __init__.py
+"""
+Implementation the CyberSource credit card processor.
 
+IMPORTANT: CyberSource will deprecate this version of the API ("Hosted Order Page") in September 2014.
+We are keeping this implementation in the code-base for now, but we should
+eventually replace this module with the newer implementation (in `CyberSource2.py`)
+
+To enable this implementation, add the following to Django settings:
+
+    CC_PROCESSOR_NAME = "CyberSource"
+    CC_PROCESSOR = {
+        "CyberSource": {
+            "SHARED_SECRET": "<shared secret>",
+            "MERCHANT_ID": "<merchant ID>",
+            "SERIAL_NUMBER": "<serial number>",
+            "PURCHASE_ENDPOINT": "<purchase endpoint>"
+        }
+    }
+
+"""
 import time
 import hmac
 import binascii
@@ -16,9 +32,11 @@ from django.utils.translation import ugettext as _
 from edxmako.shortcuts import render_to_string
 from shoppingcart.models import Order
 from shoppingcart.processors.exceptions import *
+from shoppingcart.processors.helpers import get_processor_config
+from microsite_configuration import microsite
 
 
-def process_postpay_callback(params):
+def process_postpay_callback(params, **kwargs):
     """
     The top level call to this module, basically
     This function is handed the callback request after the customer has entered the CC info and clicked "buy"
@@ -53,7 +71,7 @@ def processor_hash(value):
     """
     Performs the base64(HMAC_SHA1(key, value)) used by CyberSource Hosted Order Page
     """
-    shared_secret = settings.CC_PROCESSOR['CyberSource'].get('SHARED_SECRET', '')
+    shared_secret = get_processor_config().get('SHARED_SECRET', '')
     hash_obj = hmac.new(shared_secret.encode('utf-8'), value.encode('utf-8'), sha1)
     return binascii.b2a_base64(hash_obj.digest())[:-1]  # last character is a '\n', which we don't want
 
@@ -63,9 +81,9 @@ def sign(params, signed_fields_key='orderPage_signedFields', full_sig_key='order
     params needs to be an ordered dict, b/c cybersource documentation states that order is important.
     Reverse engineered from PHP version provided by cybersource
     """
-    merchant_id = settings.CC_PROCESSOR['CyberSource'].get('MERCHANT_ID', '')
-    order_page_version = settings.CC_PROCESSOR['CyberSource'].get('ORDERPAGE_VERSION', '7')
-    serial_number = settings.CC_PROCESSOR['CyberSource'].get('SERIAL_NUMBER', '')
+    merchant_id = get_processor_config().get('MERCHANT_ID', '')
+    order_page_version = get_processor_config().get('ORDERPAGE_VERSION', '7')
+    serial_number = get_processor_config().get('SERIAL_NUMBER', '')
 
     params['merchantID'] = merchant_id
     params['orderPage_timestamp'] = int(time.time() * 1000)
@@ -98,7 +116,7 @@ def verify_signatures(params, signed_fields_key='signedFields', full_sig_key='si
         raise CCProcessorSignatureException()
 
 
-def render_purchase_form_html(cart):
+def render_purchase_form_html(cart, **kwargs):
     """
     Renders the HTML of the hidden POST form that must be used to initiate a purchase with CyberSource
     """
@@ -107,8 +125,10 @@ def render_purchase_form_html(cart):
         'params': get_signed_purchase_params(cart),
     })
 
-def get_signed_purchase_params(cart):
+
+def get_signed_purchase_params(cart, **kwargs):
     return sign(get_purchase_params(cart))
+
 
 def get_purchase_params(cart):
     total_cost = cart.total_cost
@@ -122,8 +142,10 @@ def get_purchase_params(cart):
 
     return params
 
+
 def get_purchase_endpoint():
-    return settings.CC_PROCESSOR['CyberSource'].get('PURCHASE_ENDPOINT', '')
+    return get_processor_config().get('PURCHASE_ENDPOINT', '')
+
 
 def payment_accepted(params):
     """
@@ -144,13 +166,13 @@ def payment_accepted(params):
                           ('decision', str)]:
         if key not in params:
             raise CCProcessorDataException(
-                _("The payment processor did not return a required parameter: {0}".format(key))
+                _("The payment processor did not return a required parameter: {0}").format(key)
             )
         try:
             valid_params[key] = key_type(params[key])
         except ValueError:
             raise CCProcessorDataException(
-                _("The payment processor returned a badly-typed value {0} for param {1}.".format(params[key], key))
+                _("The payment processor returned a badly-typed value {0} for param {1}.").format(params[key], key)
             )
 
     try:
@@ -165,8 +187,9 @@ def payment_accepted(params):
             charged_amt = Decimal(params['ccAuthReply_amount'])
         except InvalidOperation:
             raise CCProcessorDataException(
-                _("The payment processor returned a badly-typed value {0} for param {1}.".format(
-                    params['ccAuthReply_amount'], 'ccAuthReply_amount'))
+                _("The payment processor returned a badly-typed value {0} for param {1}.").format(
+                    params['ccAuthReply_amount'], 'ccAuthReply_amount'
+                )
             )
 
         if charged_amt == order.total_cost and valid_params['orderCurrency'] == order.currency:
@@ -176,9 +199,13 @@ def payment_accepted(params):
                     'order': order}
         else:
             raise CCProcessorWrongAmountException(
-                _("The amount charged by the processor {0} {1} is different than the total cost of the order {2} {3}."
-                    .format(charged_amt, valid_params['orderCurrency'],
-                            order.total_cost, order.currency))
+                _("The amount charged by the processor {0} {1} is different than the total cost of the order {2} {3}.")
+                .format(
+                    charged_amt,
+                    valid_params['orderCurrency'],
+                    order.total_cost,
+                    order.currency
+                )
             )
     else:
         return {'accepted': False,
@@ -215,63 +242,83 @@ def record_purchase(params, order):
 
 def get_processor_decline_html(params):
     """Have to parse through the error codes to return a helpful message"""
-    payment_support_email = settings.PAYMENT_SUPPORT_EMAIL
 
-    msg = dedent(_(
-            """
-            <p class="error_msg">
-            Sorry! Our payment processor did not accept your payment.
-            The decision they returned was <span class="decision">{decision}</span>,
-            and the reason was <span class="reason">{reason_code}:{reason_msg}</span>.
-            You were not charged. Please try a different form of payment.
-            Contact us with payment-related questions at {email}.
-            </p>
-            """))
+    # see if we have an override in the microsites
+    payment_support_email = microsite.get_value('payment_support_email', settings.PAYMENT_SUPPORT_EMAIL)
 
-    return msg.format(
-        decision=params['decision'],
-        reason_code=params['reasonCode'],
-        reason_msg=REASONCODE_MAP[params['reasonCode']],
-        email=payment_support_email)
+    msg = _(
+        "Sorry! Our payment processor did not accept your payment. "
+        "The decision they returned was {decision_text}, "
+        "and the reason was {reason_text}. "
+        "You were not charged. "
+        "Please try a different form of payment. "
+        "Contact us with payment-related questions at {email}."
+    )
+    formatted = msg.format(
+        decision_text='<span class="decision">{}</span>'.format(params['decision']),
+        reason_text='<span class="reason">{code}:{msg}</span>'.format(
+            code=params['reasonCode'], msg=REASONCODE_MAP[params['reasonCode']],
+        ),
+        email=payment_support_email,
+    )
+    return '<p class="error_msg">{}</p>'.format(formatted)
 
 
 def get_processor_exception_html(exception):
     """Return error HTML associated with exception"""
 
-    payment_support_email = settings.PAYMENT_SUPPORT_EMAIL
+    # see if we have an override in the microsites
+    payment_support_email = microsite.get_value('payment_support_email', settings.PAYMENT_SUPPORT_EMAIL)
     if isinstance(exception, CCProcessorDataException):
-        msg = dedent(_(
-                """
-                <p class="error_msg">
-                Sorry! Our payment processor sent us back a payment confirmation that had inconsistent data!
-                We apologize that we cannot verify whether the charge went through and take further action on your order.
-                The specific error message is: <span class="exception_msg">{msg}</span>.
-                Your credit card may possibly have been charged.  Contact us with payment-specific questions at {email}.
-                </p>
-                """.format(msg=exception.message, email=payment_support_email)))
-        return msg
+        msg = _(
+            "Sorry! Our payment processor sent us back a payment confirmation "
+            "that had inconsistent data!"
+            "We apologize that we cannot verify whether the charge went through "
+            "and take further action on your order."
+            "The specific error message is: {error_message}. "
+            "Your credit card may possibly have been charged. "
+            "Contact us with payment-specific questions at {email}."
+        )
+        formatted = msg.format(
+            error_message='<span class="exception_msg">{msg}</span>'.format(
+                msg=exception.message,
+            ),
+            email=payment_support_email,
+        )
+        return '<p class="error_msg">{}</p>'.format(formatted)
     elif isinstance(exception, CCProcessorWrongAmountException):
-        msg = dedent(_(
-                """
-                <p class="error_msg">
-                Sorry! Due to an error your purchase was charged for a different amount than the order total!
-                The specific error message is: <span class="exception_msg">{msg}</span>.
-                Your credit card has probably been charged. Contact us with payment-specific questions at {email}.
-                </p>
-                """.format(msg=exception.message, email=payment_support_email)))
-        return msg
+        msg = _(
+            "Sorry! Due to an error your purchase was charged for "
+            "a different amount than the order total! "
+            "The specific error message is: {error_message}. "
+            "Your credit card has probably been charged. "
+            "Contact us with payment-specific questions at {email}."
+        )
+        formatted = msg.format(
+            error_message='<span class="exception_msg">{msg}</span>'.format(
+                msg=exception.message,
+            ),
+            email=payment_support_email,
+        )
+        return '<p class="error_msg">{}</p>'.format(formatted)
     elif isinstance(exception, CCProcessorSignatureException):
-        msg = dedent(_(
-                """
-                <p class="error_msg">
-                Sorry! Our payment processor sent us back a corrupted message regarding your charge, so we are
-                unable to validate that the message actually came from the payment processor.
-                The specific error message is: <span class="exception_msg">{msg}</span>.
-                We apologize that we cannot verify whether the charge went through and take further action on your order.
-                Your credit card may possibly have been charged.  Contact us with payment-specific questions at {email}.
-                </p>
-                """.format(msg=exception.message, email=payment_support_email)))
-        return msg
+        msg = _(
+            "Sorry! Our payment processor sent us back a corrupted message "
+            "regarding your charge, so we are unable to validate that "
+            "the message actually came from the payment processor. "
+            "The specific error message is: {error_message}. "
+            "We apologize that we cannot verify whether the charge went through "
+            "and take further action on your order. "
+            "Your credit card may possibly have been charged. "
+            "Contact us with payment-specific questions at {email}."
+        )
+        formatted = msg.format(
+            error_message='<span class="exception_msg">{msg}</span>'.format(
+                msg=exception.message,
+            ),
+            email=payment_support_email,
+        )
+        return '<p class="error_msg">{}</p>'.format(formatted)
 
     # fallthrough case, which basically never happens
     return '<p class="error_msg">EXCEPTION!</p>'
@@ -358,10 +405,9 @@ REASONCODE_MAP.update(
             Possible fix: retry with another form of payment
             """)),
         '233': _('General decline by the processor.  Possible fix: retry with another form of payment'),
-        '234': dedent(_(
-            """
-            There is a problem with our CyberSource merchant configuration.  Please let us know at {0}
-            """.format(settings.PAYMENT_SUPPORT_EMAIL))),
+        '234': _(
+            "There is a problem with our CyberSource merchant configuration.  Please let us know at {0}"
+        ).format(settings.PAYMENT_SUPPORT_EMAIL),
         # reason code 235 only applies if we are processing a capture through the API. so we should never see it
         '235': _('The requested amount exceeds the originally authorized amount.'),
         '236': _('Processor Failure.  Possible fix: retry the payment'),

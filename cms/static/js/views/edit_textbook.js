@@ -1,8 +1,8 @@
-define(["js/views/baseview", "underscore", "jquery", "js/views/edit_chapter", "js/views/feedback_notification"],
+define(["js/views/baseview", "underscore", "jquery", "js/views/edit_chapter", "common/js/components/views/feedback_notification"],
         function(BaseView, _, $, EditChapterView, NotificationView) {
     var EditTextbook = BaseView.extend({
         initialize: function() {
-            this.template = _.template($("#edit-textbook-tpl").text());
+            this.template = this.loadTemplate('edit-textbook');
             this.listenTo(this.model, "invalid", this.render);
             var chapters = this.model.get('chapters');
             this.listenTo(chapters, "add", this.addOne);
@@ -13,7 +13,7 @@ define(["js/views/baseview", "underscore", "jquery", "js/views/edit_chapter", "j
         className: "textbook",
         render: function() {
             this.$el.html(this.template({
-                name: this.model.escape('name'),
+                name: this.model.get('name'),
                 error: this.model.validationError
             }));
             this.addAll();
@@ -60,7 +60,7 @@ define(["js/views/baseview", "underscore", "jquery", "js/views/edit_chapter", "j
             this.setValues();
             if(!this.model.isValid()) { return; }
             var saving = new NotificationView.Mini({
-                title: gettext("Saving") + "&hellip;"
+                title: gettext("Saving")
             }).show();
             var that = this;
             this.model.save({}, {

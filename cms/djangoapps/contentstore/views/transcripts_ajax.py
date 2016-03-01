@@ -15,29 +15,31 @@ from django.http import HttpResponse, Http404
 from django.core.exceptions import PermissionDenied
 from django.contrib.auth.decorators import login_required
 from django.conf import settings
+from django.utils.translation import ugettext as _
+
+from opaque_keys import InvalidKeyError
 
 from xmodule.contentstore.content import StaticContent
 from xmodule.exceptions import NotFoundError
-from xmodule.modulestore.django import modulestore, loc_mapper
+from xmodule.modulestore.django import modulestore
+from opaque_keys.edx.keys import UsageKey
 from xmodule.contentstore.django import contentstore
-from xmodule.modulestore.exceptions import ItemNotFoundError, InvalidLocationError, InsufficientSpecificationError
+from xmodule.modulestore.exceptions import ItemNotFoundError
 
 from util.json_request import JsonResponse
-from xmodule.modulestore.locator import BlockUsageLocator
 
-from ..transcripts_utils import (
+from xmodule.video_module.transcripts_utils import (
     generate_subs_from_source,
     generate_srt_from_sjson, remove_subs_from_store,
     download_youtube_subs, get_transcripts_from_youtube,
     copy_or_rename_transcript,
-    save_module,
     manage_video_subtitles_save,
-    TranscriptsGenerationException,
     GetTranscriptsFromYouTubeException,
-    TranscriptsRequestValidationException
+    TranscriptsRequestValidationException,
+    youtube_video_transcript_name,
 )
 
-from .access import has_course_access
+from student.auth import has_course_author_access
 
 __all__ = [
     'upload_transcripts',
@@ -46,7 +48,7 @@ __all__ = [
     'choose_transcripts',
     'replace_transcripts',
     'rename_transcripts',
-    'save_transcripts'
+    'save_transcripts',
 ]
 
 log = logging.getLogger(__name__)
@@ -84,10 +86,10 @@ def upload_transcripts(request):
 
     try:
         item = _get_item(request, request.POST)
-    except (ItemNotFoundError, InvalidLocationError, InsufficientSpecificationError):
+    except (InvalidKeyError, ItemNotFoundError):
         return error_response(response, "Can't find item by locator.")
 
-    if 'file' not in request.FILES:
+    if 'transcript-file' not in request.FILES:
         return error_response(response, 'POST data without "file" form data.')
 
     video_list = request.POST.get('video_list')
@@ -99,8 +101,9 @@ def upload_transcripts(request):
     except ValueError:
         return error_response(response, 'Invalid video_list JSON.')
 
-    source_subs_filedata = request.FILES['file'].read().decode('utf8')
-    source_subs_filename = request.FILES['file'].name
+    # Used utf-8-sig encoding type instead of utf-8 to remove BOM(Byte Order Mark), e.g. U+FEFF
+    source_subs_filedata = request.FILES['transcript-file'].read().decode('utf-8-sig')
+    source_subs_filename = request.FILES['transcript-file'].name
 
     if '.' not in source_subs_filename:
         return error_response(response, "Undefined file extension.")
@@ -115,29 +118,20 @@ def upload_transcripts(request):
     # Allow upload only if any video link is presented
     if video_list:
         sub_attr = source_subs_name
-
-        try:  # Generate and save for 1.0 speed, will create subs_sub_attr.srt.sjson subtitles file in storage.
+        try:
+            # Generate and save for 1.0 speed, will create subs_sub_attr.srt.sjson subtitles file in storage.
             generate_subs_from_source({1: sub_attr}, source_subs_ext, source_subs_filedata, item)
-        except TranscriptsGenerationException as e:
-            return error_response(response, e.message)
-        statuses = {}
-        for video_dict in video_list:
-            video_name = video_dict['video']
-            # We are creating transcripts for every video source,
-            # for the case that in future, some of video sources can be deleted.
-            statuses[video_name] = copy_or_rename_transcript(video_name, sub_attr, item)
-            try:
-                # updates item.sub with `video_name` if it is successful.
-                copy_or_rename_transcript(video_name, sub_attr, item)
-                selected_name = video_name  # name to write to item.sub field, chosen at random.
-            except NotFoundError:
-                # subtitles file `sub_attr` is not presented in the system. Nothing to copy or rename.
-                return error_response(response, "Can't find transcripts in storage for {}".format(sub_attr))
 
-        item.sub = selected_name  # write one of  new subtitles names to item.sub attribute.
-        save_module(item)
-        response['subs'] = item.sub
-        response['status'] = 'Success'
+            for video_dict in video_list:
+                video_name = video_dict['video']
+                # We are creating transcripts for every video source, if in future some of video sources would be deleted.
+                # Updates item.sub with `video_name` on success.
+                copy_or_rename_transcript(video_name, sub_attr, item, user=request.user)
+
+            response['subs'] = item.sub
+            response['status'] = 'Success'
+        except Exception as ex:
+            return error_response(response, ex.message)
     else:
         return error_response(response, 'Empty video sources.')
 
@@ -158,7 +152,7 @@ def download_transcripts(request):
 
     try:
         item = _get_item(request, request.GET)
-    except (ItemNotFoundError, InvalidLocationError, InsufficientSpecificationError):
+    except (InvalidKeyError, ItemNotFoundError):
         log.debug("Can't find item by locator.")
         raise Http404
 
@@ -172,9 +166,7 @@ def download_transcripts(request):
         raise Http404
 
     filename = 'subs_{0}.srt.sjson'.format(subs_id)
-    content_location = StaticContent.compute_location(
-        item.location.org, item.location.course, filename
-    )
+    content_location = StaticContent.compute_location(item.location.course_key, filename)
     try:
         sjson_transcripts = contentstore().find(content_location)
         log.debug("Downloading subs for %s id", subs_id)
@@ -236,9 +228,7 @@ def check_transcripts(request):
     transcripts_presence['status'] = 'Success'
 
     filename = 'subs_{0}.srt.sjson'.format(item.sub)
-    content_location = StaticContent.compute_location(
-        item.location.org, item.location.course, filename
-    )
+    content_location = StaticContent.compute_location(item.location.course_key, filename)
     try:
         local_transcripts = contentstore().find(content_location).data
         transcripts_presence['current_item_subs'] = item.sub
@@ -252,9 +242,7 @@ def check_transcripts(request):
 
         # youtube local
         filename = 'subs_{0}.srt.sjson'.format(youtube_id)
-        content_location = StaticContent.compute_location(
-            item.location.org, item.location.course, filename
-        )
+        content_location = StaticContent.compute_location(item.location.course_key, filename)
         try:
             local_transcripts = contentstore().find(content_location).data
             transcripts_presence['youtube_local'] = True
@@ -262,16 +250,23 @@ def check_transcripts(request):
             log.debug("Can't find transcripts in storage for youtube id: %s", youtube_id)
 
         # youtube server
-        youtube_api = copy.deepcopy(settings.YOUTUBE_API)
-        youtube_api['params']['v'] = youtube_id
-        youtube_response = requests.get(youtube_api['url'], params=youtube_api['params'])
+        youtube_text_api = copy.deepcopy(settings.YOUTUBE['TEXT_API'])
+        youtube_text_api['params']['v'] = youtube_id
+        youtube_transcript_name = youtube_video_transcript_name(youtube_text_api)
+        if youtube_transcript_name:
+            youtube_text_api['params']['name'] = youtube_transcript_name
+        youtube_response = requests.get('http://' + youtube_text_api['url'], params=youtube_text_api['params'])
 
         if youtube_response.status_code == 200 and youtube_response.text:
             transcripts_presence['youtube_server'] = True
         #check youtube local and server transcripts for equality
         if transcripts_presence['youtube_server'] and transcripts_presence['youtube_local']:
             try:
-                youtube_server_subs = get_transcripts_from_youtube(youtube_id)
+                youtube_server_subs = get_transcripts_from_youtube(
+                    youtube_id,
+                    settings,
+                    item.runtime.service(item, "i18n")
+                )
                 if json.loads(local_transcripts) == youtube_server_subs:  # check transcripts for equality
                     transcripts_presence['youtube_diff'] = False
             except GetTranscriptsFromYouTubeException:
@@ -281,9 +276,7 @@ def check_transcripts(request):
     html5_subs = []
     for html5_id in videos['html5']:
         filename = 'subs_{0}.srt.sjson'.format(html5_id)
-        content_location = StaticContent.compute_location(
-            item.location.org, item.location.course, filename
-        )
+        content_location = StaticContent.compute_location(item.location.course_key, filename)
         try:
             html5_subs.append(contentstore().find(content_location).data)
             transcripts_presence['html5_local'].append(html5_id)
@@ -388,8 +381,11 @@ def choose_transcripts(request):
 
     if item.sub != html5_id:  # update sub value
         item.sub = html5_id
-        save_module(item)
-    response = {'status': 'Success',  'subs': item.sub}
+        item.save_with_metadata(request.user)
+    response = {
+        'status': 'Success',
+        'subs': item.sub,
+    }
     return JsonResponse(response)
 
 
@@ -414,13 +410,16 @@ def replace_transcripts(request):
         return error_response(response, 'YouTube id {} is not presented in request data.'.format(youtube_id))
 
     try:
-        download_youtube_subs({1.0: youtube_id}, item)
+        download_youtube_subs(youtube_id, item, settings)
     except GetTranscriptsFromYouTubeException as e:
         return error_response(response, e.message)
 
     item.sub = youtube_id
-    save_module(item)
-    response = {'status': 'Success',  'subs': item.sub}
+    item.save_with_metadata(request.user)
+    response = {
+        'status': 'Success',
+        'subs': item.sub,
+    }
     return JsonResponse(response)
 
 
@@ -439,15 +438,15 @@ def _validate_transcripts_data(request):
     """
     data = json.loads(request.GET.get('data', '{}'))
     if not data:
-        raise TranscriptsRequestValidationException('Incoming video data is empty.')
+        raise TranscriptsRequestValidationException(_('Incoming video data is empty.'))
 
     try:
         item = _get_item(request, data)
-    except (ItemNotFoundError, InvalidLocationError, InsufficientSpecificationError):
-        raise TranscriptsRequestValidationException("Can't find item by locator.")
+    except (InvalidKeyError, ItemNotFoundError):
+        raise TranscriptsRequestValidationException(_("Can't find item by locator."))
 
     if item.category != 'video':
-        raise TranscriptsRequestValidationException('Transcripts are supported only for "video" modules.')
+        raise TranscriptsRequestValidationException(_('Transcripts are supported only for "video" modules.'))
 
     # parse data form request.GET.['data']['video'] to useful format
     videos = {'youtube': '', 'html5': {}}
@@ -482,7 +481,7 @@ def rename_transcripts(request):
     for new_name in videos['html5'].keys():  # copy subtitles for every HTML5 source
         try:
             # updates item.sub with new_name if it is successful.
-            copy_or_rename_transcript(new_name, old_name, item)
+            copy_or_rename_transcript(new_name, old_name, item, user=request.user)
         except NotFoundError:
             # subtitles file `item.sub` is not presented in the system. Nothing to copy or rename.
             error_response(response, "Can't find transcripts in storage for {}".format(old_name))
@@ -508,7 +507,7 @@ def save_transcripts(request):
 
     try:
         item = _get_item(request, data)
-    except (ItemNotFoundError, InvalidLocationError, InsufficientSpecificationError):
+    except (InvalidKeyError, ItemNotFoundError):
         return error_response(response, "Can't find item by locator.")
 
     metadata = data.get('metadata')
@@ -518,10 +517,10 @@ def save_transcripts(request):
         for metadata_key, value in metadata.items():
             setattr(item, metadata_key, value)
 
-        save_module(item)  # item becomes updated with new values
+        item.save_with_metadata(request.user)  # item becomes updated with new values
 
         if new_sub:
-            manage_video_subtitles_save(None, item)
+            manage_video_subtitles_save(item, request.user)
         else:
             # If `new_sub` is empty, it means that user explicitly does not want to use
             # transcripts for current video ids and we remove all transcripts from storage.
@@ -543,14 +542,13 @@ def _get_item(request, data):
 
     Returns the item.
     """
-    locator = BlockUsageLocator(data.get('locator'))
-    old_location = loc_mapper().translate_locator_to_location(locator)
+    usage_key = UsageKey.from_string(data.get('locator'))
+    # This is placed before has_course_author_access() to validate the location,
+    # because has_course_author_access() raises  r if location is invalid.
+    item = modulestore().get_item(usage_key)
 
-    # This is placed before has_course_access() to validate the location,
-    # because has_course_access() raises InvalidLocationError if location is invalid.
-    item = modulestore().get_item(old_location)
-
-    if not has_course_access(request.user, locator):
+    # use the item's course_key, because the usage_key might not have the run
+    if not has_course_author_access(request.user, item.location.course_key):
         raise PermissionDenied()
 
     return item

@@ -27,14 +27,14 @@
   }
 
   .wrapper-l {
-    float: left;
+    @include float(left);
     width: flex-grid(7,12);
   }
 
   .wrapper-r {
-    float: right;
+    @include float(right);
     width: flex-grid(4,12);
-    text-align: right;
+    @include text-align(right);
   }
 
   .branding, .info-course, .nav-course, .nav-account, .nav-pitch {
@@ -43,8 +43,19 @@
     vertical-align: middle;
   }
 
+  .user-language-selector {
+    width: 120px;
+    display: inline-block;
+    margin: 0 10px 0 5px;
+    vertical-align: sub;
+
+    .language-selector {
+      width: 120px;
+    }
+  }
+
   .nav-account {
-    width: 100%;
+    width: auto;
   }
 
   // basic layout - nav items
@@ -52,9 +63,9 @@
 
     > ol > .nav-item {
       @extend %t-action3;
+      @extend %t-strong;
       display: inline-block;
       vertical-align: middle;
-      font-weight: 600;
 
       &:last-child {
         margin-right: 0;
@@ -78,7 +89,7 @@
       @extend %ui-btn-dd-nav-primary;
       @include transition(all $tmg-f2 ease-in-out 0s);
 
-      .label, .icon-caret-down {
+      .label, .fa-caret-down {
 
       }
 
@@ -86,20 +97,20 @@
 
       }
 
-      .icon-caret-down {
+      .fa-caret-down {
         opacity: 0.25;
       }
 
       &:hover {
 
-        .icon-caret-down {
+        .fa-caret-down {
           opacity: 1.0;
         }
       }
 
       .nav-sub .nav-item {
 
-        [class^="icon-"] {
+        .icon {
           display: inline-block;
           vertical-align: middle;
           margin-right: ($baseline/4);
@@ -118,7 +129,7 @@
       display: block;
 
       img {
-        width: 100%;
+        max-height: ($baseline*2);
         display: block;
       }
     }
@@ -128,8 +139,8 @@
 
   // specific elements - course name/info
   .info-course {
-    margin-right: flex-gutter();
-    border-right: 1px solid $gray-l4;
+    @include margin-right(flex-gutter());
+    @include border-right(1px solid $gray-l4);
     padding: ($baseline*0.75) flex-gutter() ($baseline*0.75) 0;
 
     .course-org, .course-number {
@@ -144,17 +155,17 @@
     }
 
     .course-org {
-      margin-right: ($baseline/4);
+      @include margin-right($baseline/4);
     }
 
     .course-title {
       @extend %t-action2;
+      @extend %t-strong;
       display: block;
       width: 100%;
       overflow: hidden;
       white-space: nowrap;
       text-overflow: ellipsis;
-      font-weight: 600;
     }
 
     // entire link
@@ -184,7 +195,7 @@
     padding: ($baseline*0.75) 0;
 
     .nav-sub {
-      text-align: left;
+      @include text-align(left);
     }
 
     .nav-account-help {
@@ -201,11 +212,18 @@
 
         > .label {
           display: inline-block;
-          max-width: 85%;
+          max-width: 84%;
           overflow: hidden;
           white-space: nowrap;
           text-overflow: ellipsis;
         }
+      }
+    }
+
+    .settings-language-form {
+      margin-top: 4px;
+      .language-selector {
+        width: 130px;
       }
     }
   }
@@ -229,16 +247,15 @@
 .is-signedin {
 
   .wrapper-l {
-    width: flex-grid(9,12);
+    width: flex-grid(8,12);
   }
 
   .wrapper-r {
-    width: flex-grid(3,12);
+    width: flex-grid(4,12);
   }
 
   .branding {
-    width: 20%;
-    margin-right: 2%;
+    @include margin-right(2%);
   }
 
   .nav-account {
@@ -254,16 +271,15 @@
   .wrapper-header {
 
     .wrapper-l {
-      width: flex-grid(9,12);
+      width: flex-grid(8,12);
     }
 
     .wrapper-r {
-      width: flex-grid(3,12);
+      width: flex-grid(4,12);
     }
 
     .branding {
-      width: 20%;
-      margin-right: 2%;
+      @include margin-right(2%);
     }
 
     .info-course {
@@ -280,7 +296,8 @@
 // ====================
 
 // CASE: user not signed in
-.not-signedin {
+.not-signedin,
+.view-util {
 
   .wrapper-header {
 
@@ -308,19 +325,19 @@
       }
 
       .action-signup {
-        @include blue-button;
-        @include font-size(14);
+        @include blue-button();
+        @extend %t-action3;
+        @extend %t-strong;
         padding: ($baseline/4) ($baseline/2);
         text-transform: uppercase;
-        font-weight: 600;
       }
 
       .action-signin {
-        @include white-button;
-        @include font-size(14);
+        @include white-button();
+        @extend %t-action3;
+        @extend %t-strong;
         padding: ($baseline/4) ($baseline/2);
         text-transform: uppercase;
-        font-weight: 600;
       }
     }
   }
@@ -337,36 +354,48 @@ body.howitworks .nav-not-signedin-hiw,
 body.dashboard .nav-account-dashboard,
 
 // course content
-body.course.outline .nav-course-courseware .title,
-body.course.updates .nav-course-courseware .title,
-body.course.pages .nav-course-courseware .title,
-body.course.uploads .nav-course-courseware .title,
+body.course.view-outline .nav-course-courseware .title,
+body.course.view-updates .nav-course-courseware .title,
+body.course.view-static-pages .nav-course-courseware .title,
+body.course.view-uploads .nav-course-courseware .title,
+body.course.view-textbooks .nav-course-courseware .title,
+body.course.view-video-uploads .nav-course-courseware .title,
 
-body.course.outline .nav-course-courseware-outline,
-body.course.updates .nav-course-courseware-updates,
-body.course.pages .nav-course-courseware-pages,
-body.course.uploads .nav-course-courseware-uploads,
-body.course.textbooks .nav-course-courseware-textbooks,
+body.course.view-outline .nav-course-courseware-outline,
+body.course.view-updates .nav-course-courseware-updates,
+body.course.view-static-pages .nav-course-courseware-pages,
+body.course.view-uploads .nav-course-courseware-uploads,
+body.course.view-textbooks .nav-course-courseware-textbooks,
+body.course.view-video-uploads .nav-course-courseware-video,
 
 // course settings
 body.course.schedule .nav-course-settings .title,
 body.course.grading .nav-course-settings .title,
-body.course.team .nav-course-settings .title,
+body.course.view-team .nav-course-settings .title,
+body.course.view-group-configurations .nav-course-settings .title,
 body.course.advanced .nav-course-settings .title,
+body.course.view-certificates .nav-course-settings .title,
 
 body.course.schedule .nav-course-settings-schedule,
 body.course.grading .nav-course-settings-grading,
-body.course.team .nav-course-settings-team,
+body.course.view-team .nav-course-settings-team,
+body.course.view-group-configurations .nav-course-settings-group-configurations,
 body.course.advanced .nav-course-settings-advanced,
+body.course.view-certificates .nav-course-settings-certificates,
 
 // course tools
-body.course.import .nav-course-tools .title,
-body.course.export .nav-course-tools .title,
-body.course.checklists .nav-course-tools .title,
+body.course.view-import .nav-course-tools .title,
+body.course.view-export .nav-course-tools .title,
+body.course.view-export-git .nav-course-tools .title,
 
-body.course.import .nav-course-tools-import,
-body.course.export .nav-course-tools-export,
-body.course.checklists .nav-course-tools-checklists,
+body.course.view-import .nav-course-tools-import,
+body.course.view-export .nav-course-tools-export,
+body.course.view-export-git .nav-course-tools-export-git,
+
+// content library settings
+body.course.view-team .nav-library-settings .title,
+
+body.course.view-team .nav-library-settings-team,
 
 {
   color: $blue;

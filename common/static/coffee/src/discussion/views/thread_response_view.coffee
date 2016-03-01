@@ -1,6 +1,7 @@
 if Backbone?
   class @ThreadResponseView extends DiscussionContentView
     tagName: "li"
+    className: "forum-response"
 
     events:
         "click .discussion-submit-comment": "submitComment"
@@ -9,22 +10,35 @@ if Backbone?
     $: (selector) ->
       @$el.find(selector)
 
-    initialize: ->
+    initialize: (options) ->
+      @collapseComments = options.collapseComments
       @createShowView()
+      @readOnly = $('.discussion-module').data('read-only')
 
     renderTemplate: ->
       @template = _.template($("#thread-response-template").html())
 
-      templateData = @model.toJSON()
-      templateData.wmdId = @model.id ? (new Date()).getTime()
+      container = $("#discussion-container")
+      if !container.length
+        # inline discussion
+        container = $(".discussion-module")
+      templateData = _.extend(
+        @model.toJSON(),
+        wmdId: @model.id ? (new Date()).getTime(),
+        create_sub_comment: container.data("user-create-subcomment"),
+        readOnly: @readOnly
+      )
       @template(templateData)
 
     render: ->
+      @$el.addClass("response_" + @model.get("id"))
       @$el.html(@renderTemplate())
       @delegateEvents()
 
       @renderShowView()
       @renderAttrs()
+      if @model.get("thread").get("closed")
+        @hideCommentForm()
 
       @renderComments()
       @
@@ -53,6 +67,7 @@ if Backbone?
 
     renderComments: ->
       comments = new Comments()
+      @commentViews = []
       comments.comparator = (comment) ->
         comment.get('created_at')
       collectComments = (comment) ->
@@ -63,12 +78,30 @@ if Backbone?
           collectComments(child)
       @model.get('comments').each collectComments
       comments.each (comment) => @renderComment(comment, false, null)
+      if @collapseComments && comments.length
+        @$(".comments").hide()
+        @$(".action-show-comments").on("click", (event) =>
+          event.preventDefault()
+          @$(".action-show-comments").hide()
+          @$(".comments").show()
+        )
+      else
+        @$(".action-show-comments").hide()
 
     renderComment: (comment) =>
       comment.set('thread', @model.get('thread'))
       view = new ResponseCommentView(model: comment)
       view.render()
-      @$el.find(".comments .new-comment").before(view.el)
+      if @readOnly
+        @$el.find('.comments').append(view.el)
+      else
+        @$el.find(".comments .new-comment").before(view.el)
+      view.bind "comment:edit", (event) =>
+        @cancelEdit(event) if @editView?
+        @cancelCommentEdits()
+        @hideCommentForm()
+      view.bind "comment:cancel_edit", () => @showCommentForm()
+      @commentViews.push(view)
       view
 
     submitComment: (event) ->
@@ -91,6 +124,7 @@ if Backbone?
           body: body
         success: (response, textStatus) ->
           comment.set(response.content)
+          comment.updateInfo(response.annotated_content_info)
           view.render() # This is just to update the id for the most part, but might be useful in general
 
     _delete: (event) =>
@@ -111,13 +145,14 @@ if Backbone?
 
     createEditView: () ->
       if @showView?
-        @showView.undelegateEvents()
         @showView.$el.empty()
-        @showView = null
 
-      @editView = new ThreadResponseEditView(model: @model)
-      @editView.bind "response:update", @update
-      @editView.bind "response:cancel_edit", @cancelEdit
+      if @editView?
+        @editView.model = @model
+      else
+        @editView = new ThreadResponseEditView(model: @model)
+        @editView.bind "response:update", @update
+        @editView.bind "response:cancel_edit", @cancelEdit
 
     renderSubView: (view) ->
       view.setElement(@$('.discussion-response'))
@@ -126,6 +161,9 @@ if Backbone?
 
     renderEditView: () ->
       @renderSubView(@editView)
+
+    cancelCommentEdits: () ->
+      _.each(@commentViews, (view) -> view.cancelEdit())
 
     hideCommentForm: () ->
       @$('.comment-form').closest('li').hide()
@@ -136,13 +174,15 @@ if Backbone?
     createShowView: () ->
 
       if @editView?
-        @editView.undelegateEvents()
         @editView.$el.empty()
-        @editView = null
 
-      @showView = new ThreadResponseShowView(model: @model)
-      @showView.bind "response:_delete", @_delete
-      @showView.bind "response:edit", @edit
+      if @showView?
+        @showView.model = @model
+      else
+        @showView = new ThreadResponseShowView(model: @model)
+        @showView.bind "response:_delete", @_delete
+        @showView.bind "response:edit", @edit
+        @showView.on "comment:endorse", => @trigger("comment:endorse")
 
     renderShowView: () ->
       @renderSubView(@showView)
@@ -156,6 +196,7 @@ if Backbone?
     edit: (event) =>
       @createEditView()
       @renderEditView()
+      @cancelCommentEdits()
       @hideCommentForm()
 
     update: (event) =>
@@ -170,12 +211,10 @@ if Backbone?
           url: url
           type: "POST"
           dataType: 'json'
-          async: false # TODO when the rest of the stuff below is made to work properly..
           data:
               body: newBody
           error: DiscussionUtil.formErrorHandler(@$(".edit-post-form-errors"))
           success: (response, textStatus) =>
-              # TODO: Move this out of the callback, this makes it feel sluggish
               @editView.$(".edit-post-body textarea").val("").attr("prev-text", "")
               @editView.$(".wmd-preview p").html("")
 

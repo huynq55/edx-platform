@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 This module contains celery task functions for handling the sending of bulk email
 to a course.
@@ -6,8 +7,10 @@ import re
 import random
 import json
 from time import sleep
+from collections import Counter
+import logging
 
-from dogapi import dog_stats_api
+import dogstats_wrapper as dog_stats_api
 from smtplib import SMTPServerDisconnected, SMTPDataError, SMTPConnectError, SMTPException
 from boto.ses.exceptions import (
     SESAddressNotVerifiedError,
@@ -22,10 +25,9 @@ from boto.ses.exceptions import (
 )
 from boto.exception import AWSConnectionError
 
-from celery import task, current_task
-from celery.utils.log import get_task_logger
-from celery.states import SUCCESS, FAILURE, RETRY
-from celery.exceptions import RetryTaskError
+from celery import task, current_task  # pylint: disable=no-name-in-module
+from celery.states import SUCCESS, FAILURE, RETRY  # pylint: disable=no-name-in-module, import-error
+from celery.exceptions import RetryTaskError  # pylint: disable=no-name-in-module, import-error
 
 from django.conf import settings
 from django.contrib.auth.models import User
@@ -33,10 +35,12 @@ from django.core.mail import EmailMultiAlternatives, get_connection
 from django.core.urlresolvers import reverse
 
 from bulk_email.models import (
-    CourseEmail, Optout, CourseEmailTemplate,
+    CourseEmail, Optout,
     SEND_TO_MYSELF, SEND_TO_ALL, TO_OPTIONS,
+    SEND_TO_STAFF,
 )
-from courseware.courses import get_course, course_image_url
+from courseware.courses import get_course
+from openedx.core.lib.courses import course_image_url
 from student.roles import CourseStaffRole, CourseInstructorRole
 from instructor_task.models import InstructorTask
 from instructor_task.subtasks import (
@@ -45,8 +49,10 @@ from instructor_task.subtasks import (
     check_subtask_is_valid,
     update_subtask_status,
 )
+from util.query import use_read_replica_if_available
+from util.date_utils import get_default_time_display
 
-log = get_task_logger(__name__)
+log = logging.getLogger('edx.celery.task')
 
 
 # Errors that an individual email is failing to be sent, and should just
@@ -90,25 +96,30 @@ BULK_EMAIL_FAILURE_ERRORS = (
 )
 
 
-def _get_recipient_queryset(user_id, to_option, course_id, course_location):
+def _get_recipient_querysets(user_id, to_option, course_id):
     """
-    Returns a query set of email recipients corresponding to the requested to_option category.
+    Returns a list of query sets of email recipients corresponding to the
+    requested `to_option` category.
 
     `to_option` is either SEND_TO_MYSELF, SEND_TO_STAFF, or SEND_TO_ALL.
 
-    Recipients who are in more than one category (e.g. enrolled in the course and are staff or self)
-    will be properly deduped.
+    Recipients who are in more than one category (e.g. enrolled in the course
+    and are staff or self) will be properly deduped.
     """
     if to_option not in TO_OPTIONS:
         log.error("Unexpected bulk email TO_OPTION found: %s", to_option)
         raise Exception("Unexpected bulk email TO_OPTION found: {0}".format(to_option))
 
     if to_option == SEND_TO_MYSELF:
-        recipient_qset = User.objects.filter(id=user_id)
+        user = User.objects.filter(id=user_id)
+        return [use_read_replica_if_available(user)]
     else:
-        staff_qset = CourseStaffRole(course_location).users_with_role()
-        instructor_qset = CourseInstructorRole(course_location).users_with_role()
-        recipient_qset = staff_qset | instructor_qset
+        staff_qset = CourseStaffRole(course_id).users_with_role()
+        instructor_qset = CourseInstructorRole(course_id).users_with_role()
+        staff_instructor_qset = (staff_qset | instructor_qset).distinct()
+        if to_option == SEND_TO_STAFF:
+            return [use_read_replica_if_available(staff_instructor_qset)]
+
         if to_option == SEND_TO_ALL:
             # We also require students to have activated their accounts to
             # provide verification that the provided email address is valid.
@@ -117,29 +128,40 @@ def _get_recipient_queryset(user_id, to_option, course_id, course_location):
                 courseenrollment__course_id=course_id,
                 courseenrollment__is_active=True
             )
-            recipient_qset = recipient_qset | enrollment_qset
-        recipient_qset = recipient_qset.distinct()
 
-    recipient_qset = recipient_qset.order_by('pk')
-    return recipient_qset
+            # to avoid duplicates, we only want to email unenrolled course staff
+            # members here
+            unenrolled_staff_qset = staff_instructor_qset.exclude(
+                courseenrollment__course_id=course_id, courseenrollment__is_active=True
+            )
+
+            # use read_replica if available
+            recipient_qsets = [
+                use_read_replica_if_available(unenrolled_staff_qset),
+                use_read_replica_if_available(enrollment_qset),
+            ]
+            return recipient_qsets
 
 
 def _get_course_email_context(course):
     """
     Returns context arguments to apply to all emails, independent of recipient.
     """
-    course_id = course.id
+    course_id = course.id.to_deprecated_string()
     course_title = course.display_name
+    course_end_date = get_default_time_display(course.end)
     course_url = 'https://{}{}'.format(
         settings.SITE_NAME,
         reverse('course_root', kwargs={'course_id': course_id})
     )
-    image_url = 'https://{}{}'.format(settings.SITE_NAME, course_image_url(course))
+    image_url = u'https://{}{}'.format(settings.SITE_NAME, course_image_url(course))
     email_context = {
         'course_title': course_title,
         'course_url': course_url,
         'course_image_url': image_url,
-        'account_settings_url': 'https://{}{}'.format(settings.SITE_NAME, reverse('dashboard')),
+        'course_end_date': course_end_date,
+        'account_settings_url': 'https://{}{}'.format(settings.SITE_NAME, reverse('account_settings')),
+        'email_settings_url': 'https://{}{}'.format(settings.SITE_NAME, reverse('dashboard')),
         'platform_name': settings.PLATFORM_NAME,
     }
     return email_context
@@ -159,8 +181,9 @@ def perform_delegate_email_batches(entry_id, course_id, task_input, action_name)
     # Perfunctory check, since expansion is made for convenience of other task
     # code that doesn't need the entry_id.
     if course_id != entry.course_id:
-        format_msg = "Course id conflict: explicit value {} does not match task value {}"
-        raise ValueError(format_msg.format(course_id, entry.course_id))
+        format_msg = u"Course id conflict: explicit value %r does not match task value %r"
+        log.warning(u"Task %s: " + format_msg, task_id, course_id, entry.course_id)
+        raise ValueError(format_msg % (course_id, entry.course_id))
 
     # Fetch the CourseEmail.
     email_id = task_input['email_id']
@@ -169,7 +192,7 @@ def perform_delegate_email_batches(entry_id, course_id, task_input, action_name)
     except CourseEmail.DoesNotExist:
         # The CourseEmail object should be committed in the view function before the task
         # is submitted and reaches this point.
-        log.warning("Task %s: Failed to get CourseEmail with id %s", task_id, email_id)
+        log.warning(u"Task %s: Failed to get CourseEmail with id %s", task_id, email_id)
         raise
 
     # Check to see if email batches have already been defined.  This seems to
@@ -180,25 +203,41 @@ def perform_delegate_email_batches(entry_id, course_id, task_input, action_name)
     # So we just return right away.  We don't raise an exception, because we want
     # the current task to be marked with whatever it had been marked with before.
     if len(entry.subtasks) > 0 and len(entry.task_output) > 0:
-        log.warning("Task %s has already been processed for email %s!  InstructorTask = %s", task_id, email_id, entry)
+        log.warning(u"Task %s has already been processed for email %s!  InstructorTask = %s", task_id, email_id, entry)
         progress = json.loads(entry.task_output)
         return progress
 
     # Sanity check that course for email_obj matches that of the task referencing it.
     if course_id != email_obj.course_id:
-        format_msg = "Course id conflict: explicit value {} does not match email value {}"
-        raise ValueError(format_msg.format(course_id, email_obj.course_id))
+        format_msg = u"Course id conflict: explicit value %r does not match email value %r"
+        log.warning(u"Task %s: " + format_msg, task_id, course_id, email_obj.course_id)
+        raise ValueError(format_msg % (course_id, email_obj.course_id))
 
     # Fetch the course object.
-    try:
-        course = get_course(course_id)
-    except ValueError:
-        log.exception("Task %s: course not found: %s", task_id, course_id)
-        raise
+    course = get_course(course_id)
+
+    if course is None:
+        msg = u"Task %s: course not found: %s"
+        log.error(msg, task_id, course_id)
+        raise ValueError(msg % (task_id, course_id))
 
     # Get arguments that will be passed to every subtask.
     to_option = email_obj.to_option
     global_email_context = _get_course_email_context(course)
+
+    recipient_qsets = _get_recipient_querysets(user_id, to_option, course_id)
+    recipient_fields = ['profile__name', 'email']
+
+    log.info(u"Task %s: Preparing to queue subtasks for sending emails for course %s, email %s, to_option %s",
+             task_id, course_id, email_id, to_option)
+
+    total_recipients = sum([recipient_queryset.count() for recipient_queryset in recipient_qsets])
+
+    routing_key = settings.BULK_EMAIL_ROUTING_KEY
+    # if there are few enough emails, send them through a different queue
+    # to avoid large courses blocking emails to self and staff
+    if total_recipients <= settings.BULK_EMAIL_JOB_SIZE_THRESHOLD:
+        routing_key = settings.BULK_EMAIL_ROUTING_KEY_SMALL_JOBS
 
     def _create_send_email_subtask(to_list, initial_subtask_status):
         """Creates a subtask to send email to a given recipient list."""
@@ -212,24 +251,18 @@ def perform_delegate_email_batches(entry_id, course_id, task_input, action_name)
                 initial_subtask_status.to_dict(),
             ),
             task_id=subtask_id,
-            routing_key=settings.BULK_EMAIL_ROUTING_KEY,
+            routing_key=routing_key,
         )
         return new_subtask
-
-    recipient_qset = _get_recipient_queryset(user_id, to_option, course_id, course.location)
-    recipient_fields = ['profile__name', 'email']
-
-    log.info("Task %s: Preparing to queue subtasks for sending emails for course %s, email %s, to_option %s",
-             task_id, course_id, email_id, to_option)
 
     progress = queue_subtasks_for_query(
         entry,
         action_name,
         _create_send_email_subtask,
-        recipient_qset,
+        recipient_qsets,
         recipient_fields,
-        settings.BULK_EMAIL_EMAILS_PER_QUERY,
-        settings.BULK_EMAIL_EMAILS_PER_TASK
+        settings.BULK_EMAIL_EMAILS_PER_TASK,
+        total_recipients,
     )
 
     # We want to return progress here, as this is what will be stored in the
@@ -240,7 +273,7 @@ def perform_delegate_email_batches(entry_id, course_id, task_input, action_name)
     return progress
 
 
-@task(default_retry_delay=settings.BULK_EMAIL_DEFAULT_RETRY_DELAY, max_retries=settings.BULK_EMAIL_MAX_RETRIES)  # pylint: disable=E1102
+@task(default_retry_delay=settings.BULK_EMAIL_DEFAULT_RETRY_DELAY, max_retries=settings.BULK_EMAIL_MAX_RETRIES)
 def send_course_email(entry_id, email_id, to_list, global_email_context, subtask_status_dict):
     """
     Sends an email to a list of recipients.
@@ -278,7 +311,8 @@ def send_course_email(entry_id, email_id, to_list, global_email_context, subtask
     subtask_status = SubtaskStatus.from_dict(subtask_status_dict)
     current_task_id = subtask_status.task_id
     num_to_send = len(to_list)
-    log.info("Preparing to send email %s to %d recipients as subtask %s for instructor task %d: context = %s, status=%s",
+    log.info((u"Preparing to send email %s to %d recipients as subtask %s "
+              u"for instructor task %d: context = %s, status=%s"),
              email_id, num_to_send, current_task_id, entry_id, global_email_context, subtask_status)
 
     # Check that the requested subtask is actually known to the current InstructorTask entry.
@@ -324,11 +358,11 @@ def send_course_email(entry_id, email_id, to_list, global_email_context, subtask
         # was encountered has already been updated before the retry call was made,
         # so we only log here.
         log.warning("Send-email task %s for email %s: being retried", current_task_id, email_id)
-        raise send_exception  # pylint: disable=E0702
+        raise send_exception  # pylint: disable=raising-bad-type
     else:
         log.error("Send-email task %s for email %s: failed: %s", current_task_id, email_id, send_exception)
         update_subtask_status(entry_id, current_task_id, new_subtask_status)
-        raise send_exception  # pylint: disable=E0702
+        raise send_exception  # pylint: disable=raising-bad-type
 
     # return status in a form that can be serialized by Celery into JSON:
     log.info("Send-email task %s for email %s: returning status %s", current_task_id, email_id, new_subtask_status)
@@ -366,15 +400,14 @@ def _get_source_address(course_id, course_title):
     """
     course_title_no_quotes = re.sub(r'"', '', course_title)
 
-    # The course_id is assumed to be in the form 'org/course_num/run',
-    # so pull out the course_num.  Then make sure that it can be used
+    # For the email address, get the course.  Then make sure that it can be used
     # in an email address, by substituting a '_' anywhere a non-(ascii, period, or dash)
     # character appears.
-    course_num = course_id.split('/')[1]
-    invalid_chars = re.compile(r"[^\w.-]")
-    course_num = invalid_chars.sub('_', course_num)
-
-    from_addr = '"{0}" Course Staff <{1}-{2}>'.format(course_title_no_quotes, course_num, settings.BULK_EMAIL_DEFAULT_FROM_EMAIL)
+    from_addr = u'"{0}" Course Staff <{1}-{2}>'.format(
+        course_title_no_quotes,
+        re.sub(r"[^\w.-]", '_', course_id.course),
+        settings.BULK_EMAIL_DEFAULT_FROM_EMAIL
+    )
     return from_addr
 
 
@@ -407,12 +440,31 @@ def _send_course_email(entry_id, email_id, to_list, global_email_context, subtas
         'failed' count above.
     """
     # Get information from current task's request:
+    parent_task_id = InstructorTask.objects.get(pk=entry_id).task_id
     task_id = subtask_status.task_id
+    total_recipients = len(to_list)
+    recipient_num = 0
+    total_recipients_successful = 0
+    total_recipients_failed = 0
+    recipients_info = Counter()
+
+    log.info(
+        "BulkEmail ==> Task: %s, SubTask: %s, EmailId: %s, TotalRecipients: %s",
+        parent_task_id,
+        task_id,
+        email_id,
+        total_recipients
+    )
 
     try:
         course_email = CourseEmail.objects.get(id=email_id)
     except CourseEmail.DoesNotExist as exc:
-        log.exception("Task %s: could not find email id:%s to send.", task_id, email_id)
+        log.exception(
+            "BulkEmail ==> Task: %s, SubTask: %s, EmailId: %s, Could not find email to send.",
+            parent_task_id,
+            task_id,
+            email_id
+        )
         raise
 
     # Exclude optouts (if not a retry):
@@ -426,10 +478,13 @@ def _send_course_email(entry_id, email_id, to_list, global_email_context, subtas
         subtask_status.increment(skipped=num_optout)
 
     course_title = global_email_context['course_title']
-    subject = "[" + course_title + "] " + course_email.subject
-    from_addr = _get_source_address(course_email.course_id, course_title)
 
-    course_email_template = CourseEmailTemplate.get_template()
+    # use the email from address in the CourseEmail, if it is present, otherwise compute it
+    from_addr = course_email.from_addr if course_email.from_addr else \
+        _get_source_address(course_email.course_id, course_title)
+
+    # use the CourseEmailTemplate that was associated with the CourseEmail
+    course_email_template = course_email.get_template()
     try:
         connection = get_connection()
         connection.open()
@@ -444,10 +499,13 @@ def _send_course_email(entry_id, email_id, to_list, global_email_context, subtas
             # That way, the to_list will always contain the recipients remaining to be emailed.
             # This is convenient for retries, which will need to send to those who haven't
             # yet been emailed, but not send to those who have already been sent to.
+            recipient_num += 1
             current_recipient = to_list[-1]
             email = current_recipient['email']
             email_context['email'] = email
             email_context['name'] = current_recipient['profile__name']
+            email_context['user_id'] = current_recipient['pk']
+            email_context['course_id'] = course_email.course_id
 
             # Construct message content using templates and context:
             plaintext_msg = course_email_template.render_plaintext(course_email.text_message, email_context)
@@ -455,7 +513,7 @@ def _send_course_email(entry_id, email_id, to_list, global_email_context, subtas
 
             # Create email:
             email_msg = EmailMultiAlternatives(
-                subject,
+                course_email.subject,
                 plaintext_msg,
                 from_addr,
                 [email],
@@ -472,29 +530,81 @@ def _send_course_email(entry_id, email_id, to_list, global_email_context, subtas
                 sleep(settings.BULK_EMAIL_RETRY_DELAY_BETWEEN_SENDS)
 
             try:
-                log.debug('Email with id %s to be sent to %s', email_id, email)
-
+                log.info(
+                    "BulkEmail ==> Task: %s, SubTask: %s, EmailId: %s, Recipient num: %s/%s, \
+                    Recipient name: %s, Email address: %s",
+                    parent_task_id,
+                    task_id,
+                    email_id,
+                    recipient_num,
+                    total_recipients,
+                    current_recipient['profile__name'],
+                    email
+                )
                 with dog_stats_api.timer('course_email.single_send.time.overall', tags=[_statsd_tag(course_title)]):
                     connection.send_messages([email_msg])
 
             except SMTPDataError as exc:
                 # According to SMTP spec, we'll retry error codes in the 4xx range.  5xx range indicates hard failure.
+                total_recipients_failed += 1
+                log.error(
+                    "BulkEmail ==> Status: Failed(SMTPDataError), Task: %s, SubTask: %s, EmailId: %s, \
+                    Recipient num: %s/%s, Email address: %s",
+                    parent_task_id,
+                    task_id,
+                    email_id,
+                    recipient_num,
+                    total_recipients,
+                    email
+                )
                 if exc.smtp_code >= 400 and exc.smtp_code < 500:
                     # This will cause the outer handler to catch the exception and retry the entire task.
                     raise exc
                 else:
                     # This will fall through and not retry the message.
-                    log.warning('Task %s: email with id %s not delivered to %s due to error %s', task_id, email_id, email, exc.smtp_error)
+                    log.warning(
+                        'BulkEmail ==> Task: %s, SubTask: %s, EmailId: %s, Recipient num: %s/%s, \
+                        Email not delivered to %s due to error %s',
+                        parent_task_id,
+                        task_id,
+                        email_id,
+                        recipient_num,
+                        total_recipients,
+                        email,
+                        exc.smtp_error
+                    )
                     dog_stats_api.increment('course_email.error', tags=[_statsd_tag(course_title)])
                     subtask_status.increment(failed=1)
 
             except SINGLE_EMAIL_FAILURE_ERRORS as exc:
                 # This will fall through and not retry the message.
-                log.warning('Task %s: email with id %s not delivered to %s due to error %s', task_id, email_id, email, exc)
+                total_recipients_failed += 1
+                log.error(
+                    "BulkEmail ==> Status: Failed(SINGLE_EMAIL_FAILURE_ERRORS), Task: %s, SubTask: %s, \
+                    EmailId: %s, Recipient num: %s/%s, Email address: %s, Exception: %s",
+                    parent_task_id,
+                    task_id,
+                    email_id,
+                    recipient_num,
+                    total_recipients,
+                    email,
+                    exc
+                )
                 dog_stats_api.increment('course_email.error', tags=[_statsd_tag(course_title)])
                 subtask_status.increment(failed=1)
 
             else:
+                total_recipients_successful += 1
+                log.info(
+                    "BulkEmail ==> Status: Success, Task: %s, SubTask: %s, EmailId: %s, \
+                    Recipient num: %s/%s, Email address: %s,",
+                    parent_task_id,
+                    task_id,
+                    email_id,
+                    recipient_num,
+                    total_recipients,
+                    email
+                )
                 dog_stats_api.increment('course_email.sent', tags=[_statsd_tag(course_title)])
                 if settings.BULK_EMAIL_LOG_SENT_EMAILS:
                     log.info('Email with id %s sent to %s', email_id, email)
@@ -505,7 +615,31 @@ def _send_course_email(entry_id, email_id, to_list, global_email_context, subtas
             # Pop the user that was emailed off the end of the list only once they have
             # successfully been processed.  (That way, if there were a failure that
             # needed to be retried, the user is still on the list.)
+            recipients_info[email] += 1
             to_list.pop()
+
+        log.info(
+            "BulkEmail ==> Task: %s, SubTask: %s, EmailId: %s, Total Successful Recipients: %s/%s, \
+            Failed Recipients: %s/%s",
+            parent_task_id,
+            task_id,
+            email_id,
+            total_recipients_successful,
+            total_recipients,
+            total_recipients_failed,
+            total_recipients
+        )
+        duplicate_recipients = ["{0} ({1})".format(email, repetition)
+                                for email, repetition in recipients_info.most_common() if repetition > 1]
+        if duplicate_recipients:
+            log.info(
+                "BulkEmail ==> Task: %s, SubTask: %s, EmailId: %s, Total Duplicate Recipients [%s]: [%s]",
+                parent_task_id,
+                task_id,
+                email_id,
+                len(duplicate_recipients),
+                ', '.join(duplicate_recipients)
+            )
 
     except INFINITE_RETRY_ERRORS as exc:
         dog_stats_api.increment('course_email.infinite_retry', tags=[_statsd_tag(course_title)])
@@ -531,20 +665,22 @@ def _send_course_email(entry_id, email_id, to_list, global_email_context, subtas
     except BULK_EMAIL_FAILURE_ERRORS as exc:
         dog_stats_api.increment('course_email.error', tags=[_statsd_tag(course_title)])
         num_pending = len(to_list)
-        log.exception('Task %s: email with id %d caused send_course_email task to fail with "fatal" exception.  %d emails unsent.',
+        log.exception(('Task %s: email with id %d caused send_course_email task to fail '
+                       'with "fatal" exception.  %d emails unsent.'),
                       task_id, email_id, num_pending)
         # Update counters with progress to date, counting unsent emails as failures,
         # and set the state to FAILURE:
         subtask_status.increment(failed=num_pending, state=FAILURE)
         return subtask_status, exc
 
-    except Exception as exc:
+    except Exception as exc:  # pylint: disable=broad-except
         # Errors caught here cause the email to be retried.  The entire task is actually retried
         # without popping the current recipient off of the existing list.
         # These are unexpected errors.  Since they might be due to a temporary condition that might
         # succeed on retry, we give them a retry.
         dog_stats_api.increment('course_email.limited_retry', tags=[_statsd_tag(course_title)])
-        log.exception('Task %s: email with id %d caused send_course_email task to fail with unexpected exception.  Generating retry.',
+        log.exception(('Task %s: email with id %d caused send_course_email task to fail '
+                       'with unexpected exception.  Generating retry.'),
                       task_id, email_id)
         # Increment the "retried_withmax" counter, update other counters with progress to date,
         # and set the state to RETRY:
@@ -577,7 +713,8 @@ def _get_current_task():
     return current_task
 
 
-def _submit_for_retry(entry_id, email_id, to_list, global_email_context, current_exception, subtask_status, skip_retry_max=False):
+def _submit_for_retry(entry_id, email_id, to_list, global_email_context,
+                      current_exception, subtask_status, skip_retry_max=False):
     """
     Helper function to requeue a task for retry, using the new version of arguments provided.
 
@@ -630,7 +767,8 @@ def _submit_for_retry(entry_id, email_id, to_list, global_email_context, current
     # retries are deferred by the same amount.
     countdown = ((2 ** retry_index) * base_delay) * random.uniform(.75, 1.25)
 
-    log.warning('Task %s: email with id %d not delivered due to %s error %s, retrying send to %d recipients in %s seconds (with max_retry=%s)',
+    log.warning(('Task %s: email with id %d not delivered due to %s error %s, '
+                 'retrying send to %d recipients in %s seconds (with max_retry=%s)'),
                 task_id, email_id, exception_type, current_exception, len(to_list), countdown, max_retries)
 
     # we make sure that we update the InstructorTask with the current subtask status
@@ -642,7 +780,7 @@ def _submit_for_retry(entry_id, email_id, to_list, global_email_context, current
     # needs to be returned back to Celery.  If it fails, we return the existing
     # exception.
     try:
-        send_course_email.retry(
+        retry_task = send_course_email.retry(
             args=[
                 entry_id,
                 email_id,
@@ -655,27 +793,28 @@ def _submit_for_retry(entry_id, email_id, to_list, global_email_context, current
             max_retries=max_retries,
             throw=True,
         )
+        raise retry_task
     except RetryTaskError as retry_error:
         # If the retry call is successful, update with the current progress:
-        log.exception('Task %s: email with id %d caused send_course_email task to retry.',
+        log.exception(u'Task %s: email with id %d caused send_course_email task to retry.',
                       task_id, email_id)
         return subtask_status, retry_error
-    except Exception as retry_exc:
+    except Exception as retry_exc:  # pylint: disable=broad-except
         # If there are no more retries, because the maximum has been reached,
         # we expect the original exception to be raised.  We catch it here
         # (and put it in retry_exc just in case it's different, but it shouldn't be),
         # and update status as if it were any other failure.  That means that
         # the recipients still in the to_list are counted as failures.
-        log.exception('Task %s: email with id %d caused send_course_email task to fail to retry. To list: %s',
+        log.exception(u'Task %s: email with id %d caused send_course_email task to fail to retry. To list: %s',
                       task_id, email_id, [i['email'] for i in to_list])
         num_failed = len(to_list)
-        subtask_status.increment(subtask_status, failed=num_failed, state=FAILURE)
+        subtask_status.increment(failed=num_failed, state=FAILURE)
         return subtask_status, retry_exc
 
 
 def _statsd_tag(course_title):
     """
-    Calculate the tag we will use for DataDog.
+    Prefix the tag we will use for DataDog.
+    The tag also gets modified by our dogstats_wrapper code.
     """
-    tag = "course_email:{0}".format(course_title)
-    return tag[:200]
+    return u"course_email:{0}".format(course_title)

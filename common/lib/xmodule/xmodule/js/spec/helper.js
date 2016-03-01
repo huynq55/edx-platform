@@ -1,8 +1,7 @@
-(function ($, undefined) {
-    var oldAjaxWithPrefix = $.ajaxWithPrefix;
+(function () {
+    'use strict';
 
-    // Stub YouTube API.
-    window.YT = {
+    var stubbedYT = {
         Player: function () {
             var Player = jasmine.createSpyObj(
                 'YT.Player',
@@ -11,12 +10,16 @@
                     'getPlayerState', 'getVolume', 'setVolume',
                     'loadVideoById', 'getAvailablePlaybackRates', 'playVideo',
                     'pauseVideo', 'seekTo', 'getDuration', 'setPlaybackRate',
-                    'getPlaybackQuality'
+                    'getAvailableQualityLevels', 'getPlaybackQuality',
+                    'setPlaybackQuality', 'destroy'
                 ]
             );
 
             Player.getDuration.andReturn(60);
-            Player.getAvailablePlaybackRates.andReturn(['0.50', '1.0', '1.50', '2.0']);
+            Player.getAvailablePlaybackRates.andReturn([0.50, 1.0, 1.50, 2.0]);
+            Player.getAvailableQualityLevels.andReturn(
+                ['highres', 'hd1080', 'hd720', 'large', 'medium', 'small']
+            );
 
             return Player;
         },
@@ -33,6 +36,9 @@
             return f();
         }
     };
+    jasmine.YT = stubbedYT;
+    // Stub YouTube API.
+    window.YT = stubbedYT;
 
     window.STATUS = window.YT.PlayerState;
 
@@ -63,42 +69,6 @@
         ]
     };
 
-    // For our purposes, we need to make sure that the function
-    // $.ajaxWithPrefix does not fail when during tests a captions file is
-    // requested. It is originally defined in file:
-    //
-    //     common/static/coffee/src/ajax_prefix.js
-    //
-    // We will replace it with a function that does:
-    //
-    //     1.) Return a hard coded captions object if the file name contains
-    //         'Z5KLxerq05Y'.
-    //     2.) Behaves the same a as the original function in all other cases.
-    $.ajaxWithPrefix = function (url, settings) {
-        var data, success;
-
-        if (!settings) {
-            settings = url;
-            url = settings.url;
-            success = settings.success;
-            data = settings.data;
-        }
-
-        if (
-            url.match(/Z5KLxerq05Y/g) ||
-            url.match(/7tqY6eQzVhE/g) ||
-            url.match(/cogebirgzzM/g)
-        ) {
-            if ($.isFunction(success)) {
-                return success(jasmine.stubbedCaption);
-            } else if ($.isFunction(data)) {
-                return data(jasmine.stubbedCaption);
-            }
-        } else {
-            return oldAjaxWithPrefix.apply(this, arguments);
-        }
-    };
-
     // Time waitsFor() should wait for before failing a test.
     window.WAIT_TIMEOUT = 5000;
 
@@ -106,19 +76,27 @@
 
     jasmine.stubbedMetadata = {
         '7tqY6eQzVhE': {
-            id: '7tqY6eQzVhE',
-            duration: 300
+            contentDetails : {
+                id: '7tqY6eQzVhE',
+                duration: 'PT5M0S'
+            }
         },
         'cogebirgzzM': {
-            id: 'cogebirgzzM',
-            duration: 200
+            contentDetails : {
+                id: 'cogebirgzzM',
+                duration: 'PT3M20S'
+            }
         },
         'abcdefghijkl': {
-            id: 'abcdefghijkl',
-            duration: 400
+            contentDetails : {
+                id: 'abcdefghijkl',
+                duration: 'PT6M40S'
+            }
         },
         bogus: {
-            duration: 100
+            contentDetails : {
+                duration: 'PT1M40S'
+            }
         }
     };
 
@@ -145,13 +123,16 @@
     jasmine.stubbedHtml5Speeds = ['0.75', '1.0', '1.25', '1.50'];
 
     jasmine.stubRequests = function () {
-        return spyOn($, 'ajax').andCallFake(function (settings) {
-            var match, status, callCallback;
+        var spy = $.ajax;
 
-            if (
-                match = settings.url
-                    .match(/youtube\.com\/.+\/videos\/(.+)\?v=2&alt=jsonc/)
-            ) {
+        if (!($.ajax.isSpy)) {
+            spy = spyOn($, 'ajax');
+        }
+        return spy.andCallFake(function (settings) {
+            var match = settings.url
+                    .match(/googleapis\.com\/.+\/videos\/\?id=(.+)&part=contentDetails/),
+                status, callCallback;
+            if (match) {
                 status = match[1].split('_');
                 if (status && status[0] === 'status') {
                     callCallback = function (callback) {
@@ -165,7 +146,7 @@
                     };
                 } else if (settings.success) {
                     return settings.success({
-                        data: jasmine.stubbedMetadata[match[1]]
+                        items: jasmine.stubbedMetadata[match[1]]
                     });
                 } else {
                     return {
@@ -177,14 +158,13 @@
                         }
                     };
                 }
-            } else if (
-                match = settings.url
-                    .match(/static(\/.*)?\/subs\/(.+)\.srt\.sjson/)
-            ) {
+            } else if (settings.url.match(/transcript\/translation\/.+$/)) {
                 return settings.success(jasmine.stubbedCaption);
+            } else if (settings.url === '/transcript/available_translations') {
+                return settings.success(['uk', 'de']);
             } else if (settings.url.match(/.+\/problem_get$/)) {
                 return settings.success({
-                    html: readFixtures('problem_content.html')
+                    html: window.readFixtures('problem_content.html')
                 });
             } else if (
                 settings.url === '/calculate' ||
@@ -193,7 +173,8 @@
                 settings.url.match(/.+\/problem_(check|reset|show|save)$/)
             ) {
                 // Do nothing.
-            } else if (settings.url == '/save_user_state') {
+                return;
+            } else if (settings.url === '/save_user_state') {
                 return {success: true};
             } else {
                 throw 'External request attempted for ' +
@@ -207,28 +188,30 @@
     beforeEach(function () {
         this.addMatchers({
             toHaveAttrs: function (attrs) {
-                var element = this.actual,
-                    result = true;
+                var element;
 
                 if ($.isEmptyObject(attrs)) {
                     return false;
                 }
 
-                $.each(attrs, function (name, value) {
-                    return result = result && element.attr(name) === value;
-                });
+                element = this.actual;
 
-                return result;
+                return _.every(attrs, function (value, name) {
+                    return element.attr(name) === value;
+                });
             },
             toBeInRange: function (min, max) {
                 return min <= this.actual && this.actual <= max;
             },
             toBeInArray: function (array) {
                 return $.inArray(this.actual, array) > -1;
+            },
+            toBeFocused: function () {
+                return $(this.actual)[0] === $(this.actual)[0].ownerDocument.activeElement;
             }
         });
 
-        return this.addMatchers(imagediff.jasmine);
+        return this.addMatchers(window.imagediff.jasmine);
     });
 
     // Stub jQuery.cookie module.
@@ -239,6 +222,19 @@
 
     // Stub jQuery.scrollTo module.
     $.fn.scrollTo = jasmine.createSpy('jQuery.scrollTo');
+
+    // Stub window.Video.loadYouTubeIFrameAPI()
+    window.Video.loadYouTubeIFrameAPI = jasmine.createSpy('window.Video.loadYouTubeIFrameAPI').andReturn(
+        function (scriptTag) {
+            var event = document.createEvent('Event');
+            if (fixture === "video.html") {
+                event.initEvent('load', false, false);
+            } else {
+                event.initEvent('error', false, false);
+            }
+            scriptTag.dispatchEvent(event);
+        }
+    );
 
     jasmine.initializePlayer = function (fixture, params) {
         var state;
@@ -258,15 +254,15 @@
             loadFixtures('video_all.html');
         }
 
-        // If `params` is an object, assign it's properties as data attributes
+        // If `params` is an object, assign its properties as data attributes
         // to the main video DIV element.
         if (_.isObject(params)) {
-            $('#example')
-                .find('#video_id')
-                .data(params);
+            var metadata = _.extend($('#video_id').data('metadata'), params);
+            $('#video_id').data('metadata', metadata);
         }
 
-        state = new Video('#example');
+        jasmine.stubRequests();
+        state = new window.Video('#example');
 
         state.resizer = (function () {
             var methods = [
@@ -274,13 +270,21 @@
                     'alignByWidthOnly',
                     'alignByHeightOnly',
                     'setParams',
-                    'setMode'
+                    'setMode',
+                    'setElement'
                 ],
-                obj = {};
+                obj = {},
+                delta = {
+                    add: jasmine.createSpy().andReturn(obj),
+                    substract: jasmine.createSpy().andReturn(obj),
+                    reset: jasmine.createSpy().andReturn(obj)
+                };
 
             $.each(methods, function (index, method) {
                 obj[method] = jasmine.createSpy(method).andReturn(obj);
             });
+
+            obj.delta = delta;
 
             return obj;
         }());
@@ -289,8 +293,8 @@
         return state;
     };
 
-    jasmine.initializePlayerYouTube = function () {
+    jasmine.initializePlayerYouTube = function (params) {
         // "video.html" contains HTML template for a YouTube video.
-        return jasmine.initializePlayer('video.html');
+        return jasmine.initializePlayer('video.html', params);
     };
-}).call(this, window.jQuery);
+}).call(this);

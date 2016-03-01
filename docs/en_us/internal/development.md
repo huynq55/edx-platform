@@ -4,7 +4,7 @@
 
 ### Ruby
 
-To install all of the libraries needed for our rake commands, run `bundle install`.
+To install all of the required ruby libraries, run `bundle install`.
 This will read the `Gemfile` and install all of the gems specified there.
 
 ### Python
@@ -21,15 +21,32 @@ Install the following:
 
 ### Databases
 
-First start up the mongo daemon. E.g. to start it up in the background
-using a config file:
+First start up the MongoDB daemon. E.g. to start it up in the background
+using a config file (sometimes using `sudo` is required):
 
     mongod --config /usr/local/etc/mongod.conf &
 
-Check out the course data directories that you want to work with into the
-`GITHUB_REPO_ROOT` (by default, `../data`). Then run the following command:
+On some Linux distributions the configuration script is located at:
 
-    rake resetdb
+    /etc/mongodb.conf
+
+If MongoDB does not start properly, it might be the case that there is a stray
+lock file somewhere, or that the configuration file is corrupt. In this case
+try deleting the lock files, and then running the MongoDB repair script:
+
+    sudo rm -rf /data/db/mongod.lock
+    sudo rm -rf /var/lib/mongodb/mongod.lock
+    sudo -u mongodb mongod -f /usr/local/etc/mongod.conf --repair
+
+To verify that MongoDB started up OK, run the MongoDB client:
+
+    mongo
+
+After MongoDB daemon is successfully running, check out the course data
+directories that you want to work with into the `GITHUB_REPO_ROOT` (by default,
+`../data`). Then run the following command:
+
+    paver update_db
 
 ## Installing
 
@@ -43,10 +60,10 @@ the repo:
 
 Both the LMS and Studio can be started using the following shortcut tasks
 
-    rake lms  # Start the LMS
-    rake cms  # Start studio
-    rake lms[cms.dev]  # Start LMS to run alongside Studio
-    rake lms[cms.dev_preview]  # Start LMS to run alongside Studio in preview mode
+    paver lms  # Start the LMS
+    paver studio  # Start studio
+    paver lms --settings=cms.dev  # Start LMS to run alongside Studio
+    paver lms --settings=cms.dev_preview  # Start LMS to run alongside Studio in preview mode
 
 Under the hood, this executes `./manage.py {lms|cms} --settings $ENV runserver`,
 which starts a local development server.
@@ -55,13 +72,12 @@ Both of these commands take arguments to start the servers in different environm
 or with additional options:
 
     # Start the LMS using the test configuration, on port 5000
-    rake lms[test,5000]  # Executes ./manage.py lms --settings test runserver 5000
+    paver lms --settings=test --port=5000  # Executes ./manage.py lms --settings test runserver 5000
 
-*N.B.* You may have to escape the `[` characters, depending on your shell: `rake "lms[test,5000]"`
+To get a full list of available paver tasks, run:
 
-To get a full list of available rake tasks, use:
+     paver --help
 
-    rake -T
 
 ### Troubleshooting
 
@@ -84,7 +100,7 @@ Coffee watches both directories and files, so you will need to set this fairly h
 
 ## Running Tests
 
-See `testing.md` for instructions on running the test suite.
+See `testing.rst` for instructions on running the test suite.
 
 ## Content development
 
